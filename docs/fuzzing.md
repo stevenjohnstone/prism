@@ -23,7 +23,7 @@ fuzz
 
 ## Usage
 
-There are currently three fuzzing targets
+There are currently two fuzzing targets
 
 - `pm_serialize_parse` (parse)
 - `pm_regexp_parse` (regexp)
