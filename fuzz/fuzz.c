@@ -7,12 +7,10 @@
 #include <unistd.h>
 
 #ifdef IGNORE_ASSERTS
-// Set our own assertion handler which does a clean exit. This signals to AFL++ that the input is not interesting. Can
-// be used to focus the fuzzer on non-assert issues.
 void __assert_fail(const char *assertion, const char *file, unsigned int line, const char *function) __attribute__((noreturn));
 
 void __assert_fail(const char *assertion, const char *file, unsigned int line, const char *function) {
-    printf("%s: %s:%d %s", assertion, file, line, function);
+    fprintf(stderr, "%s: %s:%d %s\n", assertion, file, line, function);
     _exit(0);
 }
 #endif
