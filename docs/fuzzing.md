@@ -43,7 +43,7 @@ make fuzz-debug
 
 # Out-of-bounds reads
 
-Currently, encoding functionality implementing the `pm_encoding_t` interface can read outside of inputs. For the time being, ASAN instrumentation is disabled for functions from src/enc. See `fuzz/asan.ignore`.
+Currently, encoding functionality implementing the `pm_encoding_t` interface can read outside of inputs.
 
 To disable ASAN read instrumentation globally, use the `FUZZ_FLAGS` environment variable e.g.
 
