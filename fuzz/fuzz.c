@@ -17,7 +17,17 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 }
 #endif
 
-void harness(const uint8_t *input, size_t size);
+// causes an abort when an ASAN error occurs. When
+// something else calls abort() (e.g. an assert), the
+// asan error handler will kick in giving a nice
+// backtrace
+extern const char *__asan_default_option(void);
+
+
+const char* __asan_default_options(void) {
+    return "abort_on_error=1:handle_abort=1";
+}
+extern void harness(const uint8_t *input, size_t size);
 
 int
 LLVMFuzzerTestOneInput(const char *data, size_t size) {
