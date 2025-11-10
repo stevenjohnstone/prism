@@ -1,6 +1,6 @@
 #include <prism.h>
 
-void
+__attribute__((noinline)) void
 harness(const uint8_t *input, size_t size) {
     if (size >= 32) {
         return;

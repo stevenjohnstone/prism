@@ -63,18 +63,19 @@ build/fuzz.%: $(SOURCES) fuzz/%.c fuzz/fuzz.c
 	$(ECHO) "building $* fuzzer"
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building main fuzz binary"
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -grecord-command-line -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@ $^
+	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@ $^
 	$(ECHO) "building with no instrumented reads"
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=false -grecord-command-line -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@.noread $^
+	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=false -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@.noread $^
 	$(ECHO) "building cmplog binary"
-	$(Q) AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -grecord-command-line -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@.cmplog $^
+	$(Q) AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@.cmplog $^
 
-build/fuzz.heisenbug.%: $(SOURCES) fuzz/%.c fuzz/heisenbug.c
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -O0 -grecord-command-line -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@ $^
-
-fuzz-debug:
+fuzz-debug: FORCE fuzz-docker-build
 	$(ECHO) "entering debug shell"
 	$(Q) docker run -it --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz
+
+fuzz-triage: FORCE fuzz-docker-build
+	$(ECHO) "starting triage -- may take a long time"
+	$(Q) docker run -it --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz ./fuzz/tools/triage.sh
 
 fuzz-docker-build: fuzz/docker/Dockerfile
 	$(ECHO) "building docker image"
