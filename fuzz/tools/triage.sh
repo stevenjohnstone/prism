@@ -3,11 +3,13 @@
 OUTPUT_DIR="fuzz/output"
 parallel=8
 
+export UBSAN_OPTIONS=print_stacktrace=1
+
 TESTCASES_DIR=${1:-"triage"}
 mkdir -p "$TESTCASES_DIR"
 
 crash_count=0
-for f in "$OUTPUT_DIR"/*/*/{crashes,hangs}/id*; do
+for f in "$OUTPUT_DIR"/*/{crashes,hangs}/id*; do
 	[[ -f $f ]] && { crash_count=$((crash_count + 1)); }
 done
 
@@ -19,8 +21,6 @@ END="\n"
 	START="\033[K"
 	END="\r"
 }
-
-trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
 
 print_lock=$(mktemp)
 exec 200<>"$print_lock"
@@ -56,7 +56,7 @@ function process_crash() {
 	if [[ "$pre_min_size" -gt 16 ]]; then
 		print "Minimizing %s -- may take a long time" "$crash"
 		if [ "$reason" = "hang" ]; then
-			AFL_TMIN_EXACT=1 afl-tmin -e -H -t 500 -i "$crash" -o "$minimized_input" -- "$executable" &>/dev/null
+			AFL_TMIN_EXACT=1 afl-tmin -H -t 500 -i "$crash" -o "$minimized_input" -- "$executable" &>/dev/null
 		else
 			AFL_TMIN_EXACT=1 afl-tmin -e -t 500 -i "$crash" -o "$minimized_input" -- "$executable" &>/dev/null
 		fi
@@ -115,12 +115,13 @@ EOF
 		set +o pipefail
 		set -e
 		if [ "$program_status" -ne 0 ]; then
-			reason="$(grep -aEo 'SUMMARY: AddressSanitizer: [[:alpha:]-]*' "$c_file" | sed -r 's/SUMMARY: AddressSanitizer: //g')"/"$signature"
+			reason="$(sed -rn 's/SUMMARY: (UndefinedBehavior|Address)Sanitizer: ([[:alpha:]-]*) .*/\2/p' "$c_file")"/"$signature"
 		else
 			heisenbug=1
 			# there was no failure...maybe due to reading outside of bounds setting up very specific conditions
 			reason="heisenbug/${signature}"
 		fi
+		print "reason=%s" "$reason"
 	else
 		echo "Not available: hang" >>"$c_file"
 	fi
@@ -186,7 +187,7 @@ EOF
 	fi
 }
 
-for crash_dir in "$OUTPUT_DIR"/*/*/{crashes,hangs}; do
+for crash_dir in "$OUTPUT_DIR"/*/{crashes,hangs}; do
 	readme_path="$crash_dir/../crashes/README.txt"
 	# It's entirely possible that there are no crashes in the directory
 	# which is indicated by the absence of a README.txt file
