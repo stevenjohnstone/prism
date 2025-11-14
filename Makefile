@@ -91,9 +91,13 @@ fuzz-debug: fuzz-docker-build
 	$(ECHO) "entering debug shell"
 	$(Q) docker run -it --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz
 
+
 fuzz-triage: fuzz-docker-build
 	$(ECHO) "starting triage -- may take a long time"
-	$(Q) docker run -it --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz ./fuzz/tools/triage.sh
+	@if [ -t 1 ]; then \
+		DOCKER_ARGS="-it"; \
+	fi; \
+	docker run $${DOCKER_ARGS} --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz ./fuzz/tools/triage.sh
 
 
 FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
