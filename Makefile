@@ -114,8 +114,27 @@ fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(Q) docker run -it --rm -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz /bin/bash -c "./fuzz/run.sh /fuzz_output/"
 FORCE:
 
+define TTY_CONFIRM
+@if [ -t 1 ]; then \
+	echo "$(1) (Y/n)"; \
+	read response; \
+	case "$$response" in \
+		[Y]*) \
+			;; \
+		*) \
+			echo "Aborting."; \
+			exit 1; \
+			;; \
+	esac; \
+fi
+endef
+
+fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_OUTPUT_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l || echo "0")
 fuzz-clean:
+	$(call TTY_CONFIRM, "This will destroy $(FUZZ_FINDINGS) fuzz findings. Continue?")
+	$(ECHO) "Removing fuzz data"
 	$(Q) $(RMALL) fuzz/output
+	$(ECHO) "done"
 
 clean:
 	$(Q) $(RMALL) build
