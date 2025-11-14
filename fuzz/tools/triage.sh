@@ -14,7 +14,7 @@ for f in "$OUTPUT_DIR"/*/{crashes,hangs}/id*; do
 done
 
 START=""
-END="\n"
+END="\r\n"
 
 [[ -t 1 ]] && {
 	# attached to tty so don't fill the terminal
