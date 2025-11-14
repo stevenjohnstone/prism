@@ -13,8 +13,6 @@ fuzz
 ├── fuzz.c                    generic entrypoint for fuzzing
 ├── parse.c                   fuzz handler for parsing
 ├── parse.sh                  script to run parsing fuzzer
-├── regexp.c                  fuzz handler for regular expression parsing
-├── regexp.sh                 script to run regexp fuzzer
 └── tools
     ├── halfempty.sh          script to use Google zero's halfempty minimizer
     ├── halfempty_compare.sh  identifies similar backtraces
@@ -28,61 +26,34 @@ fuzz
 
 ## Usage
 
-There are currently two fuzzing targets:
-* `pm_serialize_parse` (parse)
-* `pm_regexp_parse` (regexp)
-
-You can run them from the root of the prism repository.
+There is currently one fuzzing target:
+* `pm_parse_success_p`
 
 * **To run the parse fuzzer:**
+    In the root directory of this repository run
     ```bash
     # builds and runs fuzzing code in a container
-    make fuzz-run-parse 
-    ```
-* **To run the regexp fuzzer:**
-    ```bash
-    # builds and runs fuzzing code in a container
-    make fuzz-run-regexp
-    ```
+    make fuzz-run 
 
-Either command will start a container with one or more fuzzer jobs. You can find an explanation of the status screen [here](https://aflplus.plus/docs/status_screen/).
+This command will start a docker container running four fuzzers:
+1. a fuzzer using ASAN and cmplog (main)
+2. a fuzzer using UBSAN (ubsan)
+3. a grammar driven fuzzer (grammar)
+4. a fuzzer using ASAN with read instrumentation disabled (noread)
+
+The terminal will have a tmux session running in the container. When the terminal is large enough, all four fuzzers will
+display an AFL++ status screen. When the terminal is too small it will show the `main` fuzzer status screen.
+The status screen is explained [here](https://aflplus.plus/docs/status_screen/).
 
 Fuzzing output will be generated in the `fuzz/output` directory.
 
-To end a fuzzing job, interrupt with **CTRL+C**. To leave the Docker container shell, type:
+To end a fuzzing job, interrupt with **CTRL+C**.
+
+To delete any fuzzing data, run
 ```bash
-exit
+make fuzz-clean
 ```
-
-## Usage
-
-There are currently two fuzzing targets
-
-- `pm_serialize_parse` (parse)
-- `pm_regexp_parse` (regexp)
-
-Respectively, fuzzing can be performed by executing
-
-```bash
-make fuzz-run-parse #builds and runs fuzzing code in a container
-```
-and
-```bash
-make fuzz-run-regexp #builds and runs fuzzing code in a container
-```
-in the root of the prism respository.
-
-Either will start a container with one or more fuzzer jobs running. The status screen is explained [here](https://aflplus.plus/docs/status_screen/).
-
-To end a fuzzing job, interrupt with CTRL+C. To leave the docker container shell, type
-```bash
-exit
-```
-
-There will be fuzz output in the directory
-```
-fuzz/output
-```
+> **WARNING**: after running `make fuzz-clean`, no crash triage is possible
 
 ## Triaging Crashes and Hangs
 
@@ -167,24 +138,13 @@ SUMMARY: AddressSanitizer: ABRT nptl/pthread_kill.c:44:76 in __pthread_kill_impl
 ==143==ABORTING
 Aborted
 ```
-You can then debug the crash using gdb:
+You can then debug the crash using gdb (or lldb):
 ```bash
 gdb ./testcase
 ```
-To run the test case on **the host plaform** (Linux, WSL and macOS supported)
-exit the container
-```bash
-exit
-```
-and run
-```bash
-# Build the test case
-./triage/ABRT/d0a90c13bfbe209b/e4ceb80a0511fe06/build.sh
 
-# Run the test case
-./testcase
-```
-just as in the container.
+It may be useful to set a break point on `__sanitizer::Die` to stop the program exiting after the ASAN/UBSAN
+handler completes.
 
 
 
