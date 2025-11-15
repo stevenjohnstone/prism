@@ -15,6 +15,10 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 }
 #endif
 
+#ifndef __AFL_LEAK_CHECK
+#define __AFL_LEAK_CHECK() (void)0
+#endif
+
 // causes an abort when an ASAN error occurs. When
 // something else calls abort() (e.g. an assert), the
 // asan error handler will kick in giving a nice
@@ -30,5 +34,6 @@ extern void harness(const uint8_t *input, size_t size);
 int
 LLVMFuzzerTestOneInput(const char *data, size_t size) {
     harness((const uint8_t *) data, size);
+    __AFL_LEAK_CHECK();
     return 0;
 }
