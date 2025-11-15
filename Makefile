@@ -70,7 +70,7 @@ $(FUZZ_BUILD_STAMP): $(SOURCES) fuzz/parse.c fuzz/fuzz.c
 	$(ECHO) "building main fuzz binary"
 	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o build/fuzz $^
 	$(ECHO) "building with no instrumented reads"
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=false -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o build/fuzz.noread $^
+	$(Q) AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=false -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o build/fuzz.noread $^
 	$(ECHO) "building with UBSAN"
 	$(Q) AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -DIGNORE_ASSERTS -fsanitize=fuzzer,undefined -ggdb3 -std=c99 -Iinclude -o build/fuzz.ubsan $^
 	$(ECHO) "building cmplog binary"
