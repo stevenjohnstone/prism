@@ -55,6 +55,17 @@ make fuzz-clean
 ```
 > **WARNING**: after running `make fuzz-clean`, no crash triage is possible
 
+## Coverage
+
+To view coverage information in the browser, run
+```
+make fuzz-coverage
+open build/fuzz-coverage/index.html
+```
+
+> **NOTE** the coverage is calculated over the functions which are reachable in the target
+
+
 ## Triaging Crashes and Hangs
 
 From the prism directory where fuzzing is running, run

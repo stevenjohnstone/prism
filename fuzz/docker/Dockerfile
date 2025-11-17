@@ -29,7 +29,7 @@ RUN wget https://www.antlr.org/download/antlr-4.8-complete.jar \
 RUN git clone https://github.com/AFLplusplus/Grammar-Mutator
 RUN cd Grammar-Mutator && make GRAMMAR_FILE=grammars/ruby.json && \
     cp libgrammarmutator-ruby.so /usr/local/lib
-RUN apt install -y tmux clang-format xxhash
+RUN apt install -y tmux clang-format xxhash llvm
 COPY Gemfile Gemfile.lock prism.gemspec /prism/
 WORKDIR /prism
 RUN bundle install
