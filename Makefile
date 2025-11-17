@@ -116,7 +116,11 @@ fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "starting AFL++ run"
 	$(Q) $(MAKEDIRS) $(FUZZ_OUTPUT_DIR)/$*
 	$(Q) docker run -it --rm -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz /bin/bash -c "./fuzz/run.sh /fuzz_output/"
-FORCE:
+
+fuzz-coverage: fuzz-docker-build
+	$(ECHO) "collecting coverage"
+	$(Q) docker run --rm -v $(CURDIR):/prism prism/fuzz /bin/bash -c "./fuzz/tools/coverage.sh"
+
 
 define TTY_CONFIRM
 @if [ -t 1 ]; then \

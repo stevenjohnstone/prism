@@ -17,9 +17,9 @@ cleanup() {
 # SIGTERM is now the main one, for docker stop.
 trap cleanup TERM
 
-CMD_NOREAD="/bin/bash -c 'afl-fuzz -x ./fuzz/dict -G $MAX_INPUT_SIZE -i ./fuzz/corpus/parse -o $OUTPUT_DIR -S noread -- ./build/fuzz.noread'"
-CMD_UBSAN="/bin/bash -c 'afl-fuzz -x ./fuzz/dict -G $MAX_INPUT_SIZE -i ./fuzz/corpus/parse -o $OUTPUT_DIR -S uban -- ./build/fuzz.ubsan'"
-CMD_GRAMMAR="/bin/bash -c 'AFL_CUSTOM_MUTATOR_LIBRARY=/usr/local/lib/libgrammarmutator-ruby.so AFL_CUSTOM_MUTATOR_ONLY=1 afl-fuzz -G $MAX_INPUT_SIZE -i fuzz/corpus/parse -o $OUTPUT_DIR -S grammar_parse -- ./build/fuzz'"
+CMD_NOREAD="/bin/bash -c 'afl-fuzz -x ./fuzz/dict -G $MAX_INPUT_SIZE -i ./fuzz/corpus/parse -o $OUTPUT_DIR -S noread -p coe -- ./build/fuzz.noread'"
+CMD_UBSAN="/bin/bash -c 'afl-fuzz -x ./fuzz/dict -G $MAX_INPUT_SIZE -i ./fuzz/corpus/parse -o $OUTPUT_DIR -S ubsan -p exploit -- ./build/fuzz.ubsan'"
+CMD_GRAMMAR="/bin/bash -c 'AFL_CUSTOM_MUTATOR_LIBRARY=/usr/local/lib/libgrammarmutator-ruby.so afl-fuzz -G $MAX_INPUT_SIZE -i fuzz/corpus/parse -o $OUTPUT_DIR -S grammar -p rare -- ./build/fuzz'"
 CMD_MAIN="/bin/bash -c 'afl-fuzz -x ./fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i ./fuzz/corpus/parse -M main -o $OUTPUT_DIR ./build/fuzz|| read -n 1'"
 
 echo "Starting tmux session with 2x2 grid..."
