@@ -14,9 +14,13 @@ fuzz
 ├── parse.c                   fuzz handler for parsing
 ├── parse.sh                  script to run parsing fuzzer
 └── tools
+    ├── corpus.rb             script to prepare a fuzzing corpus
+    ├── coverage.sh           generate coverage in html
     ├── halfempty.sh          script to use Google zero's halfempty minimizer
     ├── halfempty_compare.sh  identifies similar backtraces
-    └── triage.sh             automagic triage of crashes
+    ├── kill.sh               manages graceful shutdown of tmux
+    ├── signature.sh          generates a crash signature hash
+    └── triage.rb             automagic triage of crashes
 ```
 
 ## Requirements
@@ -161,7 +165,7 @@ handler completes.
 
 ## Crash Similarity
 
-Crashes are deemed to be **similar** if:
+Crashes are deemed to be **identifcal** if:
 
   * They are in the same category (e.g., `ABRT`, `SEGV`).
   * Their backtraces have the same hash signature after being stripped of random elements (like memory addresses).
@@ -172,17 +176,11 @@ Similar crashes are stored in the output directory under their category and back
 triage
 ├── ABRT  <------------------------type of crash
 │   ├── 14a9275da317ddd6     <-----backtrace signature
-│   │   ├── d0a90c13bfbe209b <-----instance 1
-│   │   │   ├── build.sh
-│   │   │   ├── input.min
-│   │   │   └── testcase.c
-│   │   └── e4ceb80a0511fe06 <-----instance 2
-│   │       ├── build.sh
-│   │       ├── input.min
-│   │       └── testcase.c
+│   │   ├── build.sh
+│   │   ├── input.min
+│   │   └── testcase.c
 ```
 
-Here, the `ABRT` with signature `14a9275da317ddd6` has two instances. Their backtraces should be similar and likely share the same root cause.
 
 > **A Note on Behavior:**
 > When building and running test cases outside the fuzzing framework, crashes may manifest differently. For example, a "use after poison" crash (from data on the heap surrounded by poisoned pages) might become a "global buffer overflow" in the test harness (where data is stored in a global). Either way, the underlying bug is an out-of-bounds read or write.

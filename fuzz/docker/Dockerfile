@@ -17,7 +17,7 @@ RUN wget https://cache.ruby-lang.org/pub/ruby/3.3/ruby-${RUBY_VERSION}.tar.gz -O
 RUN mkdir ruby-source && tar -xvf ruby.tar.gz -C ruby-source --strip-components=1
 RUN apt update && apt -y install libyaml-dev libz-dev libssl-dev
 RUN cd ruby-source && ./configure --disable-install-doc && make && make install
-RUN gem install rake-compiler ruby_memcheck
+RUN gem install rake-compiler ruby_memcheck concurrent-ruby
 RUN git clone https://github.com/pwndbg/pwndbg && cd pwndbg && ./setup.sh
 ENV LC_CTYPE=C.UTF-8
 RUN apt install -y libglib2.0-dev bsdmainutils

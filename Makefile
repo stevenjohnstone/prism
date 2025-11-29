@@ -97,7 +97,7 @@ fuzz-triage: fuzz-docker-build
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz ./fuzz/tools/triage.sh
+	docker run $${DOCKER_ARGS} --init --rm -e TRIAGE_MINIMIZE -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz ruby ./fuzz/tools/triage.rb
 
 
 FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
@@ -115,7 +115,7 @@ fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(Q) docker run --rm -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make fuzz-build"
 	$(ECHO) "starting AFL++ run"
 	$(Q) $(MAKEDIRS) $(FUZZ_OUTPUT_DIR)/$*
-	$(Q) docker run -it --rm -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz /bin/bash -c "./fuzz/run.sh /fuzz_output/"
+	$(Q) docker run -it --init --rm -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz /bin/bash -c "./fuzz/run.sh /fuzz_output/"
 
 fuzz-coverage: fuzz-docker-build
 	$(ECHO) "collecting coverage"
