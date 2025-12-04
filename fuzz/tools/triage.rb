@@ -175,7 +175,7 @@ end
 
 pool = Concurrent::FixedThreadPool.new(Concurrent.processor_count / 2)
 semaphore = Mutex.new
-Dir.glob(File.join(OUTPUT_DIR, '**/{crashes,hangs}')) do |crash_dir|
+Dir.glob(File.join(OUTPUT_DIR, '**/{crashes*,hangs*}')) do |crash_dir|
   executable = File.read(File.join(crash_dir, '../cmdline')).strip
   Dir.glob(File.join(crash_dir, '/id*')) do |crash|
     pool.post do
