@@ -29,6 +29,7 @@ out.svg
 
 /ext/prism/api_node.c
 /fuzz/output/
+/triage/
 /gemfiles/typecheck/bin/
 /include/prism/ast.h
 /include/prism/diagnostic.h
