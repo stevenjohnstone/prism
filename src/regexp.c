@@ -774,6 +774,9 @@ pm_regexp_parse_pattern(pm_regexp_parser_t *parser) {
  */
 PRISM_EXPORTED_FUNCTION void
 pm_regexp_parse(pm_parser_t *parser, const uint8_t *source, size_t size, bool extended_mode, pm_regexp_name_callback_t name_callback, void *name_data, pm_regexp_error_callback_t error_callback, void *error_data) {
+    if (source == NULL) {
+        return;
+    }
     pm_regexp_parse_pattern(&(pm_regexp_parser_t) {
         .parser = parser,
         .start = source,

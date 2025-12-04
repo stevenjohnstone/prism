@@ -339,6 +339,11 @@ pm_string_compare(const pm_string_t *left, const pm_string_t *right) {
         return -1;
     } else if (left_length > right_length) {
         return 1;
+    } else if (left_length == 0) {
+        // zero-length strings are considered to be equal
+        // avoids passing NULL pointers to memcmp which has
+        // undefined behaviour
+        return 0;
     }
 
     return memcmp(pm_string_source(left), pm_string_source(right), left_length);
