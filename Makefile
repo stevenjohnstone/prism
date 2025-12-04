@@ -92,8 +92,9 @@ fuzz-debug: fuzz-docker-build
 	$(Q) docker run -it --rm -e HISTFILE=/prism/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz
 
 
-fuzz-triage: fuzz-docker-build
+fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "starting triage -- may take a long time"
+	$(Q) docker run --rm -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make fuzz-build"
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
