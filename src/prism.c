@@ -20441,6 +20441,10 @@ parse_regular_expression_named_capture(const pm_string_t *capture, void *data) {
 
     const uint8_t *source = pm_string_source(capture);
     size_t length = pm_string_length(capture);
+    if (source == NULL) {
+        // avoid undefined behaviour
+        return;
+    }
     pm_buffer_t unescaped = { 0 };
 
     // First, we need to handle escapes within the name of the capture group.
@@ -20456,6 +20460,10 @@ parse_regular_expression_named_capture(const pm_string_t *capture, void *data) {
         pm_named_capture_escape(parser, &unescaped, source, length, cursor);
         source = (const uint8_t *) pm_buffer_value(&unescaped);
         length = pm_buffer_length(&unescaped);
+        if (source == NULL) {
+            // avoid undefined behaviour
+            return;
+        }
     }
 
     pm_location_t location;
