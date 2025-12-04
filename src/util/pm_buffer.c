@@ -74,7 +74,7 @@ pm_buffer_append_length(pm_buffer_t *buffer, size_t length) {
 static inline void
 pm_buffer_append(pm_buffer_t *buffer, const void *source, size_t length) {
     size_t cursor = buffer->length;
-    if (pm_buffer_append_length(buffer, length)) {
+    if (length > 0 && pm_buffer_append_length(buffer, length)) {
         memcpy(buffer->value + cursor, source, length);
     }
 }
