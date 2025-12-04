@@ -14,6 +14,8 @@ fuzz
 ├── parse.c                   fuzz handler for parsing
 ├── parse.sh                  script to run parsing fuzzer
 └── tools
+    ├── build.sh              builds a test case
+    ├── build.asan.sh         builds a test case with ASAN enabled
     ├── corpus.rb             script to prepare a fuzzing corpus
     ├── coverage.sh           generate coverage in html
     ├── halfempty.sh          script to use Google zero's halfempty minimizer
@@ -81,8 +83,7 @@ make fuzz-triage
 This will create a `triage/` directory with crashes organized by type. Each leaf directory contains:
 
 1.  A C program (`testcase.c`)
-2.  A build script (`build.sh`)
-3.  The raw, malformed Ruby program that causes the crash (`input.min`)
+2.  The raw, malformed Ruby program that causes the crash (`input.min`)
 
 For example, the `triage` directory may look like this:
 
@@ -91,31 +92,25 @@ For example, the `triage` directory may look like this:
 triage
 ├── ABRT
 │  	├── 14a9275da317ddd6
-│  	│  	├── d0a90c13bfbe209b
-│  	│  	│  	├── build.sh
-│  	│  	│  	├── input.min
-│  	│  	│  	└── testcase.c
-│  	│  	└── e4ceb80a0511fe06
-│  	│  	 	 ├── build.sh
-│  	│  	 	 ├── input.min
-│  	│  	 	 └── testcase.c
+│  	│  	├── input.min
+│  	│  	└── testcase.c
 
 ```
-In this case, `ABRT` (abort signal) crashes were found, most likely from a failing program assert.
+In this case, an `ABRT` (abort signal) crashes was found, most likely from a failing program assert.
 
 ### Reproducing a Crash
 
 To demonstrate a crash, you can build and run a specific test case:
 
 ```bash
-# Build the test case
-./triage/ABRT/d0a90c13bfbe209b/e4ceb80a0511fe06/build.sh
+# Build the test case with ASAN enabled
+./fuzz/tools/build.asan.sh ./triage/ABRT/d0a90c13bfbe209b/testcase.c
 
 # Run the test case
 ./testcase
 ```
 
-> **NOTE** if you do not have a compiler which support ASAN (clang, gcc) installed on the host, run `make fuzz-debug` to start a container with clang, fuzzing tools etc installed and follow the instructions as above
+> **NOTE** if you do not have a compiler which supports ASAN (clang, gcc) installed on the host, run `make fuzz-debug` to start a container with clang, fuzzing tools etc installed and follow the instructions as above
 
 
 The output may be something like

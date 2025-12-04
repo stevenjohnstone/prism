@@ -168,11 +168,6 @@ def process_crash(crash_dir, crash, executable, semaphore)
   File.open(File.join(target_directory, 'testcase.c'), File::CREAT | File::TRUNC | File::RDWR) do |f|
     f.write(c_testcase)
   end
-  File.open(File.join(target_directory, 'build.sh'), File::CREAT | File::TRUNC | File::RDWR, 0o755) do |f|
-    sanitize_flag = reason == 'undefined-behavior' ? 'undefined' : 'address'
-    f.write("#!/bin/bash\n")
-    f.write("clang -Iinclude -fsanitize=#{sanitize_flag} -ggdb3 $(find src -name '*.c') #{target_directory}/testcase.c -o testcase")
-  end
   FileUtils.cp(minimized_input, File.join(target_directory, 'input.min'))
   FileUtils.rm_r(testcase_subdir)
   puts "#{crash} complete => #{target_directory}"
