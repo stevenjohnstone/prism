@@ -144,7 +144,7 @@ def process_crash(crash_dir, crash, executable, semaphore)
   semaphore.synchronize do
     if File.directory?(target_directory)
       # don't do duplicate work for this signature
-      puts "#{crash} has signature that's been seen before"
+      puts "#{crash} has signature #{target_directory} that's been seen before"
       return
     end
     FileUtils.mkdir_p(target_directory)
