@@ -3,7 +3,6 @@ FROM aflplusplus/aflplusplus:v5.03c
 ARG USERNAME=ubuntu
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
-ARG RUBY_VERSION=3.3.10
 ENV MAKEFLAGS=-j8
 
 RUN apt update && apt install -y sudo \
@@ -11,12 +10,8 @@ RUN apt update && apt install -y sudo \
     && chmod 0440 /etc/sudoers.d/$USERNAME
 
 
-RUN wget https://cache.ruby-lang.org/pub/ruby/3.3/ruby-${RUBY_VERSION}.tar.gz -O ruby.tar.gz
-RUN mkdir ruby-source && tar -xvf ruby.tar.gz -C ruby-source --strip-components=1
-RUN apt update && apt -y install libyaml-dev libz-dev libssl-dev
-RUN cd ruby-source && ./configure --disable-install-doc && make && make install
-RUN gem install rake-compiler ruby_memcheck concurrent-ruby
-RUN git clone https://github.com/pwndbg/pwndbg && cd pwndbg && ./setup.sh
+RUN apt-get install -y ruby-full
+RUN gem install rake-compiler ruby_memcheck concurrent-ruby bundler
 ENV LC_CTYPE=C.UTF-8
 RUN apt install -y libglib2.0-dev bsdmainutils
 RUN git clone https://github.com/googleprojectzero/halfempty
