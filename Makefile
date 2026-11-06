@@ -6,7 +6,6 @@ Q1 = $(V:1=)
 Q = $(Q1:0=@)
 ECHO1 = $(V:1=@ :)
 ECHO = $(ECHO1:0=@ echo)
-FUZZ_OUTPUT_DIR = $(CURDIR)/test/fuzz/output
 
 SOEXT ?= $(shell ruby -e 'puts RbConfig::CONFIG["SOEXT"]')
 
@@ -22,6 +21,7 @@ WASI_SDK_PATH := /opt/wasi-sdk
 # the symbols javascript/src/parsePrism.js calls. That lets --gc-sections drop
 # the rest of the C API along with the wasi-libc code reachable from it.
 WASM_EXPORTS := -Wl,--export=malloc,--export=free,--export=pm_buffer_new,--export=pm_buffer_value,--export=pm_buffer_length,--export=pm_buffer_free,--export=pm_serialize_parse
+
 
 # Bind the library's own references to its own definitions at link time, so
 # that the functions exported for FFI cannot be interposed by another copy of
@@ -94,42 +94,12 @@ build/static/%.o: src/%.c Makefile $(HEADERS)
 	$(Q) $(MAKEDIRS) $(@D)
 	$(Q) $(CC) $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-build/fuzz.%: $(SOURCES) test/fuzz/%.c test/fuzz/fuzz.c
-	$(ECHO) "building $* fuzzer"
-	$(Q) $(MAKEDIRS) $(@D)
-	$(ECHO) "building main fuzz binary"
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -O0 -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@ $^
-	$(ECHO) "building cmplog binary"
-	$(Q) AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -O0 -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@.cmplog $^
-
-build/fuzz.heisenbug.%: $(SOURCES) test/fuzz/%.c test/fuzz/heisenbug.c
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -O0 -fsanitize=fuzzer,address -ggdb3 -std=c99 -Iinclude -o $@ $^
-
-fuzz-debug:
-	$(ECHO) "entering debug shell"
-	$(Q) docker run -it --rm -e HISTFILE=/prism/test/fuzz/output/.bash_history -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz
-
-fuzz-docker-build: test/fuzz/docker/Dockerfile
-	$(ECHO) "building docker image"
-	$(Q) docker build -t prism/fuzz test/fuzz/docker/
-
-fuzz-run-%: FORCE fuzz-docker-build
-	$(ECHO) "generating templates"
-	$(Q) bundle exec rake templates
-	$(ECHO) "running $* fuzzer"
-	$(Q) docker run --rm -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make build/fuzz.$*"
-	$(ECHO) "starting AFL++ run"
-	$(Q) $(MAKEDIRS) $(FUZZ_OUTPUT_DIR)/$*
-	$(Q) docker run -it --rm -v $(CURDIR):/prism -v $(FUZZ_OUTPUT_DIR):/fuzz_output prism/fuzz /bin/bash -c "./test/fuzz/$*.sh /fuzz_output/$*"
-FORCE:
-
-fuzz-clean:
-	$(Q) $(RMALL) test/fuzz/output
+include test/fuzz/Makefile
 
 clean:
 	$(Q) $(RMALL) build
 
-.PHONY: clean doc/playground fuzz-clean
+.PHONY: clean doc/playground
 
 all-no-debug: DEBUG_FLAGS := -DNDEBUG=1
 all-no-debug: OPTFLAGS := -O3
