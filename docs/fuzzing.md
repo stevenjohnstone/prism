@@ -86,14 +86,14 @@ Inside the dashboard (`Window 0`), press **`Tab`**, **`Space`**, **`1`**, **`2`*
 
      Workers: 12/12 alive   Speed: 21,927/s   Execs: 34,420,027   Corpus: 18,540   Max Cov: 69.91%   Crashes: 0   Hangs: 0
 
-   FUZZER     STATE     SCHED          EXEC/S    COV %  CRASHES  HANGS
-   -------------------------------------------------------------------
-   main       RUNNING   exploit       1,720/s   47.66%        0      0
-   grammar    RUNNING   explore       2,309/s   69.91%        0      0
-   msan       RUNNING   fast          5,773/s   37.59%        0      0
-   main-2     RUNNING   explore       1,218/s   47.42%        0      0
+   FUZZER     STATE     SCHED          EXEC/S    COV %             EDGES  CRASHES  HANGS
+   -------------------------------------------------------------------------------------
+   main       RUNNING   exploit       1,720/s   47.66%   15,288 / 32,905        0      0
+   grammar    RUNNING   explore       2,309/s   69.91%   16,234 / 24,169        0      0
+   msan       RUNNING   fast          5,773/s   37.59%   18,890 / 55,121        0      0
+   main-2     RUNNING   explore       1,218/s   47.42%   15,276 / 32,905        0      0
    ...
-   -------------------------------------------------------------------
+   -------------------------------------------------------------------------------------
    [Tab/Space/1/2] Switch page   [Ctrl+B, w] Fuzzer window   [Ctrl+B, n/p] Next/Prev   [Ctrl+B, 0] Dashboard   [Ctrl+B, d] Detach   [Ctrl+C] Stop all
    ```
 

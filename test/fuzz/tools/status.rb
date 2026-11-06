@@ -140,6 +140,8 @@ def collect_fuzzer_rows(afl_dir, expected_fuzzers)
         pending_total: stats["pending_total"].to_i,
         pending_favs: stats["pending_favs"].to_i,
         bitmap_cvg: stats["bitmap_cvg"] || "0.00%",
+        edges_found: stats["edges_found"].to_i,
+        total_edges: stats["total_edges"].to_i,
         saved_crashes: stats["saved_crashes"].to_i,
         saved_hangs: stats["saved_hangs"].to_i,
         last_find: stats["last_find"].to_i,
@@ -157,6 +159,8 @@ def collect_fuzzer_rows(afl_dir, expected_fuzzers)
         pending_total: 0,
         pending_favs: 0,
         bitmap_cvg: "0.00%",
+        edges_found: 0,
+        total_edges: 0,
         saved_crashes: 0,
         saved_hangs: 0,
         last_find: 0,
@@ -208,8 +212,8 @@ def render(afl_dir, expected_fuzzers, started_at, page, contribs)
 
   header = if page == 1
              format(
-               "%-10s %-9s %-8s %12s %8s %8s %6s",
-               "FUZZER", "STATE", "SCHED", "EXEC/S", "COV %", "CRASHES", "HANGS"
+               "%-10s %-9s %-8s %12s %8s %17s %8s %6s",
+               "FUZZER", "STATE", "SCHED", "EXEC/S", "COV %", "EDGES", "CRASHES", "HANGS"
              )
            else
              format(
@@ -244,13 +248,20 @@ def render(afl_dir, expected_fuzzers, started_at, page, contribs)
                     format("%6d", 0)
                   end
 
+      edges_str = if r[:total_edges] > 0
+                    "#{format_int(r[:edges_found])} / #{format_int(r[:total_edges])}"
+                  else
+                    "-"
+                  end
+
       out << format(
-        "%-10s %s %-8s %12s %8s %s %s\n",
+        "%-10s %s %-8s %12s %8s %17s %s %s\n",
         r[:name],
         state_str,
         r[:sched],
         "#{format_int(r[:execs_per_sec].round)}/s",
         r[:bitmap_cvg],
+        edges_str,
         crashes_str,
         hangs_str
       )
