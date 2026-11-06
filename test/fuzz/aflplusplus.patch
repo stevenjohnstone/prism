@@ -1,0 +1,1013 @@
+--- a/instrumentation/SanitizerCoverageLTO.so.cc	2026-11-06 23:21:07.469177000 +0000
++++ b/instrumentation/SanitizerCoverageLTO.so.cc	2026-11-06 23:21:07.476177000 +0000
+@@ -1521,17 +1521,28 @@
+ }
+ 
+ // True if block has successors and it dominates all of them.
+-static bool isFullDominator(const BasicBlock *BB, const DominatorTree *DT) {
++static bool isFullDominator(const BasicBlock       *BB,
++                            const DominatorTree    *DT,
++                            const SanitizerCFGInfo *SanCFG = nullptr) {
++
++  if (SanCFG) {
++
++    BB = SanCFG->getTail(BB);
++    if (const BasicBlock *Target = SanCFG->getUncondTarget(BB))
++      return DT->dominates(BB, Target);
+ 
+-  if (succ_begin(BB) == succ_end(BB)) return false;
++  }
+ 
++  bool has_succ = false;
+   for (const BasicBlock *SUCC : make_range(succ_begin(BB), succ_end(BB))) {
+ 
++    if (isSanitizerTrapBlock(SUCC)) continue;
++    has_succ = true;
+     if (!DT->dominates(BB, SUCC)) return false;
+ 
+   }
+ 
+-  return true;
++  return has_succ;
+ 
+ }
+ 
+@@ -1593,10 +1604,14 @@
+ 
+ }
+ 
+-static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
++static bool shouldInstrumentBlock(const Function                 &F,
++                                  const BasicBlock               *BB,
+                                   const DominatorTree            *DT,
+                                   const PostDominatorTree        *PDT,
+-                                  const SanitizerCoverageOptions &Options) {
++                                  const SanitizerCoverageOptions &Options,
++                                  const SanitizerCFGInfo *SanCFG = nullptr) {
++
++  if (SanCFG && SanCFG->isSkippedBlock(BB)) return false;
+ 
+   if (const Instruction *term = BB->getTerminator())
+     if (term->getMetadata("afl.skip")) return false;
+@@ -1607,6 +1622,7 @@
+   // percentage. Also, unreachable instructions frequently have no debug
+   // locations.
+   if (isa<UnreachableInst>(BB->getFirstNonPHIOrDbgOrLifetime())) return false;
++  if (isSanitizerTrapBlock(BB)) return false;
+ 
+   // Don't insert coverage into blocks without a valid insertion point
+   // (catchswitch blocks).
+@@ -1628,7 +1644,7 @@
+ 
+   // Do not instrument full dominators, or full post-dominators with multiple
+   // predecessors.
+-  return !isFullDominator(BB, DT) &&
++  return !isFullDominator(BB, DT, SanCFG) &&
+          !(isFullPostDominator(BB, PDT) && !BB->getSinglePredecessor());
+ 
+ }
+@@ -1780,10 +1796,14 @@
+ 
+   }
+ 
++  SanitizerPreSplitInfo SanPre = analyzeSanitizerPreSplit(F);
++
+   if (Options.CoverageType >= SanitizerCoverageOptions::SCK_Edge)
+     SplitAllCriticalEdges(
+         F, CriticalEdgeSplittingOptions().setIgnoreUnreachableDests());
+ 
++  SanitizerCFGInfo SanCFG = finalizeSanitizerCFG(F, SanPre);
++
+   markPersistentLoopEdges(F);
+ 
+   SmallVector<Instruction *, 8> IndirCalls;
+@@ -1975,7 +1995,7 @@
+ 
+         }
+ 
+-        if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
++        if (shouldInstrumentBlock(F, &BB, DT, PDT, Options, &SanCFG))
+           BlocksToInstrument.push_back(&BB);
+ 
+       }
+@@ -2631,7 +2651,7 @@
+     }
+ 
+     if (!instrument_ctx || call_counter <= 1)
+-      if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
++      if (shouldInstrumentBlock(F, &BB, DT, PDT, Options, &SanCFG))
+         BlocksToInstrument.push_back(&BB);
+ 
+   }
+--- a/instrumentation/SanitizerCoveragePCGUARD.so.cc	2026-11-06 23:21:07.469177000 +0000
++++ b/instrumentation/SanitizerCoveragePCGUARD.so.cc	2026-11-06 23:21:07.476177000 +0000
+@@ -146,7 +146,8 @@
+  private:
+   void            instrumentFunction(Function &F, DomTreeCallback DTCallback,
+                                      PostDomTreeCallback PDTCallback);
+-  bool            InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks);
++  bool            InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
++                                 const SanitizerCFGInfo &SanCFG);
+   GlobalVariable *CreateFunctionLocalArrayInSection(size_t    NumElements,
+                                                     Function &F, Type *Ty,
+                                                     const char *Section);
+@@ -1285,15 +1286,28 @@
+ }
+ 
+ // True if block has successors and it dominates all of them.
+-static bool isFullDominator(const BasicBlock *BB, const DominatorTree *DT) {
++static bool isFullDominator(const BasicBlock       *BB,
++                            const DominatorTree    *DT,
++                            const SanitizerCFGInfo *SanCFG = nullptr) {
+ 
+-  if (succ_empty(BB)) return false;
++  if (SanCFG) {
+ 
+-  return llvm::all_of(successors(BB), [&](const BasicBlock *SUCC) {
++    BB = SanCFG->getTail(BB);
++    if (const BasicBlock *Target = SanCFG->getUncondTarget(BB))
++      return DT->dominates(BB, Target);
+ 
+-    return DT->dominates(BB, SUCC);
++  }
+ 
+-  });
++  bool has_succ = false;
++  for (const BasicBlock *SUCC : successors(BB)) {
++
++    if (isSanitizerTrapBlock(SUCC)) continue;
++    has_succ = true;
++    if (!DT->dominates(BB, SUCC)) return false;
++
++  }
++
++  return has_succ;
+ 
+ }
+ 
+@@ -1358,10 +1372,14 @@
+ 
+ }
+ 
+-static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
++static bool shouldInstrumentBlock(const Function                 &F,
++                                  const BasicBlock               *BB,
+                                   const DominatorTree            *DT,
+                                   const PostDominatorTree        *PDT,
+-                                  const SanitizerCoverageOptions &Options) {
++                                  const SanitizerCoverageOptions &Options,
++                                  const SanitizerCFGInfo *SanCFG = nullptr) {
++
++  if (SanCFG && SanCFG->isSkippedBlock(BB)) return false;
+ 
+   if (const Instruction *term = BB->getTerminator())
+     if (term->getMetadata("afl.skip")) return false;
+@@ -1372,6 +1390,7 @@
+   // percentage. Also, unreachable instructions frequently have no debug
+   // locations.
+   if (isa<UnreachableInst>(BB->getFirstNonPHIOrDbgOrLifetime())) return false;
++  if (isSanitizerTrapBlock(BB)) return false;
+ 
+   // Don't insert coverage into blocks without a valid insertion point
+   // (catchswitch blocks).
+@@ -1384,7 +1403,7 @@
+ 
+   // Do not instrument full dominators, or full post-dominators with multiple
+   // predecessors.
+-  return !isFullDominator(BB, DT) &&
++  return !isFullDominator(BB, DT, SanCFG) &&
+          !(isFullPostDominator(BB, PDT) && !BB->getSinglePredecessor());
+ 
+ }
+@@ -1450,10 +1469,14 @@
+ 
+   }
+ 
++  SanitizerPreSplitInfo SanPre = analyzeSanitizerPreSplit(F);
++
+   if (Options.CoverageType >= SanitizerCoverageOptions::SCK_Edge)
+     SplitAllCriticalEdges(
+         F, CriticalEdgeSplittingOptions().setIgnoreUnreachableDests());
+ 
++  SanitizerCFGInfo SanCFG = finalizeSanitizerCFG(F, SanPre);
++
+   markPersistentLoopEdges(F);
+ 
+   SmallVector<BasicBlock *, 16> BlocksToInstrument;
+@@ -1486,7 +1509,7 @@
+   // AFL++ END
+   for (auto &BB : F) {
+ 
+-    if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
++    if (shouldInstrumentBlock(F, &BB, DT, PDT, Options, &SanCFG))
+       BlocksToInstrument.push_back(&BB);
+ 
+   }
+@@ -1510,7 +1533,7 @@
+   pathExits.clear();
+   if (path_mode) { current_path_count = analyzePathCoverage(F); }
+ 
+-  InjectCoverage(F, BlocksToInstrument);
++  InjectCoverage(F, BlocksToInstrument, SanCFG);
+ 
+   if (current_path_count) {
+ 
+@@ -1573,7 +1596,8 @@
+ }
+ 
+ bool ModuleSanitizerCoverageAFL::InjectCoverage(
+-    Function &F, ArrayRef<BasicBlock *> AllBlocks) {
++    Function &F, ArrayRef<BasicBlock *> AllBlocks,
++    const SanitizerCFGInfo &SanCFG) {
+ 
+   if (AllBlocks.empty()) return false;
+ 
+@@ -1757,14 +1781,19 @@
+ 
+     }
+ 
++    BasicBlock *HeadBB = const_cast<BasicBlock *>(SanCFG.getHead(&BB));
+     if (block_is_instrumented && /*&BB != &BB.getParent()->getEntryBlock() &&*/
+-        llvm::is_contained(AllBlocks, &BB)) {
++        llvm::is_contained(AllBlocks, HeadBB)) {
+ 
+-      Instruction *instr = &*BB.begin();
+-      LLVMContext &Ctx = BB.getContext();
+-      MDNode      *md = MDNode::get(Ctx, MDString::get(Ctx, "skipinstrument"));
+-      instr->setMetadata("skipinstrument", md);
+-      skip_blocks++;
++      Instruction *instr = &*HeadBB->begin();
++      if (!instr->getMetadata("skipinstrument")) {
++
++        LLVMContext &Ctx = HeadBB->getContext();
++        MDNode *md = MDNode::get(Ctx, MDString::get(Ctx, "skipinstrument"));
++        instr->setMetadata("skipinstrument", md);
++        skip_blocks++;
++
++      }
+ 
+     }
+ 
+--- a/instrumentation/afl-llvm-common.cc	2026-11-06 23:21:07.469177000 +0000
++++ b/instrumentation/afl-llvm-common.cc	2026-11-06 23:21:07.483177000 +0000
+@@ -960,9 +960,681 @@
+ 
+ }
+ 
++bool isSanitizerTrapCall(const llvm::CallBase *CB) {
++
++  if (!CB) return false;
++  const Value *CalledOp = CB->getCalledOperand();
++  if (!CalledOp) return false;
++  const Function *Callee = dyn_cast<Function>(CalledOp->stripPointerCasts());
++  if (!Callee) return false;
++
++  if (Callee->getIntrinsicID() == Intrinsic::ubsantrap ||
++      (Callee->getIntrinsicID() == Intrinsic::trap &&
++       CB->hasMetadata(LLVMContext::MD_nosanitize)))
++    return true;
++
++  StringRef Name = Callee->getName();
++  if (Name == "__assert_fail" || Name == "__assert_perror_fail" ||
++      Name == "__assert_rtn" || Name == "__assert")
++    return true;
++
++#if LLVM_VERSION_MAJOR >= 18
++  return Name.starts_with("__asan_report_") ||
++         Name.starts_with("__ubsan_handle_") ||
++         Name.starts_with("__msan_warning") ||
++         Name.starts_with("__hwasan_tag_mismatch") ||
++         Name.starts_with("__cfi_check_fail") ||
++         Name.starts_with("llvm.ubsantrap");
++#else
++  return Name.startswith("__asan_report_") ||
++         Name.startswith("__ubsan_handle_") ||
++         Name.startswith("__msan_warning") ||
++         Name.startswith("__hwasan_tag_mismatch") ||
++         Name.startswith("__cfi_check_fail") ||
++         Name.startswith("llvm.ubsantrap");
++#endif
++
++}
++
++bool isSanitizerTrapBlock(const llvm::BasicBlock *BB) {
++
++  if (!BB) return false;
++
++  const BasicBlock *Cur = BB;
++  for (unsigned hop = 0; hop < 4; ++hop) {
++
++    const Instruction *Term = Cur->getTerminator();
++    if (!Term) return false;
++
++    if (const auto *BI = dyn_cast<BranchInst>(Term)) {
++
++      if (BI->isUnconditional()) {
++
++        bool has_trap_call = false;
++        bool clean = true;
++        for (const Instruction &I : *Cur) {
++
++          if (I.isTerminator() || I.isDebugOrPseudoInst()) continue;
++          if (const auto *II = dyn_cast<IntrinsicInst>(&I)) {
++
++            if (II->isLifetimeStartOrEnd()) continue;
++
++          }
++
++          if (const auto *CB = dyn_cast<CallBase>(&I)) {
++
++            if (isSanitizerTrapCall(CB)) {
++
++              has_trap_call = true;
++              continue;
++
++            }
++
++          }
++
++          if (I.getMetadata("afl.skip") ||
++              I.hasMetadata(LLVMContext::MD_nosanitize))
++            continue;
++
++          clean = false;
++          break;
++
++        }
++
++        if (clean && has_trap_call) return true;
++        if (clean) {
++
++          Cur = BI->getSuccessor(0);
++          continue;
++
++        }
++
++      }
++
++      return false;
++
++    }
++
++    if (!isa<UnreachableInst>(Term)) return false;
++
++    if (isa<UnreachableInst>(Cur->getFirstNonPHIOrDbgOrLifetime())) return true;
++    if (isFullyArtificialBlock(Cur)) return true;
++
++    bool saw_trap_call = false;
++    for (const Instruction &I : *Cur) {
++
++      if (I.isTerminator() || I.isDebugOrPseudoInst()) continue;
++      if (const auto *CB = dyn_cast<CallBase>(&I)) {
++
++        if (isSanitizerTrapCall(CB)) {
++
++          saw_trap_call = true;
++          continue;
++
++        }
++
++        if (const Function *Callee =
++                dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts())) {
++
++          if (Callee->isIntrinsic() ||
++              Callee->getName() == "__asan_handle_no_return")
++            continue;
++
++        }
++
++        return false;
++
++      }
++
++    }
++
++    return saw_trap_call;
++
++  }
++
++  return false;
++
++}
++
++static const BasicBlock *getSanitizerSlowPathTrap(const BasicBlock *Slow,
++                                                  const BasicBlock *X,
++                                                  const BasicBlock *Y) {
++
++  if (!Slow || Slow == X || Slow == Y) return nullptr;
++  if (Slow->getSinglePredecessor() != X) return nullptr;
++
++  const auto *BI = dyn_cast_or_null<BranchInst>(Slow->getTerminator());
++  if (!BI || !BI->isConditional()) return nullptr;
++
++  const BasicBlock *S0 = BI->getSuccessor(0);
++  const BasicBlock *S1 = BI->getSuccessor(1);
++  const BasicBlock *Trap = nullptr;
++  if (S0 == Y && isSanitizerTrapBlock(S1))
++    Trap = S1;
++  else if (S1 == Y && isSanitizerTrapBlock(S0))
++    Trap = S0;
++  else
++    return nullptr;
++
++  for (const Instruction &I : *Slow) {
++
++    if (I.isTerminator() || I.isDebugOrPseudoInst()) continue;
++    if (I.mayHaveSideEffects()) return nullptr;
++
++  }
++
++  return Trap;
++
++}
++
++bool isSanitizerOnlyValue(const llvm::Instruction &Root) {
++
++  const Function *F = Root.getFunction();
++  if (!F) return false;
++  bool is_msan = F->hasFnAttribute(Attribute::SanitizeMemory);
++
++  SmallVector<const Value *, 16> Worklist;
++  SmallPtrSet<const Value *, 32> Visited;
++  Worklist.push_back(&Root);
++  bool saw_sanitizer_sink = false;
++
++  while (!Worklist.empty()) {
++
++    const Value *V = Worklist.pop_back_val();
++    if (!Visited.insert(V).second) continue;
++    if (Visited.size() > 128) return false;
++
++    for (const User *U : V->users()) {
++
++      if (const auto *BI = dyn_cast<BranchInst>(U)) {
++
++        if (!BI->isConditional() || BI->getCondition() != V) return false;
++        const BasicBlock *B0 = BI->getSuccessor(0);
++        const BasicBlock *B1 = BI->getSuccessor(1);
++        const BasicBlock *Parent = BI->getParent();
++        if (BI->hasMetadata(LLVMContext::MD_nosanitize) ||
++            isSanitizerTrapBlock(B0) || isSanitizerTrapBlock(B1) ||
++            getSanitizerSlowPathTrap(B0, Parent, B1) ||
++            getSanitizerSlowPathTrap(B1, Parent, B0)) {
++
++          saw_sanitizer_sink = true;
++          continue;
++
++        }
++
++        return false;
++
++      } else if (const auto *CB = dyn_cast<CallBase>(U)) {
++
++        if (CB->hasMetadata(LLVMContext::MD_nosanitize) ||
++            isSanitizerTrapCall(CB)) {
++
++          saw_sanitizer_sink = true;
++          continue;
++
++        }
++
++        const Value *CalledOp = CB->getCalledOperand();
++        const Function *Callee =
++            CalledOp ? dyn_cast<Function>(CalledOp->stripPointerCasts())
++                     : nullptr;
++        if (!Callee) return false;
++        StringRef Name = Callee->getName();
++#if LLVM_VERSION_MAJOR >= 18
++        if (Name.starts_with("__msan_") || Name.starts_with("__asan_") ||
++            Name.starts_with("__ubsan_") || Name.starts_with("__sanitizer_")) {
++#else
++        if (Name.startswith("__msan_") || Name.startswith("__asan_") ||
++            Name.startswith("__ubsan_") || Name.startswith("__sanitizer_")) {
++#endif
++          saw_sanitizer_sink = true;
++          continue;
++
++        }
++
++        if (Callee->isIntrinsic()) {
++
++          Worklist.push_back(CB);
++          continue;
++
++        }
++
++        return false;
++
++      } else if (const auto *SI = dyn_cast<StoreInst>(U)) {
++
++        if (SI->getValueOperand() != V) return false;
++        if (SI->hasMetadata(LLVMContext::MD_nosanitize)) {
++
++          saw_sanitizer_sink = true;
++          continue;
++
++        }
++
++        const Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
++        if (const auto *GV = dyn_cast<GlobalValue>(Ptr)) {
++
++          StringRef Name = GV->getName();
++#if LLVM_VERSION_MAJOR >= 18
++          if (Name.starts_with("__msan_") || Name.starts_with("__asan_") ||
++              Name.starts_with("__ubsan_")) {
++#else
++          if (Name.startswith("__msan_") || Name.startswith("__asan_") ||
++              Name.startswith("__ubsan_")) {
++#endif
++            saw_sanitizer_sink = true;
++            continue;
++
++          }
++
++        }
++
++        if (is_msan &&
++            (isa<IntToPtrInst>(Ptr) ||
++             (isa<ConstantExpr>(Ptr) &&
++              cast<ConstantExpr>(Ptr)->getOpcode() == Instruction::IntToPtr))) {
++
++          saw_sanitizer_sink = true;
++          continue;
++
++        }
++
++        return false;
++
++      } else if (isa<ReturnInst>(U) || isa<SwitchInst>(U) ||
++                 isa<LoadInst>(U) || isa<AtomicRMWInst>(U) ||
++                 isa<AtomicCmpXchgInst>(U)) {
++
++        return false;
++
++      } else if (isa<Instruction>(U) || isa<Operator>(U)) {
++
++        Worklist.push_back(U);
++
++      } else {
++
++        return false;
++
++      }
++
++    }
++
++  }
++
++  return saw_sanitizer_sink;
++
++}
++
++static bool isAsanStackMallocCall(const Value *V) {
++
++  const auto *CB = dyn_cast_or_null<CallBase>(V);
++  if (!CB) return false;
++  const Value *CalledOp = CB->getCalledOperand();
++  const Function *Callee =
++      CalledOp ? dyn_cast<Function>(CalledOp->stripPointerCasts()) : nullptr;
++  if (!Callee) return false;
++#if LLVM_VERSION_MAJOR >= 18
++  return Callee->getName().starts_with("__asan_stack_malloc_");
++#else
++  return Callee->getName().startswith("__asan_stack_malloc_");
++#endif
++
++}
++
++static bool isAsanStackMallocValue(const Value *V) {
++
++  if (!V) return false;
++  if (isAsanStackMallocCall(V)) return true;
++
++  if (const auto *PN = dyn_cast<PHINode>(V)) {
++
++    for (const Value *Inc : PN->incoming_values()) {
++
++      if (isAsanStackMallocCall(Inc)) return true;
++
++    }
++
++  }
++
++  return false;
++
++}
++
++static bool isAsanUarOptionLoad(const Value *V) {
++
++  const auto *LI = dyn_cast_or_null<LoadInst>(V);
++  if (!LI) return false;
++  const Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
++  const auto  *GV = dyn_cast<GlobalValue>(Ptr);
++  return GV && GV->getName() == "__asan_option_detect_stack_use_after_return";
++
++}
++
++SanitizerPreSplitInfo analyzeSanitizerPreSplit(Function &F) {
++
++  SanitizerPreSplitInfo Pre;
++
++  for (BasicBlock &BB : F) {
++
++    BasicBlock *X = &BB;
++    if (isSanitizerTrapBlock(X)) {
++
++      Pre.InternalBlocks.push_back(X);
++      continue;
++
++    }
++
++    if (X->getTerminator() && isa<SwitchInst>(X->getTerminator())) {
++
++      BasicBlock *TrapSucc = nullptr;
++      BasicBlock *NonTrapSucc = nullptr;
++      bool        multiple_non_trap = false;
++
++      for (BasicBlock *Succ : successors(X)) {
++
++        if (isSanitizerTrapBlock(Succ)) {
++
++          if (!TrapSucc) TrapSucc = Succ;
++          Pre.InternalBlocks.push_back(Succ);
++
++        } else if (Succ != X) {
++
++          if (!NonTrapSucc)
++            NonTrapSucc = Succ;
++          else if (NonTrapSucc != Succ)
++            multiple_non_trap = true;
++
++        } else {
++
++          multiple_non_trap = true;
++
++        }
++
++      }
++
++      if (TrapSucc && NonTrapSucc && !multiple_non_trap) {
++
++        BasicBlock *Y = NonTrapSucc;
++        bool        only_x_and_trap = true;
++        for (BasicBlock *Pred : predecessors(Y)) {
++
++          if (Pred != X && !isSanitizerTrapBlock(Pred)) {
++
++            only_x_and_trap = false;
++            break;
++
++          }
++
++        }
++
++        if (only_x_and_trap && !Pre.ChainNext.count(X) &&
++            !Pre.ChainPrev.count(Y)) {
++
++          Pre.ChainNext[X] = Y;
++          Pre.ChainPrev[Y] = X;
++
++        } else if (!only_x_and_trap) {
++
++          Pre.UncondTarget[X] = Y;
++
++        }
++
++        Pre.Diamonds.push_back(std::make_tuple(X, TrapSucc, Y));
++
++      }
++
++      continue;
++
++    }
++
++    auto *BI = dyn_cast_or_null<BranchInst>(X->getTerminator());
++    if (!BI || !BI->isConditional()) continue;
++
++    if (const auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
++
++      if (isAsanUarOptionLoad(Cmp->getOperand(0)) ||
++          isAsanUarOptionLoad(Cmp->getOperand(1))) {
++
++        for (unsigned idx = 0; idx < 2; ++idx) {
++
++          BasicBlock *MallocBB = BI->getSuccessor(idx);
++          BasicBlock *ThreadBB = BI->getSuccessor(1 - idx);
++          auto       *MallocBI =
++              dyn_cast_or_null<BranchInst>(MallocBB->getTerminator());
++          auto *ThreadBI =
++              dyn_cast_or_null<BranchInst>(ThreadBB->getTerminator());
++          if (!MallocBI || !MallocBI->isConditional() || !ThreadBI ||
++              !ThreadBI->isUnconditional())
++            continue;
++          BasicBlock *ContBB = ThreadBI->getSuccessor(0);
++          if ((MallocBI->getSuccessor(0) == ThreadBB &&
++               MallocBI->getSuccessor(1) == ContBB) ||
++              (MallocBI->getSuccessor(1) == ThreadBB &&
++               MallocBI->getSuccessor(0) == ContBB)) {
++
++            Pre.InternalBlocks.push_back(MallocBB);
++            Pre.InternalBlocks.push_back(ThreadBB);
++            if (!Pre.ChainNext.count(X) && !Pre.ChainPrev.count(ContBB)) {
++
++              Pre.ChainNext[X] = ContBB;
++              Pre.ChainPrev[ContBB] = X;
++
++            }
++
++            Pre.Diamonds.push_back(std::make_tuple(X, MallocBB, ThreadBB));
++            Pre.Diamonds.push_back(std::make_tuple(MallocBB, ThreadBB, ContBB));
++            break;
++
++          }
++
++        }
++
++        continue;
++
++      }
++
++      if (isAsanStackMallocValue(Cmp->getOperand(0)) ||
++          isAsanStackMallocValue(Cmp->getOperand(1))) {
++
++        BasicBlock *B0 = BI->getSuccessor(0);
++        BasicBlock *B1 = BI->getSuccessor(1);
++        auto       *B0BI = dyn_cast_or_null<BranchInst>(B0->getTerminator());
++        auto       *B1BI = dyn_cast_or_null<BranchInst>(B1->getTerminator());
++        if (B0->getSinglePredecessor() == X &&
++            B1->getSinglePredecessor() == X && B0BI &&
++            B0BI->isUnconditional() && B1BI && B1BI->isUnconditional() &&
++            B0BI->getSuccessor(0) == B1BI->getSuccessor(0)) {
++
++          BasicBlock *ExitBB = B0BI->getSuccessor(0);
++          Pre.InternalBlocks.push_back(B0);
++          Pre.InternalBlocks.push_back(B1);
++          bool only_b0_b1 = true;
++          for (BasicBlock *Pred : predecessors(ExitBB)) {
++
++            if (Pred != B0 && Pred != B1) {
++
++              only_b0_b1 = false;
++              break;
++
++            }
++
++          }
++
++          if (only_b0_b1 && !Pre.ChainNext.count(X) &&
++              !Pre.ChainPrev.count(ExitBB)) {
++
++            Pre.ChainNext[X] = ExitBB;
++            Pre.ChainPrev[ExitBB] = X;
++
++          } else if (!only_b0_b1) {
++
++            Pre.UncondTarget[X] = ExitBB;
++
++          }
++
++          Pre.Diamonds.push_back(std::make_tuple(B0, B1, ExitBB));
++          continue;
++
++        }
++
++      }
++
++    }
++
++    for (unsigned idx = 0; idx < 2; ++idx) {
++
++      BasicBlock *CheckBB = BI->getSuccessor(idx);
++      BasicBlock *Y = BI->getSuccessor(1 - idx);
++      if (Y == X || isSanitizerTrapBlock(Y)) continue;
++
++      if (isSanitizerTrapBlock(CheckBB)) {
++
++        Pre.InternalBlocks.push_back(CheckBB);
++        bool only_x_and_check = true;
++        for (BasicBlock *Pred : predecessors(Y)) {
++
++          if (Pred != X && Pred != CheckBB) {
++
++            only_x_and_check = false;
++            break;
++
++          }
++
++        }
++
++        if (only_x_and_check && !Pre.ChainNext.count(X) &&
++            !Pre.ChainPrev.count(Y)) {
++
++          Pre.ChainNext[X] = Y;
++          Pre.ChainPrev[Y] = X;
++
++        } else if (!only_x_and_check) {
++
++          Pre.UncondTarget[X] = Y;
++
++        }
++
++        Pre.Diamonds.push_back(std::make_tuple(X, CheckBB, Y));
++        break;
++
++      }
++
++      if (const BasicBlock *Trap = getSanitizerSlowPathTrap(CheckBB, X, Y)) {
++
++        Pre.InternalBlocks.push_back(CheckBB);
++        Pre.InternalBlocks.push_back(const_cast<BasicBlock *>(Trap));
++        bool only_x_and_slow = true;
++        for (BasicBlock *Pred : predecessors(Y)) {
++
++          if (Pred != X && Pred != CheckBB) {
++
++            only_x_and_slow = false;
++            break;
++
++          }
++
++        }
++
++        if (only_x_and_slow && !Pre.ChainNext.count(X) &&
++            !Pre.ChainPrev.count(Y)) {
++
++          Pre.ChainNext[X] = Y;
++          Pre.ChainPrev[Y] = X;
++
++        } else if (!only_x_and_slow) {
++
++          Pre.UncondTarget[X] = Y;
++
++        }
++
++        Pre.Diamonds.push_back(std::make_tuple(X, CheckBB, Y));
++        break;
++
++      }
++
++    }
++
++  }
++
++  return Pre;
++
++}
++
++SanitizerCFGInfo finalizeSanitizerCFG(Function                    &F,
++                                      const SanitizerPreSplitInfo &Pre) {
++
++  SanitizerCFGInfo Info;
++
++  for (BasicBlock *B : Pre.InternalBlocks)
++    Info.SkipBlocks.insert(B);
++
++  for (BasicBlock &BB : F) {
++
++    if (isSanitizerTrapBlock(&BB)) Info.SkipBlocks.insert(&BB);
++
++  }
++
++  for (const auto &D : Pre.Diamonds) {
++
++    BasicBlock *FastPred = std::get<0>(D);
++    BasicBlock *SlowPred = std::get<1>(D);
++    BasicBlock *ContBB = std::get<2>(D);
++    for (BasicBlock *P : predecessors(ContBB)) {
++
++      if (P == FastPred || P == SlowPred) continue;
++      BasicBlock *SP = P->getSinglePredecessor();
++      if (SP == FastPred || (SlowPred && SP == SlowPred)) {
++
++        if (&*P->getFirstNonPHIOrDbg() == P->getTerminator())
++          Info.SkipBlocks.insert(P);
++
++      }
++
++    }
++
++  }
++
++  for (const auto &KV : Pre.ChainNext) {
++
++    BasicBlock *X = KV.first;
++    BasicBlock *Y = KV.second;
++    Info.SkipBlocks.insert(Y);
++
++    if (!Pre.ChainPrev.count(X)) {
++
++      SmallPtrSet<const BasicBlock *, 16> Seen;
++      BasicBlock                         *Cur = X;
++      while (Pre.ChainNext.count(Cur) && Seen.insert(Cur).second) {
++
++        Info.ChainHead[Cur] = X;
++        Cur = Pre.ChainNext.lookup(Cur);
++
++      }
++
++      Info.ChainHead[Cur] = X;
++      Info.ChainTail[X] = Cur;
++
++    }
++
++  }
++
++  for (const auto &KV : Pre.UncondTarget)
++    Info.UncondTarget[KV.first] = KV.second;
++
++  for (const BasicBlock *BB : Info.SkipBlocks)
++    markAflSyntheticBlock(const_cast<BasicBlock *>(BB));
++
++  return Info;
++
++}
++
+ bool isAflCovInterestingInstruction(Instruction &I) {
+ 
+-  if (I.getMetadata("afl.skip")) return false;
++  if (I.getMetadata("afl.skip") ||
++      I.hasMetadata(LLVMContext::MD_nosanitize) ||
++      isSanitizerTrapBlock(I.getParent()) ||
++      isSanitizerOnlyValue(I))
++    return false;
+ 
+   switch (I.getOpcode()) {
+ 
+--- a/instrumentation/afl-llvm-common.h	2026-11-06 23:21:07.469177000 +0000
++++ b/instrumentation/afl-llvm-common.h	2026-11-06 23:21:07.476177000 +0000
+@@ -33,6 +33,8 @@
+ #include "llvm/Config/llvm-config.h"
+ 
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/SmallPtrSet.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/IR/IRBuilder.h"
+ #include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/IR/BasicBlock.h"
+@@ -408,6 +410,66 @@
+ 
+ }
+ 
++bool isSanitizerTrapCall(const llvm::CallBase *CB);
++bool isSanitizerTrapBlock(const llvm::BasicBlock *BB);
++bool isSanitizerOnlyValue(const llvm::Instruction &Root);
++
++/* Pre-pass before SplitAllCriticalEdges: records sanitizer check chains and
++   diamond checks so that critical-edge blocks created for them can be skipped
++   after SplitAllCriticalEdges runs. */
++struct SanitizerPreSplitInfo {
++
++  llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> ChainPrev;
++  llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> ChainNext;
++  llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> UncondTarget;
++  llvm::SmallVector<llvm::BasicBlock *, 16>              InternalBlocks;
++  llvm::SmallVector<
++      std::tuple<llvm::BasicBlock *, llvm::BasicBlock *, llvm::BasicBlock *>, 8>
++      Diamonds;
++
++};
++
++struct SanitizerCFGInfo {
++
++  llvm::DenseMap<const llvm::BasicBlock *, const llvm::BasicBlock *> ChainHead;
++  llvm::DenseMap<const llvm::BasicBlock *, const llvm::BasicBlock *> ChainTail;
++  llvm::DenseMap<const llvm::BasicBlock *, const llvm::BasicBlock *>
++                                                  UncondTarget;
++  llvm::SmallPtrSet<const llvm::BasicBlock *, 32> SkipBlocks;
++
++  const llvm::BasicBlock *getHead(const llvm::BasicBlock *BB) const {
++
++    auto it = ChainHead.find(BB);
++    return it != ChainHead.end() ? it->second : BB;
++
++  }
++
++  const llvm::BasicBlock *getTail(const llvm::BasicBlock *BB) const {
++
++    auto it = ChainTail.find(BB);
++    return it != ChainTail.end() ? it->second : BB;
++
++  }
++
++  const llvm::BasicBlock *getUncondTarget(const llvm::BasicBlock *BB) const {
++
++    auto it = UncondTarget.find(BB);
++    return it != UncondTarget.end() ? it->second : nullptr;
++
++  }
++
++  bool isSkippedBlock(const llvm::BasicBlock *BB) const {
++
++    return SkipBlocks.contains(BB);
++
++  }
++
++};
++
++SanitizerPreSplitInfo analyzeSanitizerPreSplit(llvm::Function &F);
++SanitizerCFGInfo      finalizeSanitizerCFG(llvm::Function              &F,
++                                           const SanitizerPreSplitInfo &Pre);
++
+ /* Load __afl_area_ptr once at function entry and return the loaded value.
+    Creates a preamble basic block so later per-block instrumentation never
+    sees or displaces this load.  The load is marked invariant because

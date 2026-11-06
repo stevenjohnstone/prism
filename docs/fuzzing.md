@@ -5,8 +5,9 @@ We use fuzzing to test the various entrypoints to the library. The fuzzer we use
 ```
 test/fuzz
 ├── Makefile                  make targets for building, running, triaging, and coverage
+├── aflplusplus.patch         patch for AFL++ LTO/PCGUARD passes to skip sanitizer checks
 ├── corpus
-│   └── parse                 fuzzing corpus for parsing (a symlink to our fixtures)
+│   └── parse                 fuzzing corpus for parsing (a symlink to our fixtures)
 ├── coverage.c                driver for coverage collection
 ├── dict                      an AFL++ dictionary containing various tokens
 ├── docker
@@ -28,9 +29,10 @@ test/fuzz
     ├── halfempty.sh          script to use Google Project Zero's halfempty minimizer
     ├── halfempty_compare.sh  identifies similar backtraces
     ├── kill.sh               manages graceful shutdown of tmux
-    ├── signature.sh          generates a crash signature hash
-    ├── status.rb             live terminal dashboard for the fuzzer fleet
-    └── triage.rb             automagic triage of crashes
+     ├── signature.sh          generates a crash signature hash
+     ├── status.rb             live terminal dashboard for the fuzzer fleet
+     ├── test_afl_patch.sh     verifies sanitizer-free AFL++ coverage guidance
+     └── triage.rb             automagic triage of crashes
 ```
 
 ## Requirements
@@ -71,6 +73,8 @@ This command will start a docker container running `FUZZ_WORKERS` fuzzers (defau
 > **Arena Granularity (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, Prism's arena allocator (`src/arena.c`) sub-allocates AST nodes and strings out of 8 KB blocks, which means an out-of-bounds read or write on one arena allocation can silently spill into adjacent allocations within the same block without triggering AddressSanitizer. Fuzzing and triage binaries are compiled with `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` always returns the exact requested size (`min_size`). Every `pm_arena_alloc` call therefore allocates its own exact-sized `xmalloc` block surrounded by ASAN heap redzones, while `pm_arena_cleanup` still walks the block list and frees all blocks without leaking memory.
 >
 > **Write-Only ASAN (`-asan-instrument-reads=0`)**: `build/fuzz` (used by the `main` and `main-2..N` fuzzers) is compiled with `-mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0` so AddressSanitizer only instruments stores (illegal writes) and does not abort on out-of-bounds reads, leaving read issues to the `msan` fuzzer (`build/fuzz.msan`).
+>
+> **Sanitizer-Free Coverage Instrumentation (`test/fuzz/aflplusplus.patch`)**: In LTO mode (`afl-clang-lto`), Clang runs AddressSanitizer, MemorySanitizer, and UBSAN during `-c` pre-link compilation before `SanitizerCoverageLTO.so` runs in `ld.lld`. Unpatched AFL++ instruments every sanitizer check branch, trap block, ASAN stack-use-after-return prologue/epilogue, and MSAN shadow `select`/`icmp`, inflating the coverage map of `build/fuzz` and `build/fuzz.msan` by 40–130%. During `make fuzz-build`, `test/fuzz/Makefile` applies `test/fuzz/aflplusplus.patch` and builds patched `SanitizerCoverageLTO.so` and `SanitizerCoveragePCGUARD.so` plugins into `build/afl/` (passed via `AFL_PATH`), stripping sanitizer-synthesized CFG edges and branchless shadow selects so all fuzzers (`fuzz`, `fuzz.ldet`, `fuzz.lsan`, and `fuzz.msan`) share near-identical coverage maps focused solely on Prism's control flow. In addition, `build/fuzz.msan` omits `-fsanitize-memory-track-origins=2` for higher fuzzing throughput and cleaner CFG structure, while `test/fuzz/tools/build.memory.sh` retains `-fsanitize-memory-track-origins=2` to report full uninitialized-memory origin chains when reproducing crashes.
 
 ### Fleet Dashboard
 

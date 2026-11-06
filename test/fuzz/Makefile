@@ -15,13 +15,28 @@ FUZZ_FLAGS := -DPM_ARENA_INITIAL_SIZE=0 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_S
 FUZZ_SOURCES := $(SOURCES) test/fuzz/parse.c test/fuzz/fuzz.c
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
+FUZZ_AFL_STAMP := ./build/.fuzz.afl.stamp
 FUZZ_BUILD_STAMP := ./build/.fuzz.build.stamp
 FUZZ_GRAMMAR_STAMP := ./build/.fuzz.grammar.stamp
 FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
 FUZZ_TMPFS_FLAGS := --tmpfs /tmp:rw,exec,mode=1777
 
-fuzz-build: $(FUZZ_BUILD_STAMP) $(FUZZ_GRAMMAR_STAMP)
+fuzz-build: $(FUZZ_AFL_STAMP) $(FUZZ_BUILD_STAMP) $(FUZZ_GRAMMAR_STAMP)
 	$(ECHO) "Fuzzers up to date"
+
+$(FUZZ_AFL_STAMP): test/fuzz/aflplusplus.patch
+	$(Q) $(MAKEDIRS) $(@D) build/afl
+	$(ECHO) "patching and building AFL++ instrumentation passes"
+	$(Q) rm -rf build/afl-src
+	$(Q) $(MAKEDIRS) build/afl-src
+	$(Q) cp -r /AFLplusplus/instrumentation /AFLplusplus/include /AFLplusplus/GNUmakefile.llvm build/afl-src/
+	$(Q) ln -sf /AFLplusplus/afl-showmap build/afl-src/afl-showmap
+	$(Q) git apply --unsafe-paths --directory=build/afl-src $(CURDIR)/test/fuzz/aflplusplus.patch
+	$(Q) $(MAKE) -C build/afl-src -f GNUmakefile.llvm LLVM_CONFIG=llvm-config-20 ./SanitizerCoverageLTO.so ./SanitizerCoveragePCGUARD.so
+	$(Q) ln -sf /usr/local/lib/afl/* build/afl/
+	$(Q) cp -f build/afl-src/SanitizerCoverageLTO.so build/afl-src/SanitizerCoveragePCGUARD.so build/afl/
+	$(Q) rm -rf build/afl-src
+	$(Q) touch $@
 
 $(FUZZ_GRAMMAR_STAMP): test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mutator.patch
 	$(Q) $(MAKEDIRS) $(@D)
@@ -33,24 +48,24 @@ $(FUZZ_GRAMMAR_STAMP): test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mut
 	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/grammar_generator-ruby build/grammar_generator-ruby
 	$(Q) touch $@
 
-$(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/Makefile
+$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN"
-	$(Q) AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -fsanitize-memory-track-origins=2 -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
 	$(ECHO) "building with LSAN"
-	$(Q) AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
 	$(ECHO) "building with custom leak detector"
-	$(Q) afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Itest/fuzz/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ldet $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Itest/fuzz/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ldet $(FUZZ_SOURCES)
 	$(ECHO) "building main fuzz binary"
 	# Disable ASAN read instrumentation (-asan-instrument-reads=0) so the main
 	# and grammar fuzzers focus on illegal writes, UBSAN, and assertions without
 	# stopping on out-of-bounds reads (covered by MSAN). Both -mllvm and
 	# -Wl,-mllvm are required because afl-clang-lto runs ASAN during LTO linking.
-	$(Q) AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0 -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0 -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
 	$(ECHO) "building cmplog binary"
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
-	$(Q) AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
 
@@ -96,6 +111,10 @@ fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "collecting coverage"
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/tools/coverage.sh
 
+fuzz-test: fuzz-docker-build
+	$(ECHO) "testing AFL++ instrumentation patch"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/tools/test_afl_patch.sh"
+
 define TTY_CONFIRM
 @if [ -t 1 ]; then \
 	echo "$(1) (Y/n)"; \
@@ -118,5 +137,5 @@ fuzz-clean:
 	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_COVERAGE_DIR)
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-coverage
+.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-coverage fuzz-test
 
