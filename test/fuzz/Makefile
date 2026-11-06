@@ -16,13 +16,14 @@ FUZZ_SOURCES := $(SOURCES) test/fuzz/parse.c test/fuzz/fuzz.c
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
 FUZZ_BUILD_STAMP := ./build/.fuzz.build.stamp
+FUZZ_GRAMMAR_STAMP := ./build/.fuzz.grammar.stamp
 FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
 FUZZ_TMPFS_FLAGS := --tmpfs /tmp:rw,exec,mode=1777
 
-fuzz-build: $(FUZZ_BUILD_STAMP)
+fuzz-build: $(FUZZ_BUILD_STAMP) $(FUZZ_GRAMMAR_STAMP)
 	$(ECHO) "Fuzzers up to date"
 
-$(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mutator.patch test/fuzz/Makefile
+$(FUZZ_GRAMMAR_STAMP): test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mutator.patch
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building grammar mutator"
 	$(Q) git -C /AFLplusplus/Grammar-Mutator checkout -- .
@@ -30,6 +31,10 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocat
 	$(Q) $(MAKE) -C /AFLplusplus/Grammar-Mutator GRAMMAR_FILE=$(CURDIR)/test/fuzz/grammar/ruby.json
 	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/libgrammarmutator-ruby.so build/libgrammarmutator-ruby.so
 	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/grammar_generator-ruby build/grammar_generator-ruby
+	$(Q) touch $@
+
+$(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/Makefile
+	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN"
 	$(Q) AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -fsanitize-memory-track-origins=2 -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
 	$(ECHO) "building with LSAN"
