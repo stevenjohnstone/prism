@@ -22,8 +22,14 @@ FUZZ_TMPFS_FLAGS := --tmpfs /tmp:rw,exec,mode=1777
 fuzz-build: $(FUZZ_BUILD_STAMP)
 	$(ECHO) "Fuzzers up to date"
 
-$(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/Makefile
+$(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mutator.patch test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
+	$(ECHO) "building grammar mutator"
+	$(Q) git -C /AFLplusplus/Grammar-Mutator checkout -- .
+	$(Q) git -C /AFLplusplus/Grammar-Mutator apply $(CURDIR)/test/fuzz/grammar/grammar-mutator.patch
+	$(Q) $(MAKE) -C /AFLplusplus/Grammar-Mutator GRAMMAR_FILE=$(CURDIR)/test/fuzz/grammar/ruby.json
+	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/libgrammarmutator-ruby.so build/libgrammarmutator-ruby.so
+	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/grammar_generator-ruby build/grammar_generator-ruby
 	$(ECHO) "building with MSAN"
 	$(Q) AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -fsanitize-memory-track-origins=2 -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
 	$(ECHO) "building with LSAN"
@@ -46,7 +52,7 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocat
 fuzz-docker-build: $(FUZZ_DOCKER_STAMP)
 	$(ECHO) "Docker image is up to date"
 
-$(FUZZ_DOCKER_STAMP): test/fuzz/docker/Dockerfile test/fuzz/grammar/ruby.json Gemfile Gemfile.lock prism.gemspec
+$(FUZZ_DOCKER_STAMP): test/fuzz/docker/Dockerfile Gemfile Gemfile.lock prism.gemspec
 	$(ECHO) "building docker image"
 	$(Q) docker build -t prism/fuzz -f test/fuzz/docker/Dockerfile .
 	$(Q) $(MAKEDIRS) build

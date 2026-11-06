@@ -1,0 +1,123 @@
+diff --git a/GNUmakefile b/GNUmakefile
+index 4d56fa0..2105ef8 100644
+--- a/GNUmakefile
++++ b/GNUmakefile
+@@ -78,10 +78,10 @@ GEN_FILES = \
+ all: build
+
+ # Generation
+-src/f1_c_fuzz.c include/f1_c_fuzz.h: grammars/f1_c_gen.py .grammar
++src/f1_c_fuzz.c include/f1_c_fuzz.h &: grammars/f1_c_gen.py .grammar $(GRAMMAR_FILE)
+ 	$(PYTHON) grammars/f1_c_gen.py $(shell cat .grammar) $(CURDIR)
+
+-lib/antlr4_shim/generated: grammars/f1_g4_translate.py .grammar
++lib/antlr4_shim/generated: grammars/f1_g4_translate.py .grammar $(GRAMMAR_FILE)
+ 	$(PYTHON) grammars/f1_g4_translate.py $(shell cat .grammar) ./grammars
+ 	@$(MAKE) -C lib clean
+ 	java -jar $(ANTLR_JAR_LOCATION) \
+diff --git a/src/Makefile b/src/Makefile
+index d360004..3044f5c 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -66,7 +66,7 @@ grammar_generator.o: grammar_generator.c
+ 	$(CC) $(C_DEFINES) -I../include $(C_FLAGS) -o $@ -c $<
+
+ $(GRAMMAR_GENERATOR_PROM): $(GEN_OBJS) $(GRAMMAR_MUTATOR_LIB)
+-	$(CXX) $(C_FLAGS) $< -o $@ -Wl,-rpath,$(realpath ./) $(GRAMMAR_MUTATOR_LIB)
++	$(CXX) $(C_FLAGS) $< -o $@ -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(realpath ./) $(GRAMMAR_MUTATOR_LIB)
+
+ benchmark/benchmark.o: benchmark/benchmark.c
+ 	$(CC) $(C_DEFINES) -I../include $(C_FLAGS) -o $@ -c $<
+diff --git a/src/grammar_mutator.c b/src/grammar_mutator.c
+index ca2171a..a88823c 100644
+--- a/src/grammar_mutator.c
++++ b/src/grammar_mutator.c
+@@ -194,26 +194,26 @@ uint8_t afl_custom_queue_get(my_mutator_t *data, const uint8_t *filename) {
+
+   } else {
+
+-    // Copy "/trees" (including the null) to replace the old folder name
+-    memcpy(last_dir, "/trees", 7);
++    const char *tree_dir = "/tmp/afl-tmpdir/grammar/trees";
+
+     // Set up the (expected) tree filename
+     snprintf(
+-        data->tree_fn_cur, PATH_MAX - 1, "%s/%s", tree_out_dir,
++        data->tree_fn_cur, PATH_MAX - 1, "%s/%s", tree_dir,
+         use_name);
+
+     // Check if we need to create the tree output directory
+     if (unlikely(data->tree_out_dir_exist == 0)) {
+
+       // Check whether the directory exists
+-      if (!create_directory(tree_out_dir)) {
++      if (!create_directory(tree_dir)) {
+
+         // error
+         perror("Cannot create the output directory (afl_custom_queue_get)");
+         free(tree_out_dir);
+         return 0;
+
+       }
++      data->tree_out_dir_exist = 1;
+
+     }
+
+@@ -234,20 +234,7 @@ uint8_t afl_custom_queue_get(my_mutator_t *data, const uint8_t *filename) {
+
+   }
+
+-  // try to parse the test case
+-  data->tree_cur = load_tree_from_test_case(fn);
+-  if (data->tree_cur) {
+-
+-    // Now that we've parsed it, cache the info from this test case in
+-    // our trees folder and in the chunk store
+-    tree_get_size(data->tree_cur);
+-    if (strlen(data->tree_fn_cur)) write_tree_to_file(data->tree_cur, data->tree_fn_cur);
+-    chunk_store_add_tree(data->tree_cur);
+-    return 1;
+-
+-  }
+-
+-  // parsing error, skip the current test case
++  // Skip test cases without a pre-existing serialized tree.
+
+   return 0;
+
+@@ -723,29 +710,28 @@ uint8_t afl_custom_queue_new_entry(my_mutator_t * data,
+   // NOTE: Unlike afl_custom_queue_get(), this function should ALWAYS have /queue/ as the last
+   //       directory in its filename, so the following simplified parsing is acceptable.
+   const char *fn = (const char *)filename_new_queue;
+-  snprintf(data->new_tree_fn, PATH_MAX - 1, "%s", fn);
+-  char *found = strrstr(data->new_tree_fn, "/queue/");
++  const char *found = strrstr(fn, "/queue/");
+   if (unlikely(!found)) {
+
+     // Should not reach here
+     fprintf(stderr, "Invalid filename_new_queue (afl_custom_queue_new_entry)\n");
+     return 0;
+
+   }
+
+-  // Replace "queue" with "trees"
+-  memcpy(found, "/trees", 6);
++  snprintf(data->new_tree_fn, PATH_MAX - 1, "/tmp/afl-tmpdir/grammar/trees/%s",
++           found + 7);
+
+   tree_t *tree = data->mutated_tree;
+   if (unlikely(!tree)) {
+
+     /* The test case does not come from `afl_custom_fuzz`. For example, AFL++
+       5.03c and later add trimmed test cases during trimming. Do not call
+       `afl_custom_queue_get`, because it replaces `data->tree_cur` while the
+-      trimming loop still uses it (issue #57). Parse the test case into a
+-      separate tree. */
+-    tree = load_tree_from_test_case(fn);
++      trimming loop still uses it (issue #57). Clone the current in-memory
++      trimmed tree if present, and skip test cases synced from other fuzzers. */
++    tree = data->trimmed_tree ? tree_clone(data->trimmed_tree) : NULL;
+     if (unlikely(!tree)) return 0;
+     tree_get_size(tree);
+
+   }
