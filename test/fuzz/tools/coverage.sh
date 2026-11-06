@@ -54,6 +54,7 @@ echo "Merging profile data..."
 llvm-profdata merge -sparse -f "$FILELIST" -o "$PROFDATA_FILE"
 echo "Creating html"
 llvm-cov show ./build/fuzz.coverage -instr-profile="$PROFDATA_FILE" --format=html -o "$REPORT_DIR"
+echo "Run \`open $REPORT_DIR/index.html\` to view coverage report"
 
 rm "$FILELIST"
 
