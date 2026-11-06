@@ -27,7 +27,9 @@
  * once it gets really long because we start to see the impact of an O(n^1.58)
  * vs an O(n^2) algorithm.
  */
+#ifndef PM_INTEGER_DIVIDE_THRESHOLD
 #define PM_INTEGER_DIVIDE_THRESHOLD 224
+#endif
 
 /**
  * When printing integers of many words, we switch to a divide-and-conquer

@@ -11,7 +11,11 @@ FUZZ_HARD_RSS_LIMIT := $(shell echo $$(( $(FUZZ_MAX_ALLOCATED) * 32 )))
 # Set PM_ARENA_INITIAL_SIZE=0 so each arena allocation gets its own exact-sized
 # xmalloc block with ASAN heap redzones around it instead of packing into 8 KB
 # blocks, while still freeing all blocks via pm_arena_cleanup.
-FUZZ_FLAGS := -DPM_ARENA_INITIAL_SIZE=0 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -DFUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -DFUZZ_HARD_RSS_LIMIT=$(FUZZ_HARD_RSS_LIMIT) -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration $(FUZZ_FLAGS)
+# Set PM_INTEGER_DIVIDE_THRESHOLD=8 (72 decimal digits instead of the default
+# 224 chunks / 2,017 digits) so divide-and-conquer decimal parsing and base-2^32
+# bignum arithmetic (schoolbook and Karatsuba) are reachable within
+# FUZZ_MAX_INPUT_SIZE.
+FUZZ_FLAGS := -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -DFUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -DFUZZ_HARD_RSS_LIMIT=$(FUZZ_HARD_RSS_LIMIT) -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration $(FUZZ_FLAGS)
 FUZZ_SOURCES := $(SOURCES) test/fuzz/parse.c test/fuzz/fuzz.c
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp

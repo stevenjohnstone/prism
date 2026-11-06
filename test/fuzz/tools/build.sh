@@ -7,4 +7,4 @@ src_files=()
 while IFS= read -r -d '' file; do
   src_files+=("$file")
 done < <(find src -name '*.c' -print0)
-clang -Iinclude -DPM_ARENA_INITIAL_SIZE=0 -ggdb3 "${src_files[@]}" "$testcase" -o "$output"
+clang -Iinclude -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -ggdb3 "${src_files[@]}" "$testcase" -o "$output"
