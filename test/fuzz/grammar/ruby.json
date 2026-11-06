@@ -1,0 +1,822 @@
+{
+  "<START>": [
+    ["<OPT0>", "<OPT1>", "<OPT2>", "<OPT3>", "<PROGRAM>"]
+  ],
+  "<OPT0>": [
+    ["\u0000"],
+    ["\u0001"],
+    ["\u0002"],
+    ["\u0004"],
+    ["\u0008"],
+    ["\u0010"],
+    ["0"],
+    ["@"],
+    ["D"],
+    ["u"]
+  ],
+  "<OPT1>": [
+    ["\u0000"],
+    ["\u0001"],
+    ["\u0002"],
+    ["\u0004"],
+    ["\u0008"],
+    ["\u0010"],
+    ["\u001d"],
+    [" "],
+    ["@"],
+    ["N"]
+  ],
+  "<OPT2>": [
+    ["\u0000"],
+    ["\u0001"],
+    ["\u0002"],
+    ["\u0003"],
+    ["\u0007"],
+    ["\u000b"],
+    ["\u000f"],
+    ["\u0017"],
+    ["'"],
+    ["G"],
+    ["w"],
+    ["\u007f"]
+  ],
+  "<OPT3>": [
+    ["\u0001"],
+    ["\u0000"],
+    ["d"]
+  ],
+  "<PROGRAM>": [
+    ["<STMTS>"],
+    ["<MAGIC>", "<STMTS>"],
+    ["<STMTS>", "<TRAILER>"],
+    ["<MAGIC>", "<STMTS>", "<TRAILER>"]
+  ],
+  "<MAGIC>": [
+    ["# frozen_string_literal: true\n"],
+    ["# frozen_string_literal: false\n"],
+    ["# encoding: utf-8\n"],
+    ["# encoding: ascii-8bit\n"],
+    ["# encoding: us-ascii\n"],
+    ["# encoding: euc-jp\n"],
+    ["# encoding: windows-31j\n"],
+    ["# warn_indent: true\n"],
+    ["# shareable_constant_value: literal\n"],
+    ["# shareable_constant_value: experimental_everything\n"],
+    ["# shareable_constant_value: experimental_copy\n"],
+    ["# shareable_constant_value: none\n"],
+    ["#!/usr/bin/ruby\n"],
+    ["<MAGIC_LINE>", "<MAGIC>"]
+  ],
+  "<MAGIC_LINE>": [
+    ["# frozen_string_literal: true\n"],
+    ["# encoding: utf-8\n"],
+    ["# shareable_constant_value: literal\n"]
+  ],
+  "<TRAILER>": [
+    ["\n=begin\ndoc\n=end\n"],
+    ["\n__END__\ndata\n"]
+  ],
+  "<SEP>": [
+    ["\n"],
+    ["; "]
+  ],
+  "<STMTS>": [
+    ["<STMT>"],
+    ["<STMT>", "<SEP>", "<STMTS>"]
+  ],
+  "<STMT>": [
+    ["<SIMPLE_STMT>"],
+    ["<SIMPLE_STMT>", " if ", "<EXPR>"],
+    ["<SIMPLE_STMT>", " unless ", "<EXPR>"],
+    ["<SIMPLE_STMT>", " while ", "<EXPR>"],
+    ["<SIMPLE_STMT>", " until ", "<EXPR>"],
+    ["<SIMPLE_STMT>", " rescue ", "<EXPR>"],
+    ["<HEREDOC_STMT>"]
+  ],
+  "<SIMPLE_STMT>": [
+    ["<EXPR>"],
+    ["<ASSIGN_STMT>"],
+    ["<DEF_STMT>"],
+    ["<CLASS_STMT>"],
+    ["<CONTROL_STMT>"],
+    ["<JUMP_STMT>"],
+    ["<DIRECTIVE_STMT>"]
+  ],
+  "<ASSIGN_STMT>": [
+    ["<LHS>", " = ", "<EXPR>"],
+    ["<LHS>", " ", "<OP_ASGN>", " ", "<EXPR>"],
+    ["<MLHS>", " = ", "<MRHS>"],
+    ["<EXPR>", " => ", "<PATTERN>"],
+    ["<EXPR>", " in ", "<PATTERN>"]
+  ],
+  "<LHS>": [
+    ["<VAR>"],
+    ["<IVAR>"],
+    ["<CVAR>"],
+    ["<GVAR>"],
+    ["<CONST_PATH>"],
+    ["<PRIMARY>", "[", "<OPT_CALL_ARGS>", "]"],
+    ["<PRIMARY>", ".", "<ID>"],
+    ["<PRIMARY>", "&.", "<ID>"]
+  ],
+  "<MLHS>": [
+    ["<MLHS_ITEM>", ", ", "<MLHS_TAIL>"],
+    ["(", "<MLHS>", "), ", "<MLHS_ITEM>"],
+    ["*", "<LHS>"],
+    ["*", ", ", "<MLHS_ITEM>"]
+  ],
+  "<MLHS_TAIL>": [
+    ["<MLHS_ITEM>"],
+    ["*", "<LHS>"],
+    ["*", "<LHS>", ", ", "<MLHS_ITEM>"],
+    ["*"],
+    ["<MLHS_ITEM>", ", ", "<MLHS_TAIL>"]
+  ],
+  "<MLHS_ITEM>": [
+    ["<LHS>"],
+    ["(", "<MLHS>", ")"]
+  ],
+  "<MRHS>": [
+    ["<EXPR>"],
+    ["*", "<EXPR>"],
+    ["<EXPR>", ", ", "<MRHS>"],
+    ["*", "<EXPR>", ", ", "<MRHS>"]
+  ],
+  "<OP_ASGN>": [
+    ["+="],
+    ["-="],
+    ["*="],
+    ["**="],
+    ["/="],
+    ["%="],
+    ["||="],
+    ["&&="],
+    ["|="],
+    ["&="],
+    ["^="],
+    ["<<="],
+    [">>="]
+  ],
+  "<DEF_STMT>": [
+    ["def ", "<METHOD_NAME>", "\n", "<BODY_STMTS>", "\nend"],
+    ["def ", "<METHOD_NAME>", "(", "<OPT_PARAMS>", ")\n", "<BODY_STMTS>", "\nend"],
+    ["def ", "<SINGLETON_TARGET>", ".", "<METHOD_NAME>", "(", "<OPT_PARAMS>", ")\n", "<BODY_STMTS>", "\nend"],
+    ["def ", "<METHOD_NAME>", "(", "<OPT_PARAMS>", ") = ", "<EXPR>"],
+    ["def ", "<SINGLETON_TARGET>", ".", "<METHOD_NAME>", "(", "<OPT_PARAMS>", ") = ", "<EXPR>"]
+  ],
+  "<SINGLETON_TARGET>": [
+    ["self"],
+    ["<VAR>"],
+    ["<CONST>"],
+    ["(", "<EXPR>", ")"]
+  ],
+  "<METHOD_NAME>": [
+    ["<ID>"],
+    ["<ID>", "?"],
+    ["<ID>", "!"],
+    ["<ID>", "="],
+    ["[]"],
+    ["[]="],
+    ["<=", ">"],
+    ["==="],
+    ["=="],
+    ["=~"],
+    ["!~"],
+    ["+@"],
+    ["-@"],
+    ["**"],
+    ["<<"],
+    [">>"],
+    ["`"]
+  ],
+  "<OPT_PARAMS>": [
+    [],
+    ["<PARAMS>"]
+  ],
+  "<PARAMS>": [
+    ["<PARAM>"],
+    ["..."],
+    ["<PARAM>", ", ", "<PARAMS>"]
+  ],
+  "<PARAM>": [
+    ["<ID>"],
+    ["(", "<DESTRUCT_PARAMS>", ")"],
+    ["<ID>", " = ", "<EXPR>"],
+    ["*", "<ID>"],
+    ["*"],
+    ["<ID>", ":"],
+    ["<ID>", ": ", "<EXPR>"],
+    ["**", "<ID>"],
+    ["**"],
+    ["**nil"],
+    ["&", "<ID>"],
+    ["&"]
+  ],
+  "<DESTRUCT_PARAMS>": [
+    ["<ID>", ", ", "<ID>"],
+    ["<ID>", ", *", "<ID>"],
+    ["<ID>", ", (", "<DESTRUCT_PARAMS>", ")"]
+  ],
+  "<CLASS_STMT>": [
+    ["class ", "<CONST_PATH>", "\n", "<BODY_STMTS>", "\nend"],
+    ["class ", "<CONST_PATH>", " < ", "<EXPR>", "\n", "<BODY_STMTS>", "\nend"],
+    ["class << ", "<EXPR>", "\n", "<BODY_STMTS>", "\nend"],
+    ["module ", "<CONST_PATH>", "\n", "<BODY_STMTS>", "\nend"]
+  ],
+  "<BODY_STMTS>": [
+    ["<STMTS>"],
+    ["<STMTS>", "\n", "<RESCUE_CLAUSE>"],
+    ["<STMTS>", "\n", "<RESCUE_CLAUSE>", "\nelse\n", "<STMTS>"],
+    ["<STMTS>", "\n", "<RESCUE_CLAUSE>", "\nensure\n", "<STMTS>"],
+    ["<STMTS>", "\nensure\n", "<STMTS>"]
+  ],
+  "<RESCUE_CLAUSE>": [
+    ["rescue\n", "<STMTS>"],
+    ["rescue => ", "<LHS>", "\n", "<STMTS>"],
+    ["rescue ", "<MRHS>", "\n", "<STMTS>"],
+    ["rescue ", "<MRHS>", " => ", "<LHS>", "\n", "<STMTS>"],
+    ["rescue ", "<MRHS>", " => ", "<LHS>", "\n", "<STMTS>", "\n", "<RESCUE_CLAUSE>"]
+  ],
+  "<CONTROL_STMT>": [
+    ["if ", "<EXPR>", "\n", "<STMTS>", "<ELSIF_OPT>", "<ELSE_OPT>", "\nend"],
+    ["unless ", "<EXPR>", "\n", "<STMTS>", "<ELSE_OPT>", "\nend"],
+    ["while ", "<EXPR>", "\n", "<STMTS>", "\nend"],
+    ["until ", "<EXPR>", "\n", "<STMTS>", "\nend"],
+    ["for ", "<MLHS_ITEM>", " in ", "<EXPR>", "\n", "<STMTS>", "\nend"],
+    ["for ", "<MLHS>", " in ", "<EXPR>", "\n", "<STMTS>", "\nend"],
+    ["case ", "<EXPR>", "\n", "<WHEN_CLAUSES>", "<ELSE_OPT>", "\nend"],
+    ["case\n", "<WHEN_CLAUSES>", "<ELSE_OPT>", "\nend"],
+    ["case ", "<EXPR>", "\n", "<IN_CLAUSES>", "<ELSE_OPT>", "\nend"],
+    ["begin\n", "<BODY_STMTS>", "\nend"]
+  ],
+  "<ELSIF_OPT>": [
+    [],
+    ["\nelsif ", "<EXPR>", "\n", "<STMTS>", "<ELSIF_OPT>"]
+  ],
+  "<ELSE_OPT>": [
+    [],
+    ["\nelse\n", "<STMTS>"]
+  ],
+  "<WHEN_CLAUSES>": [
+    ["when ", "<MRHS>", "\n", "<STMTS>"],
+    ["when ", "<MRHS>", " then ", "<STMT>"],
+    ["when ", "<MRHS>", "\n", "<STMTS>", "\n", "<WHEN_CLAUSES>"]
+  ],
+  "<IN_CLAUSES>": [
+    ["<IN_CLAUSE>"],
+    ["<IN_CLAUSE>", "\n", "<IN_CLAUSES>"]
+  ],
+  "<IN_CLAUSE>": [
+    ["in ", "<PATTERN>", "\n", "<STMTS>"],
+    ["in ", "<PATTERN>", " then ", "<STMT>"],
+    ["in ", "<PATTERN>", " if ", "<EXPR>", "\n", "<STMTS>"],
+    ["in ", "<PATTERN>", " unless ", "<EXPR>", "\n", "<STMTS>"]
+  ],
+  "<PATTERN>": [
+    ["<PRIMARY_PATTERN>"],
+    ["<PRIMARY_PATTERN>", " => ", "<VAR>"],
+    ["<PRIMARY_PATTERN>", " | ", "<PATTERN>"]
+  ],
+  "<PRIMARY_PATTERN>": [
+    ["<VAR>"],
+    ["_"],
+    ["<LITERAL>"],
+    ["<CONST_PATH>"],
+    ["^", "<VAR>"],
+    ["^", "<IVAR>"],
+    ["^", "<CVAR>"],
+    ["^", "<GVAR>"],
+    ["^(", "<EXPR>", ")"],
+    ["(", "<PRIMARY_PATTERN>", "..", "<PRIMARY_PATTERN>", ")"],
+    ["[", "<ARRAY_PAT_ITEMS>", "]"],
+    ["<CONST_PATH>", "[", "<ARRAY_PAT_ITEMS>", "]"],
+    ["<CONST_PATH>", "(", "<ARRAY_PAT_ITEMS>", ")"],
+    ["[", "*", "<OPT_VAR>", ", ", "<PRIMARY_PATTERN>", ", *", "<OPT_VAR>", "]"],
+    ["<CONST_PATH>", "[", "*", "<OPT_VAR>", ", ", "<PRIMARY_PATTERN>", ", *", "<OPT_VAR>", "]"],
+    ["{", "<HASH_PAT_ITEMS>", "}"],
+    ["<CONST_PATH>", "[", "<HASH_PAT_ITEMS>", "]"]
+  ],
+  "<OPT_VAR>": [
+    [],
+    ["<VAR>"]
+  ],
+  "<ARRAY_PAT_ITEMS>": [
+    [],
+    ["<PATTERN>"],
+    ["*", "<OPT_VAR>"],
+    ["<PATTERN>", ", ", "<ARRAY_PAT_ITEMS>"],
+    ["*", "<OPT_VAR>", ", ", "<PATTERN>"]
+  ],
+  "<HASH_PAT_ITEMS>": [
+    ["<ID>", ":"],
+    ["<ID>", ": ", "<PATTERN>"],
+    ["\"", "<ID>", "\": ", "<PATTERN>"],
+    ["**", "<OPT_VAR>"],
+    ["**nil"],
+    ["<ID>", ":, ", "<HASH_PAT_ITEMS>"],
+    ["<ID>", ": ", "<PATTERN>", ", ", "<HASH_PAT_ITEMS>"]
+  ],
+  "<JUMP_STMT>": [
+    ["return"],
+    ["return ", "<MRHS>"],
+    ["break"],
+    ["break ", "<MRHS>"],
+    ["next"],
+    ["next ", "<MRHS>"],
+    ["redo"],
+    ["retry"],
+    ["yield"],
+    ["yield(", "<OPT_CALL_ARGS>", ")"],
+    ["super"],
+    ["super()"],
+    ["super(", "<OPT_CALL_ARGS>", ")"],
+    ["defined?(", "<EXPR>", ")"]
+  ],
+  "<DIRECTIVE_STMT>": [
+    ["alias ", "<ALIAS_NAME>", " ", "<ALIAS_NAME>"],
+    ["alias ", "<GVAR>", " ", "<GVAR>"],
+    ["undef ", "<UNDEF_LIST>"],
+    ["BEGIN {\n", "<STMTS>", "\n}"],
+    ["END {\n", "<STMTS>", "\n}"]
+  ],
+  "<ALIAS_NAME>": [
+    ["<METHOD_NAME>"],
+    [":", "<METHOD_NAME>"],
+    [":\"a#{", "<EXPR>", "}\""]
+  ],
+  "<UNDEF_LIST>": [
+    ["<ALIAS_NAME>"],
+    ["<ALIAS_NAME>", ", ", "<UNDEF_LIST>"]
+  ],
+  "<HEREDOC_STMT>": [
+    ["<<A\n", "<HEREDOC_BODY>", "\nA"],
+    ["<<-A\n  ", "<HEREDOC_BODY>", "\n  A"],
+    ["<<~A\n  ", "<HEREDOC_BODY>", "\n  A"],
+    ["<<'A'\n", "<HEREDOC_BODY>", "\nA"],
+    ["<<\"A\"\n", "<HEREDOC_BODY>", "\nA"],
+    ["<<`A`\n", "<HEREDOC_BODY>", "\nA"],
+    ["<<~A.", "<ID>", "\n  ", "<HEREDOC_BODY>", "\nA"],
+    ["a(<<A, <<~B)\n", "<HEREDOC_BODY>", "\nA\n  ", "<HEREDOC_BODY>", "\nB"]
+  ],
+  "<HEREDOC_BODY>": [
+    ["hello"],
+    ["#{", "<STMTS>", "}"],
+    ["#@a #@@a #$a"],
+    ["  hello #{", "<EXPR>", "} world"]
+  ],
+  "<EXPR>": [
+    ["<PRIMARY>"],
+    ["<MATH_EXPR>"],
+    ["<UNARY_OP>", "<EXPR>"],
+    ["<PRIMARY>", " ", "<BIN_OP>", " ", "<EXPR>"],
+    ["<PRIMARY>", "<BIN_OP>", "<EXPR>"],
+    ["<PRIMARY>", " ? ", "<EXPR>", " : ", "<EXPR>"],
+    ["<PRIMARY>", "..", "<PRIMARY>"],
+    ["<PRIMARY>", "...", "<PRIMARY>"],
+    ["..", "<PRIMARY>"],
+    ["...", "<PRIMARY>"],
+    ["<PRIMARY>", ".."],
+    ["<PRIMARY>", "..."],
+    ["<LAMBDA_EXPR>"],
+    ["<COMMAND_CALL>"]
+  ],
+  "<MATH_EXPR>": [
+    ["<MATH_TERM>", " ", "<MATH_OP>", " ", "<MATH_EXPR>"],
+    ["<MATH_TERM>", "<MATH_OP>", "<MATH_EXPR>"],
+    ["(", "<MATH_EXPR>", ") ", "<MATH_OP>", " ", "<MATH_EXPR>"],
+    ["-", "<NUMBER>", "**", "<MATH_TERM>"],
+    ["~", "<MATH_TERM>"]
+  ],
+  "<MATH_TERM>": [
+    ["<NUMBER>"],
+    ["<VAR>"],
+    ["(", "<MATH_EXPR>", ")"]
+  ],
+  "<MATH_OP>": [
+    ["+"],
+    ["-"],
+    ["*"],
+    ["**"],
+    ["/"],
+    ["%"],
+    ["<<"],
+    [">>"],
+    ["&"],
+    ["|"],
+    ["^"],
+    ["<=", ">"]
+  ],
+  "<UNARY_OP>": [
+    ["!"],
+    ["not "],
+    ["~"],
+    ["-"],
+    ["+"]
+  ],
+  "<BIN_OP>": [
+    ["+"],
+    ["-"],
+    ["*"],
+    ["**"],
+    ["/"],
+    ["%"],
+    ["<<"],
+    [">>"],
+    ["&"],
+    ["|"],
+    ["^"],
+    ["=="],
+    ["!="],
+    ["==="],
+    ["<=", ">"],
+    ["<"],
+    ["<="],
+    [">"],
+    [">="],
+    ["=~"],
+    ["!~"],
+    ["&&"],
+    ["||"],
+    ["and"],
+    ["or"]
+  ],
+  "<LAMBDA_EXPR>": [
+    ["-> {}"],
+    ["-> { ", "<STMTS>", " }"],
+    ["->(", "<LAMBDA_PARAMS>", ") { ", "<STMTS>", " }"],
+    ["-> ", "<LAMBDA_PARAMS>", " { ", "<STMTS>", " }"],
+    ["-> do\n", "<BODY_STMTS>", "\nend"],
+    ["->(", "<LAMBDA_PARAMS>", ") do\n", "<BODY_STMTS>", "\nend"],
+    ["-> ", "<LAMBDA_PARAMS>", " do\n", "<BODY_STMTS>", "\nend"],
+    ["lambda ", "<BLOCK>"],
+    ["proc ", "<BLOCK>"]
+  ],
+  "<LAMBDA_PARAMS>": [
+    ["<OPT_PARAMS>"],
+    ["<OPT_PARAMS>", "; ", "<BLOCK_LOCALS>"],
+    ["; ", "<BLOCK_LOCALS>"]
+  ],
+  "<COMMAND_CALL>": [
+    ["<ID>", " ", "<MRHS>"],
+    ["<PRIMARY>", ".", "<ID>", " ", "<MRHS>"]
+  ],
+  "<PRIMARY>": [
+    ["<ATOM>"],
+    ["<ATOM>", "<POSTFIX_CHAIN>"]
+  ],
+  "<POSTFIX_CHAIN>": [
+    ["<POSTFIX>"],
+    ["<POSTFIX>", "<POSTFIX_CHAIN>"]
+  ],
+  "<POSTFIX>": [
+    [".", "<METHOD_NAME>"],
+    [".", "<METHOD_NAME>", "(", "<OPT_CALL_ARGS>", ")"],
+    [".", "<METHOD_NAME>", "(", "<OPT_CALL_ARGS>", ") ", "<BLOCK>"],
+    [".", "<METHOD_NAME>", " ", "<BLOCK>"],
+    ["&.", "<METHOD_NAME>"],
+    ["&.", "<METHOD_NAME>", "(", "<OPT_CALL_ARGS>", ")"],
+    ["&.", "<METHOD_NAME>", "(", "<OPT_CALL_ARGS>", ") ", "<BLOCK>"],
+    ["::", "<METHOD_NAME>", "(", "<OPT_CALL_ARGS>", ")"],
+    ["::", "<CONST>"],
+    [".(", "<OPT_CALL_ARGS>", ")"],
+    ["[", "<OPT_CALL_ARGS>", "]"],
+    ["[", "<OPT_CALL_ARGS>", "] ", "<BLOCK>"]
+  ],
+  "<OPT_CALL_ARGS>": [
+    [],
+    ["<CALL_ARGS>"]
+  ],
+  "<CALL_ARGS>": [
+    ["<CALL_ARG>"],
+    ["..."],
+    ["<CALL_ARG>", ", ", "<CALL_ARGS>"]
+  ],
+  "<CALL_ARG>": [
+    ["<EXPR>"],
+    ["*", "<EXPR>"],
+    ["**", "<EXPR>"],
+    ["&", "<EXPR>"],
+    ["&"],
+    ["<ID>", ": ", "<EXPR>"],
+    ["<ID>", ":"],
+    ["\"a#{", "<EXPR>", "}\": ", "<EXPR>"]
+  ],
+  "<BLOCK>": [
+    ["{ ", "<STMTS>", " }"],
+    ["{ |", "<BLOCK_PARAMS>", "| ", "<STMTS>", " }"],
+    ["do\n", "<BODY_STMTS>", "\nend"],
+    ["do |", "<BLOCK_PARAMS>", "|\n", "<BODY_STMTS>", "\nend"]
+  ],
+  "<BLOCK_PARAMS>": [
+    ["<OPT_PARAMS>"],
+    ["<ID>", ", "],
+    ["<OPT_PARAMS>", "; ", "<BLOCK_LOCALS>"]
+  ],
+  "<BLOCK_LOCALS>": [
+    ["<ID>"],
+    ["<ID>", ", ", "<BLOCK_LOCALS>"]
+  ],
+  "<ATOM>": [
+    ["<VAR>"],
+    ["<IVAR>"],
+    ["<CVAR>"],
+    ["<GVAR>"],
+    ["<CONST_PATH>"],
+    ["<PSEUDO_VAR>"],
+    ["<LITERAL>"],
+    ["<LAMBDA_EXPR>"],
+    ["(", "<STMTS>", ")"],
+    ["()"],
+    ["[", "<OPT_CALL_ARGS>", "]"],
+    ["{", "<OPT_HASH_ASSOCS>", "}"],
+    ["<ID>", "(", "<OPT_CALL_ARGS>", ")"],
+    ["<ID>", "(", "<OPT_CALL_ARGS>", ") ", "<BLOCK>"],
+    ["<ID>", " ", "<BLOCK>"]
+  ],
+  "<OPT_HASH_ASSOCS>": [
+    [],
+    ["<HASH_ASSOCS>"]
+  ],
+  "<HASH_ASSOCS>": [
+    ["<HASH_ASSOC>"],
+    ["<HASH_ASSOC>", ", ", "<HASH_ASSOCS>"]
+  ],
+  "<HASH_ASSOC>": [
+    ["<EXPR>", " => ", "<EXPR>"],
+    ["<ID>", ": ", "<EXPR>"],
+    ["<ID>", ":"],
+    ["\"a#{", "<EXPR>", "}\": ", "<EXPR>"],
+    ["**", "<EXPR>"]
+  ],
+  "<LITERAL>": [
+    ["<NUMBER>"],
+    ["<STRING>"],
+    ["<SYMBOL>"],
+    ["<REGEXP>"],
+    ["<PERCENT_LIT>"]
+  ],
+  "<NUMBER>": [
+    ["<INT>"],
+    ["<FLOAT>"],
+    ["<INT>", "<NUM_SUFFIX>"],
+    ["<FLOAT>", "<NUM_SUFFIX>"],
+    ["<NUM_SIGN>", "<INT>"],
+    ["<NUM_SIGN>", "<FLOAT>"],
+    ["<NUM_SIGN>", "<INT>", "<NUM_SUFFIX>"],
+    ["<NUM_SIGN>", "<FLOAT>", "<NUM_SUFFIX>"]
+  ],
+  "<NUM_SIGN>": [
+    ["-"],
+    ["+"]
+  ],
+  "<NUM_SUFFIX>": [
+    ["r"],
+    ["i"],
+    ["ri"]
+  ],
+  "<INT>": [
+    ["0"],
+    ["1"],
+    ["42"],
+    ["<DEC_NONZERO>", "<DEC_DIGITS>"],
+    ["0d", "<DEC_DIGITS>"],
+    ["0D", "<DEC_DIGITS>"],
+    ["0x", "<HEX_DIGITS>"],
+    ["0X", "<HEX_DIGITS>"],
+    ["0b", "<BIN_DIGITS>"],
+    ["0B", "<BIN_DIGITS>"],
+    ["0o", "<OCT_DIGITS>"],
+    ["0O", "<OCT_DIGITS>"],
+    ["0", "<OCT_DIGITS>"],
+    ["<BIGNUM_INT>"]
+  ],
+  "<BIGNUM_INT>": [
+    ["2147483647"],
+    ["2147483648"],
+    ["4294967295"],
+    ["4294967296"],
+    ["9223372036854775807"],
+    ["9223372036854775808"],
+    ["18446744073709551615"],
+    ["18446744073709551616"],
+    ["340282366920938463463374607431768211455"],
+    ["340282366920938463463374607431768211456"],
+    ["9999999999999999999999999999999999999999", "<DEC_DIGITS>"],
+    ["0d9999999999999999999999999999999999999999", "<DEC_DIGITS>"],
+    ["0D18446744073709551616", "<DEC_DIGITS>"],
+    ["0xffffffff_ffffffff_ffffffff_ffffffff", "<HEX_DIGITS>"],
+    ["0Xffffffff_ffffffff_ffffffff_ffffffff", "<HEX_DIGITS>"],
+    ["0x1", "<HEX_BIGNUM_64>", "<HEX_BIGNUM_64>", "<HEX_BIGNUM_64>", "<HEX_BIGNUM_64>", "<HEX_BIGNUM_64>", "<HEX_BIGNUM_64>", "<HEX_DIGITS>"],
+    ["0b11111111111111111111111111111111111111111111111111111111111111111", "<BIN_DIGITS>"],
+    ["0B10000000000000000000000000000000000000000000000000000000000000000", "<BIN_DIGITS>"],
+    ["0o7777777777777777777777777777777777777777777", "<OCT_DIGITS>"],
+    ["0O10000000000000000000000", "<OCT_DIGITS>"],
+    ["07777777777777777777777777777777777777777777", "<OCT_DIGITS>"]
+  ],
+  "<HEX_BIGNUM_64>": [
+    ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
+    ["0000000000000000000000000000000000000000000000000000000000000001"],
+    ["deadbeefcafebabe0123456789abcdefdeadbeefcafebabe0123456789abcdef"]
+  ],
+  "<FLOAT>": [
+    ["0.0"],
+    ["<DEC_DIGITS>", ".", "<DEC_DIGITS>"],
+    ["<DEC_DIGITS>", "<FLOAT_EXP>"],
+    ["<DEC_DIGITS>", ".", "<DEC_DIGITS>", "<FLOAT_EXP>"],
+    ["9999999999999999999999999999999999999999", ".", "<DEC_DIGITS>"],
+    ["<DEC_DIGITS>", ".", "9999999999999999999999999999999999999999", "<DEC_DIGITS>"],
+    ["1.7976931348623157e308"],
+    ["1e309"],
+    ["2.2250738585072014e-308"],
+    ["5e-324"],
+    ["1e-400"]
+  ],
+  "<FLOAT_EXP>": [
+    ["e", "<DEC_DIGITS>"],
+    ["E", "<DEC_DIGITS>"],
+    ["e+", "<DEC_DIGITS>"],
+    ["e-", "<DEC_DIGITS>"],
+    ["E+", "<DEC_DIGITS>"],
+    ["E-", "<DEC_DIGITS>"]
+  ],
+  "<DEC_NONZERO>": [
+    ["1"],
+    ["2"],
+    ["3"],
+    ["4"],
+    ["5"],
+    ["6"],
+    ["7"],
+    ["8"],
+    ["9"]
+  ],
+  "<DEC_DIGIT>": [
+    ["0"],
+    ["1"],
+    ["2"],
+    ["3"],
+    ["4"],
+    ["5"],
+    ["6"],
+    ["7"],
+    ["8"],
+    ["9"]
+  ],
+  "<DEC_DIGITS>": [
+    ["<DEC_DIGIT>"],
+    ["<DEC_DIGIT>", "<DEC_DIGITS>"],
+    ["<DEC_DIGIT>", "_", "<DEC_DIGITS>"]
+  ],
+  "<HEX_DIGIT>": [
+    ["0"],
+    ["1"],
+    ["7"],
+    ["8"],
+    ["9"],
+    ["a"],
+    ["f"],
+    ["A"],
+    ["F"]
+  ],
+  "<HEX_DIGITS>": [
+    ["<HEX_DIGIT>"],
+    ["<HEX_DIGIT>", "<HEX_DIGITS>"],
+    ["<HEX_DIGIT>", "_", "<HEX_DIGITS>"]
+  ],
+  "<BIN_DIGIT>": [
+    ["0"],
+    ["1"]
+  ],
+  "<BIN_DIGITS>": [
+    ["<BIN_DIGIT>"],
+    ["<BIN_DIGIT>", "<BIN_DIGITS>"],
+    ["<BIN_DIGIT>", "_", "<BIN_DIGITS>"]
+  ],
+  "<OCT_DIGIT>": [
+    ["0"],
+    ["1"],
+    ["2"],
+    ["3"],
+    ["4"],
+    ["5"],
+    ["6"],
+    ["7"]
+  ],
+  "<OCT_DIGITS>": [
+    ["<OCT_DIGIT>"],
+    ["<OCT_DIGIT>", "<OCT_DIGITS>"],
+    ["<OCT_DIGIT>", "_", "<OCT_DIGITS>"]
+  ],
+  "<STRING>": [
+    ["\"foo\""],
+    ["'bar'"],
+    ["\"a#{", "<STMTS>", "}b\""],
+    ["\"#@a #@@a #$a\""],
+    ["\"\\x80\\xff\\u{1f600}\\u0041\\C-a\\M-a\""],
+    ["\"a\" \"b\""],
+    ["?a"],
+    ["?\\n"],
+    ["?\\C-a"],
+    ["?\\M-\\C-a"],
+    ["?\\u{1f600}"],
+    ["`echo #{", "<EXPR>", "}`"]
+  ],
+  "<SYMBOL>": [
+    [":a"],
+    [":foo"],
+    [":@a"],
+    [":@@a"],
+    [":$a"],
+    [":[]="],
+    [":\"a#{", "<EXPR>", "}\""],
+    [":'bar'"]
+  ],
+  "<REGEXP>": [
+    ["/foo/"],
+    ["/a#{", "<EXPR>", "}b/imxo"],
+    ["/\\p{Alpha}(?<x>a)\\k<x>/u"],
+    ["/(?~abc)/n"],
+    ["/a/e"],
+    ["/a/s"]
+  ],
+  "<PERCENT_LIT>": [
+    ["%w[a b c]"],
+    ["%W[a #{", "<EXPR>", "} b]"],
+    ["%i[a b c]"],
+    ["%I[a #{", "<EXPR>", "} b]"],
+    ["%q(a (b) c)"],
+    ["%Q{a #{", "<EXPR>", "} b}"],
+    ["%r|a#{", "<EXPR>", "}|i"],
+    ["%s(foo_bar)"],
+    ["%x(echo #{", "<EXPR>", "})"]
+  ],
+  "<VAR>": [
+    ["a"],
+    ["b"],
+    ["c"],
+    ["foo"],
+    ["it"],
+    ["_1"],
+    ["_2"]
+  ],
+  "<ID>": [
+    ["a"],
+    ["b"],
+    ["c"],
+    ["foo"],
+    ["bar"],
+    ["call"]
+  ],
+  "<IVAR>": [
+    ["@a"],
+    ["@foo"]
+  ],
+  "<CVAR>": [
+    ["@@a"],
+    ["@@foo"]
+  ],
+  "<GVAR>": [
+    ["$a"],
+    ["$_"],
+    ["$~"],
+    ["$&"],
+    ["$`"],
+    ["$'"],
+    ["$+"],
+    ["$1"],
+    ["$9"],
+    ["$!"],
+    ["$@"],
+    ["$;"],
+    ["$,"],
+    ["$/"],
+    ["$\\"],
+    ["$."],
+    ["$?"],
+    ["$$"],
+    ["$:"],
+    ["$\""]
+  ],
+  "<CONST>": [
+    ["A"],
+    ["B"],
+    ["Foo"]
+  ],
+  "<CONST_PATH>": [
+    ["<CONST_CHAIN>"],
+    ["::", "<CONST_CHAIN>"]
+  ],
+  "<CONST_CHAIN>": [
+    ["<CONST>"],
+    ["<CONST>", "::", "<CONST_CHAIN>"]
+  ],
+  "<PSEUDO_VAR>": [
+    ["self"],
+    ["nil"],
+    ["true"],
+    ["false"],
+    ["__FILE__"],
+    ["__LINE__"],
+    ["__ENCODING__"]
+  ]
+}
