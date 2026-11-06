@@ -23,6 +23,10 @@ FUZZ_ASAN_OPTIONS="abort_on_error=1:handle_abort=1:quarantine_size_mb=16:malloc_
 FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 
 cleanup() {
+    if [ -d "/tmp/afl-tmpdir/grammar/trees" ] && [ -d "$AFL_DIR/grammar" ]; then
+        rm -rf "$AFL_DIR/.grammar-trees"
+        cp -r "/tmp/afl-tmpdir/grammar/trees" "$AFL_DIR/.grammar-trees"
+    fi
     exit 0
 }
 
@@ -55,8 +59,14 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             ;;
         1)
             mkdir -p "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees"
-            ./build/grammar_generator-ruby 100 500 "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees" >/dev/null
-            add_worker "grammar" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.ldet"
+            if [ -f "$AFL_DIR/grammar/fuzzer_stats" ] && [ -d "$AFL_DIR/.grammar-trees" ]; then
+                cp -r "$AFL_DIR/.grammar-trees/." "/tmp/afl-tmpdir/grammar/trees/"
+                printf '\x00\x00\x00\x001\n' > "/tmp/afl-tmpdir/grammar/seeds/seed_1"
+            else
+                rm -rf "$AFL_DIR/grammar" "$AFL_DIR/.grammar-trees"
+                ./build/grammar_generator-ruby 500 500 "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees" >/dev/null
+            fi
+            add_worker "grammar" "ulimit -v 4194304 && AFL_NO_SYNC=1 AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.ldet"
             ;;
         2)
             add_worker "msan" "AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
