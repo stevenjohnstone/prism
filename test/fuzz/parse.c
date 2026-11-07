@@ -21,7 +21,6 @@ typedef struct {
     bool frozen_string_literal;
     uint8_t scopes_count;
     uint8_t forwarding;
-    bool format_errors;
     pm_errors_format_type_t error_format_type;
     bool prettyprint;
 } fuzz_options_t;
@@ -87,7 +86,7 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
     pm_serialize(parser, node, buffer);
     pm_buffer_free(buffer);
 
-    if (opts->format_errors && (parser->error_list.size > 0)) {
+    if (parser->error_list.size > 0) {
         buffer = pm_buffer_new();
         (void) pm_errors_format(parser, buffer, opts->error_format_type);
         pm_buffer_free(buffer);
@@ -133,7 +132,6 @@ __attribute__((noinline)) void harness(const uint8_t *input, size_t size) {
         .frozen_string_literal = (opt_flags & 32) != 0,
         .scopes_count = (input[2] >> 2) & 0x03,
         .forwarding = (input[2] >> 4) & 0x0f,
-        .format_errors = (opt_flags & 128) != 0,
         .error_format_type = (input[1] & 128) ? PM_ERRORS_FORMAT_COLOR : PM_ERRORS_FORMAT_PLAIN,
         .prettyprint = (opt_flags & 64) != 0,
     };

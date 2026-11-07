@@ -74,7 +74,6 @@ def c_fuzz_options(input_file)
       .frozen_string_literal = #{(opt_flags & 32) != 0},
       .scopes_count = #{scopes_count},
       .forwarding = #{forwarding},
-      .format_errors = #{(opt_flags & 128) != 0},
       .error_format_type = #{error_format_type},
       .prettyprint = #{(opt_flags & 64) != 0},
     };
