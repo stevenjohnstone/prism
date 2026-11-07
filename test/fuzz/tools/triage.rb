@@ -192,6 +192,7 @@ end
 def run_afl_tmin(hang, crash, minimized_input, executable)
   flag = hang ? "-H" : "-e"
   env = {
+    "AFL_NO_IJON" => "1",
     "AFL_TMIN_EXACT" => "1",
     "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=0:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}:symbolize=0",
     "UBSAN_OPTIONS" => "abort_on_error=1:symbolize=0",

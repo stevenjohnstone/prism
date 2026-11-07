@@ -63,13 +63,15 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/incl
 	$(ECHO) "building with LSAN"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
 	$(ECHO) "building with custom leak detector"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Itest/fuzz/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ldet $(FUZZ_SOURCES)
+	# Enable IJON state tracking (AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON) on fuzz.ldet
+	# for the ldet worker; grammar and afl-tmin set AFL_NO_IJON=1 at runtime.
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_IJON=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -DPRISM_FUZZ_IJON -Itest/fuzz/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ldet $(FUZZ_SOURCES)
 	$(ECHO) "building main fuzz binary"
 	# Disable ASAN read instrumentation (-asan-instrument-reads=0) so the main
 	# and grammar fuzzers focus on illegal writes, UBSAN, and assertions without
 	# stopping on out-of-bounds reads (covered by MSAN). Both -mllvm and
 	# -Wl,-mllvm are required because afl-clang-lto runs ASAN during LTO linking.
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0 -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
 	$(ECHO) "building cmplog binary"
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
