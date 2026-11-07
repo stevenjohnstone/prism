@@ -103,10 +103,15 @@ void *fuzz_realloc(void *ptr, size_t s) {
 // asan error handler will kick in giving a nice
 // backtrace
 extern const char *__asan_default_options(void);
+extern const char *__ubsan_default_options(void);
 
 
 const char* __asan_default_options(void) {
     return "abort_on_error=1:handle_abort=1:max_allocation_size_mb=" FUZZ_STR(FUZZ_MAX_ALLOCATED) ":hard_rss_limit_mb=" FUZZ_STR(FUZZ_HARD_RSS_LIMIT);
+}
+
+const char* __ubsan_default_options(void) {
+    return "abort_on_error=1:print_stacktrace=1";
 }
 extern void harness(const uint8_t *input, size_t size);
 
