@@ -21,6 +21,7 @@ export AFL_FUZZER_LOOPCOUNT=10000
 FUZZ_MAX_ALLOCATED=${FUZZ_MAX_ALLOCATED:-64}
 FUZZ_HARD_RSS_LIMIT=$(( FUZZ_MAX_ALLOCATED * 32 ))
 FUZZ_ASAN_OPTIONS="abort_on_error=1:handle_abort=1:quarantine_size_mb=16:malloc_context_size=5:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
+FUZZ_UBSAN_OPTIONS="abort_on_error=1:symbolize=0"
 FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 
 cleanup() {
@@ -56,7 +57,7 @@ add_worker() {
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
-            add_worker "main" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -M main -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
+            add_worker "main" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -M main -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
             ;;
         1)
             mkdir -p "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees"
@@ -75,7 +76,7 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
         *)
             sched=${SCHEDULES[$(( (i - 3) % ${#SCHEDULES[@]} ))]}
             name="main-$(( i - 1 ))"
-            add_worker "$name" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -- ./build/fuzz"
+            add_worker "$name" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -- ./build/fuzz.ldet"
             ;;
     esac
 done

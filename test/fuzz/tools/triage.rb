@@ -14,7 +14,7 @@ HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 32
 
 SANITIZER_ENV = {
   "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}",
-  "UBSAN_OPTIONS" => "print_stacktrace=1",
+  "UBSAN_OPTIONS" => "abort_on_error=1:print_stacktrace=1",
   "MSAN_OPTIONS" => "abort_on_error=1:handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}",
   "LSAN_OPTIONS" => "handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}"
 }.freeze
@@ -100,10 +100,13 @@ def c_program(input, harness_code, crash_details)
     #{escape_c_comment(crash_details)}
     */
 
-    // Cause ASAN to call abort on an error to make
+    // Cause ASAN and UBSAN to call abort on an error to make
     // debugging inside gdb easier
     const char* __asan_default_options() {
       return "abort_on_error=1:handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}";
+    }
+    const char* __ubsan_default_options() {
+      return "abort_on_error=1:print_stacktrace=1";
     }
 
     #{c_fuzz_options(input)}
@@ -132,10 +135,13 @@ def c_program_heisenbug(input, harness_code, crash_details = "Heisenbug - input 
     #{escape_c_comment(crash_details)}
     */
 
-    // Cause ASAN to call abort on an error to make
+    // Cause ASAN and UBSAN to call abort on an error to make
     // debugging inside gdb easier
     const char* __asan_default_options() {
       return "abort_on_error=1:handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}";
+    }
+    const char* __ubsan_default_options() {
+      return "abort_on_error=1:print_stacktrace=1";
     }
 
     #{c_fuzz_options(input)}
@@ -188,6 +194,7 @@ def run_afl_tmin(hang, crash, minimized_input, executable)
   env = {
     "AFL_TMIN_EXACT" => "1",
     "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=0:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}:symbolize=0",
+    "UBSAN_OPTIONS" => "abort_on_error=1:symbolize=0",
     "MSAN_OPTIONS" => "exit_code=86:abort_on_error=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}:symbolize=0"
   }
   Open3.capture2e(env, "afl-tmin", flag, "-t", "500", "-i", crash, "-o", minimized_input, "--", executable)
