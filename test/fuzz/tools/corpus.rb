@@ -13,7 +13,7 @@ CORPUS_DIR = "./test/fuzz/corpus/"
 #   byte 3 (0x01): start_line=1
 DEFAULT_HEADER = "\x00\x00\x03\x01".b
 
-FileUtils.mkdir_p(OUTPUT_DIR)
+FileUtils.mkdir_p(File.dirname(OUTPUT_DIR))
 executable = File.absolute_path("./build/fuzz")
 
 Dir.chdir(CORPUS_DIR)
@@ -21,54 +21,64 @@ Dir.chdir(CORPUS_DIR)
 puts "Generating corpus in directory: #{OUTPUT_DIR}"
 puts "------------------------------------------------"
 
-Dir.mktmpdir do |tmpdir|
-  count = 0
+staging_dir = "#{OUTPUT_DIR}.tmp.#{Process.pid}"
+FileUtils.rm_rf(staging_dir)
 
-  Dir.glob("**{,/*/**}/*.txt") do |filename|
-    next if File.directory?(filename)
+begin
+  Dir.mktmpdir do |tmpdir|
+    count = 0
 
-    target_filename = File.join(tmpdir, "#{filename.gsub(/[^a-zA-Z0-9.-]/, "_")}.rb")
+    Dir.glob("**{,/*/**}/*.txt") do |filename|
+      next if File.directory?(filename)
 
-    File.binwrite(target_filename, DEFAULT_HEADER + File.binread(filename))
-    puts "✅ Generated: #{target_filename}"
-    count += 1
+      target_filename = File.join(tmpdir, "#{filename.gsub(/[^a-zA-Z0-9.-]/, "_")}.rb")
+
+      File.binwrite(target_filename, DEFAULT_HEADER + File.binread(filename))
+      puts "✅ Generated: #{target_filename}"
+      count += 1
+    end
+
+    base_content = <<~RUBY
+      # This acts as a standard variable assignment
+      foo = "Standard: abc"
+
+      # This tests Latin-1/Windows handling
+      bar = "Accents: ü"
+      baz = "Currency: €"
+
+      # This tests multibyte/wide handling
+      qux = "Japanese: あ"
+
+      puts [foo, bar, baz, qux]
+    RUBY
+
+    Encoding.list.each do |target_enc|
+      next if target_enc.dummy?
+
+      encoded_body = base_content.encode(target_enc, "binary", invalid: :replace, undef: :replace, replace: "")
+      magic_comment = "# encoding: #{target_enc.name}\n".encode(target_enc)
+      full_script = magic_comment + encoded_body
+
+      safe_name = target_enc.name.gsub(/[^a-zA-Z0-9.-]/, "_")
+      filename = File.join(tmpdir, "corpus_#{safe_name}.rb")
+
+      File.binwrite(filename, DEFAULT_HEADER + full_script.b)
+      puts "✅ Generated: #{filename}"
+      count += 1
+    rescue Encoding::UndefinedConversionError
+      puts "⚠️  Skipped:   #{target_enc.name} (cannot represent all characters)"
+    rescue Encoding::ConverterNotFoundError
+      puts "❌ Error:     #{target_enc.name} (converter not found)"
+    end
+
+    puts "------------------------------------------------"
+    puts "Total corpus size: #{count} files. Now minimizing"
+
+    FileUtils.mkdir_p(staging_dir)
+    system("afl-cmin", "-o", staging_dir, "-i", tmpdir, "--", executable, "@@", exception: true)
+    FileUtils.rm_rf(OUTPUT_DIR)
+    File.rename(staging_dir, OUTPUT_DIR)
   end
-
-  base_content = <<~RUBY
-    # This acts as a standard variable assignment
-    foo = "Standard: abc"
-
-    # This tests Latin-1/Windows handling
-    bar = "Accents: ü"
-    baz = "Currency: €"
-
-    # This tests multibyte/wide handling
-    qux = "Japanese: あ"
-
-    puts [foo, bar, baz, qux]
-  RUBY
-
-  Encoding.list.each do |target_enc|
-    next if target_enc.dummy?
-
-    encoded_body = base_content.encode(target_enc, "binary", invalid: :replace, undef: :replace, replace: "")
-    magic_comment = "# encoding: #{target_enc.name}\n".encode(target_enc)
-    full_script = magic_comment + encoded_body
-
-    safe_name = target_enc.name.gsub(/[^a-zA-Z0-9.-]/, "_")
-    filename = File.join(tmpdir, "corpus_#{safe_name}.rb")
-
-    File.binwrite(filename, DEFAULT_HEADER + full_script.b)
-    puts "✅ Generated: #{filename}"
-    count += 1
-  rescue Encoding::UndefinedConversionError
-    puts "⚠️  Skipped:   #{target_enc.name} (cannot represent all characters)"
-  rescue Encoding::ConverterNotFoundError
-    puts "❌ Error:     #{target_enc.name} (converter not found)"
-  end
-
-  puts "------------------------------------------------"
-  puts "Total corpus size: #{count} files. Now minimizing"
-
-  system("afl-cmin", "-o", OUTPUT_DIR, "-i", tmpdir, "--", executable, "@@", exception: true)
+ensure
+  FileUtils.rm_rf(staging_dir)
 end
