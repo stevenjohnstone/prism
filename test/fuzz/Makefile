@@ -6,8 +6,8 @@ FUZZ_TRIAGE_DIR = $(FUZZ_DIR)/triage
 # Maximum input size in bytes for fuzzing and coverage.
 FUZZ_MAX_INPUT_SIZE ?= 1024
 # Maximum single allocation / live heap size in MB for fuzzing and triage.
-FUZZ_MAX_ALLOCATED ?= 64
-FUZZ_HARD_RSS_LIMIT := $(shell echo $$(( $(FUZZ_MAX_ALLOCATED) * 32 )))
+FUZZ_MAX_ALLOCATED ?= 128
+FUZZ_HARD_RSS_LIMIT := $(shell echo $$(( $(FUZZ_MAX_ALLOCATED) * 16 )))
 # Set PM_ARENA_INITIAL_SIZE=0 on sanitizer builds so each arena allocation gets
 # its own exact-sized xmalloc block with ASAN/MSAN heap redzones around it
 # instead of packing into 8 KB blocks, while still freeing all blocks via

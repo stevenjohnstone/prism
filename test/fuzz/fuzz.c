@@ -27,7 +27,7 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 static size_t allocated = 0;
 
 #ifndef FUZZ_MAX_ALLOCATED
-#define FUZZ_MAX_ALLOCATED 64
+#define FUZZ_MAX_ALLOCATED 128
 #endif
 
 #ifndef FUZZ_HARD_RSS_LIMIT

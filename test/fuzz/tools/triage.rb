@@ -9,8 +9,8 @@ require "tmpdir"
 OUTPUT_DIR = "tmp/fuzz/afl"
 TESTCASES_DIR = "tmp/fuzz/triage"
 TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
-MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "64"))
-HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 32
+MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
+HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 16
 
 SANITIZER_ENV = {
   "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}",
