@@ -8,14 +8,17 @@ FUZZ_MAX_INPUT_SIZE ?= 1024
 # Maximum single allocation / live heap size in MB for fuzzing and triage.
 FUZZ_MAX_ALLOCATED ?= 64
 FUZZ_HARD_RSS_LIMIT := $(shell echo $$(( $(FUZZ_MAX_ALLOCATED) * 32 )))
-# Set PM_ARENA_INITIAL_SIZE=0 so each arena allocation gets its own exact-sized
-# xmalloc block with ASAN heap redzones around it instead of packing into 8 KB
-# blocks, while still freeing all blocks via pm_arena_cleanup.
+# Set PM_ARENA_INITIAL_SIZE=0 on sanitizer builds so each arena allocation gets
+# its own exact-sized xmalloc block with ASAN/MSAN heap redzones around it
+# instead of packing into 8 KB blocks, while still freeing all blocks via
+# pm_arena_cleanup. Non-sanitized builds (fuzz.ldet, fuzz.coverage) use the
+# default 8 KB arena blocks for higher throughput and full arena coverage.
+FUZZ_SANITIZER_FLAGS := -DPM_ARENA_INITIAL_SIZE=0
 # Set PM_INTEGER_DIVIDE_THRESHOLD=8 (72 decimal digits instead of the default
 # 224 chunks / 2,017 digits) so divide-and-conquer decimal parsing and base-2^32
 # bignum arithmetic (schoolbook and Karatsuba) are reachable within
 # FUZZ_MAX_INPUT_SIZE.
-FUZZ_FLAGS := -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -DFUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -DFUZZ_HARD_RSS_LIMIT=$(FUZZ_HARD_RSS_LIMIT) -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration $(FUZZ_FLAGS)
+FUZZ_FLAGS := -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -DFUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -DFUZZ_HARD_RSS_LIMIT=$(FUZZ_HARD_RSS_LIMIT) -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration $(FUZZ_FLAGS)
 FUZZ_SOURCES := $(SOURCES) test/fuzz/parse.c test/fuzz/fuzz.c
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
@@ -56,9 +59,9 @@ $(FUZZ_GRAMMAR_STAMP): test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mut
 $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/include/prism_xallocator.h test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
 	$(ECHO) "building with LSAN"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
 	$(ECHO) "building with custom leak detector"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Itest/fuzz/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ldet $(FUZZ_SOURCES)
 	$(ECHO) "building main fuzz binary"
@@ -66,11 +69,11 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/incl
 	# and grammar fuzzers focus on illegal writes, UBSAN, and assertions without
 	# stopping on out-of-bounds reads (covered by MSAN). Both -mllvm and
 	# -Wl,-mllvm are required because afl-clang-lto runs ASAN during LTO linking.
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0 -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0 -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
 	$(ECHO) "building cmplog binary"
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
 
