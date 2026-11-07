@@ -68,7 +68,7 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
                 rm -rf "$AFL_DIR/grammar" "$AFL_DIR/.grammar-trees"
                 ./build/grammar_generator-ruby 500 500 "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees" >/dev/null
             fi
-            add_worker "grammar" "ulimit -v 4194304 && AFL_NO_SYNC=1 AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.ldet"
+            add_worker "grammar" "ulimit -v 4194304 && AFL_NO_IJON=1 AFL_NO_SYNC=1 AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.ldet"
             ;;
         2)
             add_worker "msan" "AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"

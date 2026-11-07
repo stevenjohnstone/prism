@@ -32,6 +32,83 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
     return PM_VISIT_DESCEND;
 }
 
+#ifdef PRISM_FUZZ_IJON
+extern void ijon_set(uint32_t addr, uint32_t val);
+extern uint32_t ijon_hashint(uint32_t old, uint32_t val);
+extern uint32_t ijon_hashstr(uint32_t old, const char *val);
+
+#define FUZZ_IJON_SET(x) \
+    do { \
+        static uint32_t loc_hash = 0; \
+        if (loc_hash == 0) loc_hash = ijon_hashstr(__LINE__, __FILE__); \
+        ijon_set(loc_hash, ijon_hashint(loc_hash, (x))); \
+    } while (0)
+
+typedef struct {
+    uint32_t prev_lex_mode_sig;
+    uint32_t prev_ctx_sig;
+    uint32_t prev_state_flags;
+    uint32_t prev_scope_sig;
+} fuzz_ijon_state_t;
+
+static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void *data) {
+    fuzz_ijon_state_t *state = (fuzz_ijon_state_t *) data;
+
+    // 1. Lexer mode stack signature (top 4 modes, 4 bits each).
+    uint32_t lex_mode_sig = 0;
+    uint32_t lex_depth = 0;
+    for (const pm_lex_mode_t *m = parser->lex_modes.current; m != NULL && lex_depth < 4; m = m->prev, lex_depth++) {
+        lex_mode_sig = (lex_mode_sig << 4) | (((uint32_t) m->mode + 1u) & 0x0fu);
+    }
+    if (lex_mode_sig != state->prev_lex_mode_sig) {
+        FUZZ_IJON_SET(ijon_hashint(state->prev_lex_mode_sig, lex_mode_sig));
+        state->prev_lex_mode_sig = lex_mode_sig;
+    }
+
+    // 2. Parser context stack signature (current and parent context).
+    uint32_t cur_ctx = parser->current_context != NULL ? (uint32_t) parser->current_context->context : 0;
+    uint32_t prev_ctx = (parser->current_context != NULL && parser->current_context->prev != NULL)
+        ? (uint32_t) parser->current_context->prev->context
+        : 0;
+    uint32_t ctx_sig = (cur_ctx << 6) | prev_ctx;
+    if (ctx_sig != state->prev_ctx_sig) {
+        FUZZ_IJON_SET(ijon_hashint(state->prev_ctx_sig, ctx_sig));
+        state->prev_ctx_sig = ctx_sig;
+    }
+
+    // 3. Lexer state bitmask combined with parser mode flags and boolean stacks.
+    uint32_t state_flags =
+        ((uint32_t) parser->lex_state & 0x1fffu) |
+        ((uint32_t) parser->command_start << 13) |
+        ((uint32_t) parser->in_keyword_arg << 14) |
+        ((uint32_t) parser->in_endless_def_body << 15) |
+        ((uint32_t) parser->pattern_matching_newlines << 16) |
+        ((parser->do_loop_stack.top & 0x3u) << 17) |
+        ((parser->accepts_block_stack.top & 0x3u) << 19);
+    if (state_flags != state->prev_state_flags) {
+        FUZZ_IJON_SET(state_flags);
+        state->prev_state_flags = state_flags;
+    }
+
+    // 4. Scope parameter flags across current and enclosing scope.
+    if (parser->current_scope != NULL && parser->current_scope->parameters != 0) {
+        uint32_t prev_params = parser->current_scope->previous != NULL ? parser->current_scope->previous->parameters : 0;
+        uint32_t scope_sig = ((uint32_t) parser->current_scope->parameters << 8) | prev_params;
+        if (scope_sig != state->prev_scope_sig) {
+            FUZZ_IJON_SET(scope_sig);
+            state->prev_scope_sig = scope_sig;
+        }
+    }
+
+    // 5. Error recovery and EOF across active context and lex mode stacks.
+    if (parser->recovering || token->type == PM_TOKEN_EOF) {
+        uint32_t rec_key = (ctx_sig << 16) | (lex_mode_sig & 0xffffu);
+        uint32_t rec_val = ((uint32_t) parser->recovering << 16) | (uint32_t) token->type;
+        FUZZ_IJON_SET(ijon_hashint(rec_key, rec_val));
+    }
+}
+#endif
+
 __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, const fuzz_options_t *opts) {
     uint8_t *source = malloc(size);
     assert(source);
@@ -77,6 +154,10 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 
     pm_arena_t *arena = pm_arena_new();
     pm_parser_t *parser = pm_parser_new(arena, source, size, options);
+#ifdef PRISM_FUZZ_IJON
+    fuzz_ijon_state_t ijon_state = { 0 };
+    pm_parser_lex_callback_set(parser, fuzz_ijon_lex_callback, &ijon_state);
+#endif
     pm_node_t *node = pm_parse(parser);
 
     pm_visit_node(node, check_node_location, &size);
