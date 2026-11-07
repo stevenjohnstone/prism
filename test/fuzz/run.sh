@@ -32,9 +32,9 @@ cleanup() {
     exit 0
 }
 
-[ -d "$CORPUS_DIR" ] || {
-    ruby test/fuzz/tools/corpus.rb "$CORPUS_DIR"
-}
+if [ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]; then
+    ruby test/fuzz/tools/corpus.rb "$CORPUS_DIR" || exit 1
+fi
 
 mkdir -p "$AFL_DIR"
 
@@ -73,10 +73,13 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
         2)
             add_worker "msan" "AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
             ;;
+        3)
+            add_worker "ldet" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S ldet -p explore -- ./build/fuzz.ldet"
+            ;;
         *)
-            sched=${SCHEDULES[$(( (i - 3) % ${#SCHEDULES[@]} ))]}
-            name="main-$(( i - 1 ))"
-            add_worker "$name" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -- ./build/fuzz.ldet"
+            sched=${SCHEDULES[$(( (i - 4) % ${#SCHEDULES[@]} ))]}
+            name="main-$(( i - 2 ))"
+            add_worker "$name" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -- ./build/fuzz"
             ;;
     esac
 done
