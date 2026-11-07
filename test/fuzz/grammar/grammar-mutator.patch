@@ -15,6 +15,25 @@ index d0658c1..9efab2f 100644
  	$(PYTHON) grammars/f1_g4_translate.py $(shell cat .grammar) ./grammars
  	@$(MAKE) -C lib clean
  	java -jar $(ANTLR_JAR_LOCATION) \
+diff --git a/grammars/f1_c_gen.py b/grammars/f1_c_gen.py
+index 31464d4..fac6364 100644
+--- a/grammars/f1_c_gen.py
++++ b/grammars/f1_c_gen.py
+@@ -284,11 +284,11 @@ class CFuzzer(PyCompiledFuzzer):
+                 if key == token:
+                     res.append('node->recursion_edge_size += 1;')
+             else:
+-                esc_token_chars = [self.esc_char(c) for c in token]
+-                esc_token = ''.join(esc_token_chars)
++                token_bytes = token.encode('utf-8')
++                esc_token = bytes_to_c_str(token_bytes)
+                 res.append(
+                     'subnode = node_create_with_val(NODE_TERM__, "%s", %d);' % (
+-                        esc_token, len(esc_token_chars)))
++                        esc_token, len(token_bytes)))
+                 res.append('*consumed += %d;' % (len(token)))
+             res.append('node->subnodes[%d] = subnode;' % i)
+             res.append('subnode->parent = node;')
 diff --git a/src/Makefile b/src/Makefile
 index 43a255f..4d54417 100644
 --- a/src/Makefile

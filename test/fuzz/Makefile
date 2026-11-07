@@ -48,6 +48,7 @@ $(FUZZ_GRAMMAR_STAMP): test/fuzz/grammar/ruby.json test/fuzz/grammar/grammar-mut
 	$(Q) git -C /AFLplusplus/Grammar-Mutator checkout -- .
 	$(Q) git -C /AFLplusplus/Grammar-Mutator apply $(CURDIR)/test/fuzz/grammar/grammar-mutator.patch
 	$(Q) $(MAKE) -C /AFLplusplus/Grammar-Mutator GRAMMAR_FILE=$(CURDIR)/test/fuzz/grammar/ruby.json
+	$(Q) rm -f build/libgrammarmutator-ruby.so build/grammar_generator-ruby
 	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/libgrammarmutator-ruby.so build/libgrammarmutator-ruby.so
 	$(Q) cp -f /AFLplusplus/Grammar-Mutator/src/grammar_generator-ruby build/grammar_generator-ruby
 	$(Q) touch $@
