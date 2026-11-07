@@ -18,8 +18,8 @@ export AFL_AUTORESUME=1
 export AFL_FUZZER_STATS_UPDATE_INTERVAL=1
 export AFL_FUZZER_LOOPCOUNT=10000
 
-FUZZ_MAX_ALLOCATED=${FUZZ_MAX_ALLOCATED:-64}
-FUZZ_HARD_RSS_LIMIT=$(( FUZZ_MAX_ALLOCATED * 32 ))
+FUZZ_MAX_ALLOCATED=${FUZZ_MAX_ALLOCATED:-128}
+FUZZ_HARD_RSS_LIMIT=$(( FUZZ_MAX_ALLOCATED * 16 ))
 FUZZ_ASAN_OPTIONS="abort_on_error=1:handle_abort=1:quarantine_size_mb=16:malloc_context_size=5:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 FUZZ_UBSAN_OPTIONS="abort_on_error=1:symbolize=0"
 FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
