@@ -96,11 +96,12 @@ end
 # IDs as items enter the queue, corpus_count at any plot_data sample t corresponds
 # to queue IDs 0...(corpus_count - 1).
 def parse_queue_origins(queue_dir)
-  return { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {} } unless Dir.exist?(queue_dir)
+  return { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {}, max_src_by_source: {} } unless Dir.exist?(queue_dir)
 
   max_id = -1
   item_kind = {}
   item_source = {}
+  max_src_by_source = Hash.new(0)
 
   Dir.children(queue_dir).each do |fname|
     next unless fname.start_with?("id:")
@@ -108,8 +109,13 @@ def parse_queue_origins(queue_dir)
     id = fname[3, 6].to_i
     max_id = id if id > max_id
     if fname =~ /,sync:([^,]+)/
+      src_name = Regexp.last_match(1)
       item_kind[id] = :sync
-      item_source[id] = Regexp.last_match(1)
+      item_source[id] = src_name
+      if fname =~ /,src:(\d+)/
+        src_end = Regexp.last_match(1).to_i + 1
+        max_src_by_source[src_name] = src_end if src_end > max_src_by_source[src_name]
+      end
     elsif fname.include?(",orig:")
       item_kind[id] = :seed
     else
@@ -117,7 +123,7 @@ def parse_queue_origins(queue_dir)
     end
   end
 
-  return { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {} } if max_id < 0
+  return { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {}, max_src_by_source: {} } if max_id < 0
 
   prefix_sync = Array.new(max_id + 2, 0)
   prefix_local = Array.new(max_id + 2, 0)
@@ -136,9 +142,31 @@ def parse_queue_origins(queue_dir)
     end
   end
 
-  { prefix_sync: prefix_sync, prefix_local: prefix_local, prefix_seed: prefix_seed, by_source: by_source }
+  {
+    prefix_sync: prefix_sync,
+    prefix_local: prefix_local,
+    prefix_seed: prefix_seed,
+    by_source: by_source,
+    max_src_by_source: max_src_by_source
+  }
 rescue StandardError
-  { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {} }
+  { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {}, max_src_by_source: {} }
+end
+
+def parse_synced_cursors(fuzzer_dir)
+  synced_dir = File.join(fuzzer_dir, ".synced")
+  return {} unless Dir.exist?(synced_dir)
+
+  cursors = {}
+  Dir.children(synced_dir).each do |fname|
+    next if fname.start_with?(".") || fname.end_with?(".max")
+
+    raw = File.binread(File.join(synced_dir, fname))
+    cursors[fname] = raw.bytesize >= 4 ? raw.unpack1("V") : 0
+  end
+  cursors
+rescue StandardError
+  {}
 end
 
 def lookup_prefix(prefix_arr, count)
@@ -401,6 +429,7 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
   stats = parse_fuzzer_stats(File.join(dir, "fuzzer_stats"))
   raw_plot = parse_plot_data(File.join(dir, "plot_data"))
   origins = parse_queue_origins(File.join(dir, "queue"))
+  synced_cursors = parse_synced_cursors(dir)
   sampled = downsample(raw_plot).map do |r|
     cc = r[:corpus_count]
     r.merge(
@@ -436,6 +465,7 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
     banner: banner,
     stats: stats,
     origins: origins,
+    synced_cursors: synced_cursors,
     samples: sampled,
     sample_count: raw_plot.size,
     edges_found: edges_found,
@@ -467,6 +497,127 @@ fleet_hangs = fuzzers.sum { |f| f[:saved_hangs] }
 fleet_max_corpus = fuzzers.map { |f| f[:corpus_count] }.max || 0
 fleet_max_runtime = fuzzers.map { |f| f[:run_time] }.max || 0
 main_fuzzer = fuzzers.find { |f| f[:name] == "main" } || fuzzers.first
+
+# Compute snapshot sync progress of `main` across each peer queue (from main/.synced/<peer> + queue origins)
+main_name = main_fuzzer[:name]
+main_synced_cursors = main_fuzzer[:synced_cursors] || {}
+main_max_src = main_fuzzer[:origins][:max_src_by_source] || {}
+main_by_source = main_fuzzer[:origins][:by_source] || {}
+
+peer_sync_by_name = {}
+fuzzers.each do |f|
+  next if f[:name] == main_name
+
+  peer_name = f[:name]
+  peer_total = f[:corpus_count]
+  watermark = main_synced_cursors[peer_name] || 0
+  in_flight = main_max_src[peer_name] || 0
+  cursor = [[watermark, in_flight].max, peer_total].min
+
+  # Items in peer's queue[0...cursor] that originally came from `main` (sync:main) are skipped by `main` without running
+  skipped_from_main = lookup_prefix(f[:origins][:by_source][main_name] || [], cursor)
+  tested_by_main = [cursor - skipped_from_main, 0].max
+  imported_by_main = lookup_prefix(main_by_source[peer_name] || [], main_fuzzer[:corpus_count])
+  rejected_by_main = [tested_by_main - imported_by_main, 0].max
+  unsynced_backlog = [peer_total - cursor, 0].max
+  sync_pct = peer_total > 0 ? (cursor * 100.0 / peer_total) : 100.0
+  yield_pct = tested_by_main > 0 ? (imported_by_main * 100.0 / tested_by_main) : 0.0
+
+  # Also track how far this peer has synced through `main`'s queue (`<peer>/.synced/main`)
+  peer_from_main_wm = f[:synced_cursors][main_name] || 0
+  peer_from_main_max = f[:origins][:max_src_by_source][main_name] || 0
+  peer_from_main_cursor = [[peer_from_main_wm, peer_from_main_max].max, main_fuzzer[:corpus_count]].min
+  peer_from_main_pct = main_fuzzer[:corpus_count] > 0 ? (peer_from_main_cursor * 100.0 / main_fuzzer[:corpus_count]) : 100.0
+
+  peer_sync_by_name[peer_name] = {
+    peer_total: peer_total,
+    watermark: watermark,
+    cursor: cursor,
+    skipped_from_main: skipped_from_main,
+    tested_by_main: tested_by_main,
+    imported_by_main: imported_by_main,
+    rejected_by_main: rejected_by_main,
+    unsynced_backlog: unsynced_backlog,
+    sync_pct: sync_pct,
+    yield_pct: yield_pct,
+    peer_from_main_cursor: peer_from_main_cursor,
+    peer_from_main_pct: peer_from_main_pct
+  }
+end
+
+peer_sync_rows_html = fuzzers.reject { |f| f[:name] == main_name }.map do |f|
+  ps = peer_sync_by_name[f[:name]]
+  total = [ps[:peer_total], 1].max.to_f
+  imp_w = (ps[:imported_by_main] * 100.0 / total).round(2)
+  rej_w = (ps[:rejected_by_main] * 100.0 / total).round(2)
+  skp_w = (ps[:skipped_from_main] * 100.0 / total).round(2)
+  uns_w = [100.0 - imp_w - rej_w - skp_w, 0.0].max.round(2)
+  tip = "#{f[:name]} (queue: #{format_int(ps[:peer_total])}) — " \
+        "Cursor: #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
+        "Tested by #{main_name}: #{format_int(ps[:tested_by_main])} | " \
+        "Imported by #{main_name}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
+        "Rejected by #{main_name}: #{format_int(ps[:rejected_by_main])} | " \
+        "Skipped (sync:#{main_name}): #{format_int(ps[:skipped_from_main])} | " \
+        "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
+  <<~HTML
+    <div class="sync-row" title="#{CGI.escapeHTML(tip)}" onclick="selectTab('#{CGI.escapeHTML(f[:name])}')">
+      <div class="sync-peer">
+        <span class="legend-dot" style="background:#{f[:color]}"></span>
+        <strong>#{CGI.escapeHTML(f[:name])}</strong>
+      </div>
+      <div class="sync-bar-wrap">
+        <div class="sync-bar">
+          <div class="sync-seg sync-seg-imported" style="width:#{imp_w}%"></div>
+          <div class="sync-seg sync-seg-rejected" style="width:#{rej_w}%"></div>
+          <div class="sync-seg sync-seg-skipped" style="width:#{skp_w}%"></div>
+          <div class="sync-seg sync-seg-unsynced" style="width:#{uns_w}%"></div>
+        </div>
+      </div>
+      <div class="sync-stat">
+        <span class="sync-primary">#{format_int(ps[:cursor])} / #{format_int(ps[:peer_total])}</span>
+        <span class="sync-pct">(#{format("%.0f%%", ps[:sync_pct])})</span>
+      </div>
+      <div class="sync-stat">
+        <span class="sync-imported">+#{format_int(ps[:imported_by_main])}</span>
+        <span class="sync-secondary">/ #{format_int(ps[:tested_by_main])} tested (#{format("%.1f%%", ps[:yield_pct])})</span>
+      </div>
+    </div>
+  HTML
+end.join("\n")
+
+peer_sync_card_html = if peer_sync_by_name.any?
+  total_peer_tested = peer_sync_by_name.values.sum { |ps| ps[:tested_by_main] }
+  total_peer_imported = peer_sync_by_name.values.sum { |ps| ps[:imported_by_main] }
+  total_peer_backlog = peer_sync_by_name.values.sum { |ps| ps[:unsynced_backlog] }
+  overall_yield = total_peer_tested > 0 ? (total_peer_imported * 100.0 / total_peer_tested) : 0.0
+  <<~HTML
+    <div class="chart-card sync-overview-card">
+      <div class="chart-header">
+        <div>
+          <h3>Peer Queue Sync Snapshot (<code>#{CGI.escapeHTML(main_name)}/.synced/&lt;peer&gt;</code>)</h3>
+          <p class="chart-sub">How far <code>#{CGI.escapeHTML(main_name)}</code> has scanned each peer's queue, and how many foreign inputs yielded novel edges vs. were rejected or skipped (overall: <strong>+#{format_int(total_peer_imported)}</strong> imported / <strong>#{format_int(total_peer_tested)}</strong> tested = <strong>#{format("%.2f%%", overall_yield)}</strong> yield, <strong>#{format_int(total_peer_backlog)}</strong> unsynced backlog)</p>
+        </div>
+        <div class="chart-legend">
+          <span class="legend-item"><span class="legend-dot" style="background:#34d399"></span><span class="legend-name">Imported (Novel)</span></span>
+          <span class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span><span class="legend-name">Tested &amp; Rejected</span></span>
+          <span class="legend-item"><span class="legend-dot" style="background:#475569"></span><span class="legend-name">Skipped (sync:#{CGI.escapeHTML(main_name)})</span></span>
+          <span class="legend-item"><span class="legend-dot" style="background:#1e293b;border:1px solid #475569"></span><span class="legend-name">Unsynced Backlog</span></span>
+        </div>
+      </div>
+      <div class="sync-rows-head">
+        <div>Peer Worker</div>
+        <div>Peer Queue Breakdown</div>
+        <div style="text-align:right">Cursor / Queue</div>
+        <div style="text-align:right">Imported / Tested (Yield)</div>
+      </div>
+      <div class="sync-rows">
+        #{peer_sync_rows_html}
+      </div>
+    </div>
+  HTML
+else
+  ""
+end
 
 # Overview comparison charts
 overview_charts = [
@@ -541,6 +692,14 @@ summary_rows_html = fuzzers.map do |f|
   edges_str = f[:total_edges] > 0 ? "#{format_int(f[:edges_found])} / #{format_int(f[:total_edges])}" : format_int(f[:edges_found])
   crash_cls = f[:saved_crashes] > 0 ? "badge-danger" : "badge-muted"
   hang_cls = f[:saved_hangs] > 0 ? "badge-warn" : "badge-muted"
+  ps = peer_sync_by_name[f[:name]]
+  if ps
+    main_sync_cell = "#{format_int(ps[:cursor])} / #{format_int(ps[:peer_total])} <span class=\"muted\">(#{format('%.0f%%', ps[:sync_pct])})</span>"
+    main_yield_cell = "<strong>+#{format_int(ps[:imported_by_main])}</strong> / #{format_int(ps[:tested_by_main])} <span class=\"muted\">(#{format('%.1f%%', ps[:yield_pct])})</span>"
+  else
+    main_sync_cell = "<span class=\"muted\">hub</span>"
+    main_yield_cell = "<span class=\"muted\">&mdash;</span>"
+  end
   <<~HTML
     <tr class="clickable-row" onclick="selectTab('#{CGI.escapeHTML(f[:name])}')">
       <td>
@@ -556,6 +715,8 @@ summary_rows_html = fuzzers.map do |f|
       <td class="num">#{format_int(f[:corpus_count])}</td>
       <td class="num">#{format_int(f[:corpus_found])}</td>
       <td class="num">#{format_int(f[:corpus_imported])}</td>
+      <td class="num">#{main_sync_cell}</td>
+      <td class="num">#{main_yield_cell}</td>
       <td class="num">#{format_int(f[:pending_favs])} / #{format_int(f[:pending_total])}</td>
       <td class="num"><span class="badge #{crash_cls}">#{f[:saved_crashes]}</span></td>
       <td class="num"><span class="badge #{hang_cls}">#{f[:saved_hangs]}</span></td>
@@ -722,6 +883,22 @@ fuzzers.each do |f|
           <div class="kpi-value #{f[:saved_crashes] > 0 ? 'text-danger' : ''}">#{f[:saved_crashes]} / #{f[:saved_hangs]}</div>
           <div class="kpi-sub"> Peak RSS: #{f[:stats]['peak_rss_mb'] || '-'} MB</div>
         </div>
+        #{if (ps = peer_sync_by_name[f[:name]])
+            <<~SYNC_KPI
+              <div class="kpi-card">
+                <div class="kpi-label">Sync to #{CGI.escapeHTML(main_name)}</div>
+                <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
+                <div class="kpi-sub">#{format_int(ps[:tested_by_main])} tested &bull; cursor #{format_int(ps[:cursor])}/#{format_int(ps[:peer_total])} (#{format("%.0f%%", ps[:sync_pct])})</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-label">Sync from #{CGI.escapeHTML(main_name)}</div>
+                <div class="kpi-value">#{format("%.0f%%", ps[:peer_from_main_pct])}</div>
+                <div class="kpi-sub">cursor #{format_int(ps[:peer_from_main_cursor])} / #{format_int(main_fuzzer[:corpus_count])} in #{CGI.escapeHTML(main_name)}</div>
+              </div>
+            SYNC_KPI
+          else
+            ""
+          end}
       </div>
 
       <div class="charts-grid">
@@ -1120,6 +1297,76 @@ html = <<~HTML
         gap: 8px;
         flex-wrap: wrap;
       }
+      .sync-overview-card {
+        margin-bottom: 22px;
+      }
+      .sync-rows-head {
+        display: grid;
+        grid-template-columns: 140px 1fr 160px 210px;
+        gap: 14px;
+        padding: 6px 8px;
+        color: var(--muted);
+        font-size: 0.74rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        border-bottom: 1px solid var(--panel-border);
+      }
+      .sync-rows {
+        display: flex;
+        flex-direction: column;
+      }
+      .sync-row {
+        display: grid;
+        grid-template-columns: 140px 1fr 160px 210px;
+        gap: 14px;
+        align-items: center;
+        padding: 7px 8px;
+        border-bottom: 1px solid rgba(31, 41, 55, 0.6);
+        font-size: 0.82rem;
+        cursor: pointer;
+        border-radius: 6px;
+      }
+      .sync-row:hover {
+        background: rgba(255, 255, 255, 0.035);
+      }
+      .sync-row:last-child {
+        border-bottom: none;
+      }
+      .sync-peer {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+      }
+      .sync-bar-wrap {
+        width: 100%;
+      }
+      .sync-bar {
+        display: flex;
+        width: 100%;
+        height: 12px;
+        background: #0b0f19;
+        border: 1px solid #1f2937;
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .sync-seg {
+        height: 100%;
+      }
+      .sync-seg-imported { background: #34d399; }
+      .sync-seg-rejected { background: #3b82f6; }
+      .sync-seg-skipped { background: #475569; }
+      .sync-seg-unsynced { background: #1e293b; }
+      .sync-stat {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .sync-primary { font-weight: 600; color: var(--text); }
+      .sync-pct { color: var(--muted); font-size: 0.76rem; margin-left: 4px; }
+      .sync-imported { font-weight: 700; color: #34d399; }
+      .sync-secondary { color: var(--muted); font-size: 0.78rem; margin-left: 3px; }
     </style>
   </head>
   <body>
@@ -1169,6 +1416,8 @@ html = <<~HTML
           #{overview_charts}
         </div>
 
+        #{peer_sync_card_html}
+
         <div class="table-card">
           <table>
             <thead>
@@ -1183,6 +1432,8 @@ html = <<~HTML
                 <th class="num">Corpus</th>
                 <th class="num">Local Finds</th>
                 <th class="num">Synced</th>
+                <th class="num">Main Sync</th>
+                <th class="num">Main Yield (Imp / Tested)</th>
                 <th class="num">Pending (Fav/All)</th>
                 <th class="num">Crashes</th>
                 <th class="num">Hangs</th>
