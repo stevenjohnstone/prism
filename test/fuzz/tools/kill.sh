@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Get the current session name
-SESSION=$(tmux display-message -p '#S')
+# Get the current session name (accept optional argument, fallback to 'fuzzer')
+SESSION=${1:-$(tmux display-message -p '#S' 2>/dev/null || echo "fuzzer")}
 # List of common shells to identify "idle" panes
 SHELLS_REGEX="^(bash|zsh|fish|sh|ksh|csh|dash)$"
 

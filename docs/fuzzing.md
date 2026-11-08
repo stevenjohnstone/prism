@@ -53,6 +53,17 @@ There is currently one fuzzing target:
 
     # or specify a custom number of fuzzer workers:
     FUZZ_WORKERS=14 make fuzz-run
+
+    # or launch in the background as a daemon (container name defaults to prism-fuzz):
+    make fuzz-daemon
+    # (equivalent to: FUZZ_DAEMON=1 make fuzz-run)
+
+    # attach to the running tmux dashboard:
+    make fuzz-attach
+    # (equivalent to: docker exec -it prism-fuzz tmux -2 attach-session -t fuzzer)
+
+    # stop the running daemon cleanly:
+    make fuzz-stop
     ```
 
 This command will start a docker container running `FUZZ_WORKERS` fuzzers (defaulting to half the available CPU cores, or at least 4):

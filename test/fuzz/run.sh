@@ -25,6 +25,9 @@ FUZZ_UBSAN_OPTIONS="abort_on_error=1:symbolize=0"
 FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 
 cleanup() {
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        bash ./test/fuzz/tools/kill.sh "$SESSION"
+    fi
     if [ -d "/tmp/afl-tmpdir/grammar/trees" ] && [ -d "$AFL_DIR/grammar" ]; then
         rm -rf "$AFL_DIR/.grammar-trees"
         cp -r "/tmp/afl-tmpdir/grammar/trees" "$AFL_DIR/.grammar-trees"
@@ -101,14 +104,20 @@ for (( i = 0; i < ${#WORKER_NAMES[@]}; i++ )); do
 done
 
 tmux select-window -t "$SESSION:0"
-tmux bind-key -n C-c run-shell 'bash ./test/fuzz/tools/kill.sh'
+tmux bind-key -n C-c confirm-before -p "Stop all fuzzers and exit? (y/n) [Tip: press Ctrl+B then d to detach]" "run-shell 'bash ./test/fuzz/tools/kill.sh'"
 
 echo "Fuzzers started."
-echo "Attaching to dashboard (Window 0)."
 
-tmux -2 attach-session -t "$SESSION"
+if [ -t 0 ] && [ -t 1 ] && [ -z "${FUZZ_DAEMON:-}" ]; then
+    echo "Attaching to dashboard (Window 0)."
+    tmux -2 attach-session -t "$SESSION"
+else
+    echo "Running in daemon mode. Attach with: docker exec -it \${CONTAINER} tmux -2 attach-session -t $SESSION"
+fi
 
-# If the user detached cleanly (Ctrl+B, D), wait so the container doesn't exit.
+# If the user detached cleanly (Ctrl+B, D) or started in daemon mode, wait so the container doesn't exit.
+# Using wait with sleep in the background allows trapped signals (e.g. SIGTERM from docker stop) to run immediately.
 while tmux has-session -t "$SESSION" 2>/dev/null; do
-    sleep 1
+    sleep 1 &
+    wait $!
 done
