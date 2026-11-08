@@ -29,6 +29,7 @@ test/fuzz
     ├── halfempty.sh          script to use Google Project Zero's halfempty minimizer
     ├── halfempty_compare.sh  identifies similar backtraces
     ├── kill.sh               manages graceful shutdown of tmux
+     ├── plot.rb               generates interactive HTML graphs from AFL++ telemetry
      ├── signature.sh          generates a crash signature hash
      ├── status.rb             live terminal dashboard for the fuzzer fleet
      ├── test_afl_patch.sh     verifies sanitizer-free AFL++ coverage guidance
@@ -151,10 +152,16 @@ make fuzz-clean
 ```
 > **WARNING**: `make fuzz-clean` deletes `tmp/fuzz/afl`, so run `make fuzz-triage` first to save any untriaged crashes or hangs into `tmp/fuzz/triage`.
 
-## Coverage
+## Coverage and Telemetry Plots
 
-To view coverage information in the browser, run
+To view an interactive HTML report of AFL++ time-series graphs (`plot_data` and `fuzzer_stats`) with a fleet overview tab and a tab for each fuzzer worker, run
+```bash
+make fuzz-plot
+open tmp/fuzz/plots/index.html
 ```
+
+To view source-level coverage information in the browser, run
+```bash
 make fuzz-coverage
 open tmp/fuzz/coverage/report/index.html
 ```
