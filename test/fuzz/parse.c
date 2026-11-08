@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <prism.h>
+#include "prism/internal/buffer.h"
 #include "prism/internal/parser.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -21,8 +22,6 @@ typedef struct {
     bool frozen_string_literal;
     uint8_t scopes_count;
     uint8_t forwarding;
-    pm_errors_format_type_t error_format_type;
-    bool prettyprint;
 } fuzz_options_t;
 
 static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) {
@@ -162,26 +161,25 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 
     pm_visit_node(node, check_node_location, &size);
 
+#ifdef SLOW
     pm_buffer_t *buffer = pm_buffer_new();
 
     pm_serialize(parser, node, buffer);
-    pm_buffer_free(buffer);
+    pm_buffer_clear(buffer);
 
     if (parser->error_list.size > 0) {
-        buffer = pm_buffer_new();
-        (void) pm_errors_format(parser, buffer, opts->error_format_type);
-        pm_buffer_free(buffer);
+        (void) pm_errors_format(parser, buffer, PM_ERRORS_FORMAT_PLAIN);
+        pm_buffer_clear(buffer);
+        (void) pm_errors_format(parser, buffer, PM_ERRORS_FORMAT_COLOR);
+        pm_buffer_clear(buffer);
     }
 
-    if (opts->prettyprint) {
-        buffer = pm_buffer_new();
-        pm_prettyprint(buffer, parser, node);
-        pm_buffer_free(buffer);
-    } else {
-        buffer = pm_buffer_new();
-        pm_dump_json(buffer, parser, node);
-        pm_buffer_free(buffer);
-    }
+    pm_prettyprint(buffer, parser, node);
+    pm_buffer_clear(buffer);
+
+    pm_dump_json(buffer, parser, node);
+    pm_buffer_free(buffer);
+#endif
 
     pm_parser_free(parser);
     pm_arena_free(arena);
@@ -213,8 +211,6 @@ __attribute__((noinline)) void harness(const uint8_t *input, size_t size) {
         .frozen_string_literal = (opt_flags & 32) != 0,
         .scopes_count = (input[2] >> 2) & 0x03,
         .forwarding = (input[2] >> 4) & 0x0f,
-        .error_format_type = (input[1] & 128) ? PM_ERRORS_FORMAT_COLOR : PM_ERRORS_FORMAT_PLAIN,
-        .prettyprint = (opt_flags & 64) != 0,
     };
 
     harness_parse(input + 4, size - 4, &opts);
