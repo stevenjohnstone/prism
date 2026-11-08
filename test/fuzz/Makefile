@@ -2,6 +2,7 @@ FUZZ_DIR = $(CURDIR)/tmp/fuzz
 FUZZ_AFL_DIR = $(FUZZ_DIR)/afl
 FUZZ_CORPUS_DIR = $(FUZZ_DIR)/corpus
 FUZZ_COVERAGE_DIR = $(FUZZ_DIR)/coverage
+FUZZ_PLOTS_DIR = $(FUZZ_DIR)/plots
 FUZZ_TRIAGE_DIR = $(FUZZ_DIR)/triage
 # Maximum input size in bytes for fuzzing and coverage.
 FUZZ_MAX_INPUT_SIZE ?= 1024
@@ -141,6 +142,10 @@ fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "collecting coverage"
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/tools/coverage.sh
 
+fuzz-plot:
+	$(ECHO) "generating AFL++ plots"
+	$(Q) ruby ./test/fuzz/tools/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html
+
 fuzz-test: fuzz-docker-build
 	$(ECHO) "testing AFL++ instrumentation patch"
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/tools/test_afl_patch.sh"
@@ -164,8 +169,8 @@ fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} -nam
 fuzz-clean:
 	$(call TTY_CONFIRM,This will destroy $(FUZZ_FINDINGS) fuzz findings in $(FUZZ_AFL_DIR) ($(FUZZ_TRIAGE_DIR) will be preserved). Continue?)
 	$(ECHO) "Removing fuzz data (preserving $(FUZZ_TRIAGE_DIR))"
-	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_COVERAGE_DIR)
+	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR)
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-test
 

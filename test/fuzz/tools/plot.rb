@@ -90,6 +90,64 @@ rescue StandardError
   []
 end
 
+# Scan <fuzzer>/queue/id:* filenames to classify each queue ID (0..N-1) as
+# :seed (orig:), :sync (sync:<source>), or :local (mutated locally), and record
+# the source fuzzer for synced entries. Because AFL++ assigns sequential 0-based
+# IDs as items enter the queue, corpus_count at any plot_data sample t corresponds
+# to queue IDs 0...(corpus_count - 1).
+def parse_queue_origins(queue_dir)
+  return { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {} } unless Dir.exist?(queue_dir)
+
+  max_id = -1
+  item_kind = {}
+  item_source = {}
+
+  Dir.children(queue_dir).each do |fname|
+    next unless fname.start_with?("id:")
+
+    id = fname[3, 6].to_i
+    max_id = id if id > max_id
+    if fname =~ /,sync:([^,]+)/
+      item_kind[id] = :sync
+      item_source[id] = Regexp.last_match(1)
+    elsif fname.include?(",orig:")
+      item_kind[id] = :seed
+    else
+      item_kind[id] = :local
+    end
+  end
+
+  return { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {} } if max_id < 0
+
+  prefix_sync = Array.new(max_id + 2, 0)
+  prefix_local = Array.new(max_id + 2, 0)
+  prefix_seed = Array.new(max_id + 2, 0)
+  sources = item_source.values.uniq
+  by_source = sources.to_h { |src| [src, Array.new(max_id + 2, 0)] }
+
+  (0..max_id).each do |id|
+    kind = item_kind[id] || :local
+    prefix_sync[id + 1] = prefix_sync[id] + (kind == :sync ? 1 : 0)
+    prefix_local[id + 1] = prefix_local[id] + (kind == :local ? 1 : 0)
+    prefix_seed[id + 1] = prefix_seed[id] + (kind == :seed ? 1 : 0)
+    src = item_source[id]
+    sources.each do |s|
+      by_source[s][id + 1] = by_source[s][id] + (src == s ? 1 : 0)
+    end
+  end
+
+  { prefix_sync: prefix_sync, prefix_local: prefix_local, prefix_seed: prefix_seed, by_source: by_source }
+rescue StandardError
+  { prefix_sync: [0], prefix_local: [0], prefix_seed: [0], by_source: {} }
+end
+
+def lookup_prefix(prefix_arr, count)
+  return 0 if prefix_arr.empty? || count <= 0
+
+  idx = [count, prefix_arr.size - 1].min
+  prefix_arr[idx]
+end
+
 def sort_fuzzer_names(names)
   priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ldet" => 3 }
   names.sort_by do |name|
@@ -342,7 +400,15 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
   dir = File.join(afl_dir, name)
   stats = parse_fuzzer_stats(File.join(dir, "fuzzer_stats"))
   raw_plot = parse_plot_data(File.join(dir, "plot_data"))
-  sampled = downsample(raw_plot)
+  origins = parse_queue_origins(File.join(dir, "queue"))
+  sampled = downsample(raw_plot).map do |r|
+    cc = r[:corpus_count]
+    r.merge(
+      synced_count: lookup_prefix(origins[:prefix_sync], cc),
+      local_count: lookup_prefix(origins[:prefix_local], cc),
+      seed_count: lookup_prefix(origins[:prefix_seed], cc)
+    )
+  end
 
   sched = stats["power_mode"] || stats["command_line"]&.[](/-p\s+(\S+)/, 1) || "default"
   edges_found = stats["edges_found"]&.to_i || sampled.last&.dig(:edges_found) || 0
@@ -351,8 +417,8 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
   execs_done = stats["execs_done"]&.to_i || sampled.last&.dig(:total_execs) || 0
   execs_per_sec = stats["execs_per_sec"]&.to_f || sampled.last&.dig(:execs_per_sec) || 0.0
   corpus_count = stats["corpus_count"]&.to_i || sampled.last&.dig(:corpus_count) || 0
-  corpus_found = stats["corpus_found"]&.to_i || 0
-  corpus_imported = stats["corpus_imported"]&.to_i || 0
+  corpus_found = stats["corpus_found"]&.to_i || sampled.last&.dig(:local_count) || 0
+  corpus_imported = stats["corpus_imported"]&.to_i || sampled.last&.dig(:synced_count) || 0
   pending_total = stats["pending_total"]&.to_i || sampled.last&.dig(:pending_total) || 0
   pending_favs = stats["pending_favs"]&.to_i || sampled.last&.dig(:pending_favs) || 0
   saved_crashes = stats["saved_crashes"]&.to_i || sampled.last&.dig(:saved_crashes) || 0
@@ -369,6 +435,7 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
     sched: sched,
     banner: banner,
     stats: stats,
+    origins: origins,
     samples: sampled,
     sample_count: raw_plot.size,
     edges_found: edges_found,
@@ -389,6 +456,8 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
     stability: stability
   }
 end
+
+color_by_name = fuzzers.to_h { |f| [f[:name], f[:color]] }
 
 # Compute Fleet Overview KPIs
 fleet_execs = fuzzers.sum { |f| f[:execs_done] }
@@ -448,6 +517,22 @@ overview_charts = [
     zero_base: true,
     chart_id: "ov-favs",
     series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:pending_favs]] } } }
+  ),
+  render_svg_chart(
+    title: "Synced Queue Items (Foreign Imports)",
+    subtitle: "Cumulative queue entries imported from other fuzzers over time (sync:<source>)",
+    y_format: :compact,
+    zero_base: true,
+    chart_id: "ov-synced",
+    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:synced_count]] } } }
+  ),
+  render_svg_chart(
+    title: "Locally Discovered Queue Items",
+    subtitle: "Cumulative queue entries discovered by each worker's own mutations (excluding initial seeds & syncs)",
+    y_format: :compact,
+    zero_base: true,
+    chart_id: "ov-local",
+    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:local_count]] } } }
   )
 ].join("\n")
 
@@ -468,7 +553,9 @@ summary_rows_html = fuzzers.map do |f|
       <td class="num">#{format_compact(f[:execs_done])}</td>
       <td class="num"><strong>#{format("%.2f%%", f[:bitmap_cvg])}</strong></td>
       <td class="num">#{edges_str}</td>
-      <td class="num">#{format_int(f[:corpus_count])} <span class="muted">(+#{format_int(f[:corpus_found])} local)</span></td>
+      <td class="num">#{format_int(f[:corpus_count])}</td>
+      <td class="num">#{format_int(f[:corpus_found])}</td>
+      <td class="num">#{format_int(f[:corpus_imported])}</td>
       <td class="num">#{format_int(f[:pending_favs])} / #{format_int(f[:pending_total])}</td>
       <td class="num"><span class="badge #{crash_cls}">#{f[:saved_crashes]}</span></td>
       <td class="num"><span class="badge #{hang_cls}">#{f[:saved_hangs]}</span></td>
@@ -524,6 +611,36 @@ fuzzers.each do |f|
         { name: "pending_total", color: "#fbbf24", points: s.map { |r| [r[:relative_time], r[:pending_total]] } },
         { name: "pending_favs", color: "#f472b6", points: s.map { |r| [r[:relative_time], r[:pending_favs]] } }
       ]
+    ),
+    render_svg_chart(
+      title: "Queue Origin Breakdown (Local vs. Synced)",
+      subtitle: "Total queue split into locally mutated finds, foreign synced imports, and initial seeds",
+      y_format: :compact,
+      fill_area: false,
+      zero_base: true,
+      chart_id: "#{name}-origins",
+      series: [
+        { name: "corpus_count", color: "#9ca3af", points: s.map { |r| [r[:relative_time], r[:corpus_count]] } },
+        { name: "local_finds", color: "#34d399", points: s.map { |r| [r[:relative_time], r[:local_count]] } },
+        { name: "synced_imports", color: "#60a5fa", points: s.map { |r| [r[:relative_time], r[:synced_count]] } },
+        { name: "initial_seeds", color: "#fbbf24", points: s.map { |r| [r[:relative_time], r[:seed_count]] } }
+      ]
+    ),
+    render_svg_chart(
+      title: "Synced Imports by Source Fuzzer",
+      subtitle: "Which foreign fuzzers contributed synced queue entries to #{name} over time",
+      y_format: :compact,
+      fill_area: false,
+      zero_base: true,
+      chart_id: "#{name}-sync-src",
+      series: sort_fuzzer_names(f[:origins][:by_source].keys).each_with_index.map do |src, s_idx|
+        prefix_arr = f[:origins][:by_source][src]
+        {
+          name: "from #{src}",
+          color: color_by_name[src] || PALETTE[s_idx % PALETTE.size],
+          points: s.map { |r| [r[:relative_time], lookup_prefix(prefix_arr, r[:corpus_count])] }
+        }
+      end
     ),
     render_svg_chart(
       title: "Execution Speed (execs/sec)",
@@ -1064,6 +1181,8 @@ html = <<~HTML
                 <th class="num">Map %</th>
                 <th class="num">Edges</th>
                 <th class="num">Corpus</th>
+                <th class="num">Local Finds</th>
+                <th class="num">Synced</th>
                 <th class="num">Pending (Fav/All)</th>
                 <th class="num">Crashes</th>
                 <th class="num">Hangs</th>
@@ -1221,9 +1340,16 @@ html = <<~HTML
           }
 
           let html = '<div class="tt-time">t = ' + formatDuration(targetT) + '</div>';
-          series.forEach(s => {
+          const sortedSeries = series
+            .filter(s => closestPointBySeries[s.name])
+            .slice()
+            .sort((a, b) => {
+              const va = closestPointBySeries[a.name].point[1];
+              const vb = closestPointBySeries[b.name].point[1];
+              return vb - va;
+            });
+          sortedSeries.forEach(s => {
             const info = closestPointBySeries[s.name];
-            if (!info) return;
             const isAct = s.name === activeName;
             html += '<div class="tt-row' + (isAct ? ' active' : '') + '">' +
               '<span><span class="legend-dot" style="background:' + s.color + '"></span> ' + s.name + '</span>' +
