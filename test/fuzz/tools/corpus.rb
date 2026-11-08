@@ -7,7 +7,7 @@ require "tmpdir"
 OUTPUT_DIR = File.absolute_path(ARGV[0] || "./tmp/fuzz/corpus")
 CORPUS_DIR = "./test/fuzz/corpus/"
 # 4-byte options header consumed by harness() in test/fuzz/parse.c:
-#   byte 0 (0x00): default opt_flags (encoding_locked=false, dump_json)
+#   byte 0 (0x00): default opt_flags (encoding_locked=false, freeze=false, etc.)
 #   byte 1 (0x00): default cmd_flags=0, main_script=false
 #   byte 2 (0x03): version_idx=3 ("4.1"), scopes_count=0, forwarding=0
 #   byte 3 (0x01): start_line=1
