@@ -27,6 +27,12 @@ FUZZ_BUILD_STAMP := ./build/.fuzz.build.stamp
 FUZZ_GRAMMAR_STAMP := ./build/.fuzz.grammar.stamp
 FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
 FUZZ_TMPFS_FLAGS := --tmpfs /tmp:rw,exec,mode=1777
+FUZZ_CONTAINER_NAME ?= prism-fuzz
+ifneq ($(FUZZ_DAEMON),)
+FUZZ_RUN_DOCKER_FLAGS := -d --name $(FUZZ_CONTAINER_NAME) -e FUZZ_DAEMON=1
+else
+FUZZ_RUN_DOCKER_FLAGS := -it --name $(FUZZ_CONTAINER_NAME)
+endif
 
 fuzz-build: $(FUZZ_AFL_STAMP) $(FUZZ_BUILD_STAMP) $(FUZZ_GRAMMAR_STAMP)
 	$(ECHO) "Fuzzers up to date"
@@ -115,7 +121,21 @@ fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make fuzz-build"
 	$(ECHO) "starting AFL++ run"
 	$(Q) $(MAKEDIRS) $(FUZZ_AFL_DIR)
-	$(Q) docker run -it --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "./test/fuzz/run.sh"
+	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "./test/fuzz/run.sh"
+ifneq ($(FUZZ_DAEMON),)
+	$(ECHO) "Fuzzer daemon started in container '$(FUZZ_CONTAINER_NAME)'."
+	$(ECHO) "Attach to tmux with: make fuzz-attach (or: docker exec -it $(FUZZ_CONTAINER_NAME) tmux -2 attach-session -t fuzzer)"
+	$(ECHO) "Stop the daemon with: make fuzz-stop (or: docker stop $(FUZZ_CONTAINER_NAME))"
+endif
+
+fuzz-daemon:
+	$(Q) $(MAKE) fuzz-run FUZZ_DAEMON=1
+
+fuzz-attach:
+	$(Q) docker exec -it $(FUZZ_CONTAINER_NAME) tmux -2 attach-session -t fuzzer
+
+fuzz-stop:
+	$(Q) docker stop $(FUZZ_CONTAINER_NAME)
 
 fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "collecting coverage"
@@ -147,5 +167,5 @@ fuzz-clean:
 	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_COVERAGE_DIR)
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-coverage fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-test
 
