@@ -20,7 +20,7 @@ export AFL_FUZZER_LOOPCOUNT=10000
 
 FUZZ_MAX_ALLOCATED=${FUZZ_MAX_ALLOCATED:-128}
 FUZZ_HARD_RSS_LIMIT=$(( FUZZ_MAX_ALLOCATED * 16 ))
-FUZZ_ASAN_OPTIONS="abort_on_error=1:handle_abort=1:quarantine_size_mb=16:malloc_context_size=5:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
+FUZZ_ASAN_OPTIONS="abort_on_error=1:handle_abort=1:quarantine_size_mb=16:malloc_context_size=0:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 FUZZ_UBSAN_OPTIONS="abort_on_error=1:symbolize=0"
 FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 
@@ -74,7 +74,7 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             add_worker "grammar" "ulimit -v 4194304 && AFL_NO_SYNC=1 AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.native"
             ;;
         2)
-            add_worker "msan" "AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
+            add_worker "msan" "AFL_DISABLE_TRIM=1 AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
             ;;
         3)
             add_worker "ldet" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S ldet -p explore -- ./build/fuzz.ldet"
@@ -82,7 +82,7 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
         *)
             sched=${SCHEDULES[$(( (i - 4) % ${#SCHEDULES[@]} ))]}
             name="main-$(( i - 2 ))"
-            add_worker "$name" "AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -w ./build/fuzz.sand -- ./build/fuzz.native"
+            add_worker "$name" "AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -w ./build/fuzz.sand -- ./build/fuzz.native"
             ;;
     esac
 done
