@@ -65,6 +65,7 @@ prepare_seed_shard() {
 
     local total=${#CORPUS_FILES[@]}
     local files=()
+    local idx
     for (( idx = shard_idx; idx < total; idx += NUM_SHARDS )); do
         files+=("${CORPUS_FILES[$idx]}")
     done
