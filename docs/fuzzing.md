@@ -1,6 +1,6 @@
 # Fuzzing
 
-We use fuzzing to test the various entrypoints to the library. The fuzzer we use is [AFL++](https://aflplus.plus). All files related to fuzzing live within the `test/fuzz` directory, which has the following structure:
+We use coverage-guided fuzzing with [AFL++](https://aflplus.plus) to test `pm_parse` and its downstream consumers (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json`). All fuzzing files live in `test/fuzz`:
 
 ```
 test/fuzz
@@ -11,7 +11,7 @@ test/fuzz
 │   ├── build.memory.sh           builds a test case with MSAN enabled
 │   ├── build.sh                  builds a test case without sanitizers
 │   └── minimize.sh               minimizes crash/hang inputs in a directory via afl-tmin
-├── dict                          an AFL++ dictionary containing various tokens
+├── dict                          an AFL++ dictionary containing Ruby tokens
 ├── docker
 │   └── Dockerfile                for building a container with the fuzzer toolchain
 ├── grammar
@@ -24,266 +24,252 @@ test/fuzz
 │   │   └── prism_xallocator.h    custom allocator header for fast leak detection
 │   └── parse.c                   fuzz harness for parsing, serialization, and formatting
 ├── patches
+│   ├── aflplusplus.md            explanation of the AFL++ sanitizer coverage patch
 │   ├── aflplusplus.patch         patch for AFL++ LTO/PCGUARD passes to skip sanitizer checks
+│   ├── grammar-mutator.md        explanation of the Grammar-Mutator patch
 │   ├── grammar-mutator.patch     patch for AFL++ Grammar-Mutator
 │   └── test_afl_patch.sh         verifies sanitizer-free AFL++ coverage guidance
 ├── report
-│   ├── coverage.sh               generate coverage report in html
+│   ├── coverage.sh               generates HTML source coverage report
 │   └── plot.rb                   generates interactive HTML graphs from AFL++ telemetry
 ├── runtime
-│   ├── corpus.rb                 script to prepare and minimize a fuzzing corpus
-│   ├── kill.sh                   manages graceful shutdown of tmux
-│   ├── run.sh                    script to launch the parallel fuzzing session in tmux
+│   ├── corpus.rb                 prepares and minimizes the initial seed corpus
+│   ├── kill.sh                   manages graceful shutdown of the tmux session
+│   ├── run.sh                    launches the parallel fuzzing fleet in tmux
 │   └── status.rb                 live terminal dashboard for the fuzzer fleet
 └── triage
-    ├── halfempty.sh              script to use Google Project Zero's halfempty minimizer
-    ├── halfempty_compare.sh      identifies similar backtraces
-    ├── signature.sh              generates a crash signature hash
-    └── triage.rb                 automagic triage of crashes
+    ├── halfempty.sh              minimizes crash inputs with Google Project Zero's halfempty
+    ├── halfempty_compare.sh      identifies similar backtraces during minimization
+    ├── signature.sh              hashes stack traces into a crash signature
+    └── triage.rb                 deduplicates, minimizes, and packages crashes into C reproducers
 ```
 
 ## Requirements
 
+Docker: runs on Linux, Windows and Mac OS.
 
-> Fuzzing runs inside a Docker container. If Docker is installed on the host platform, then fuzzing should work without installing any other dependencies. Everything required to fuzz and triage crashes is included in the container.
+Everything needed to build the fuzzers, run a campaign, and triage crashes is self-contained inside the Docker image.
 
 ## Usage
 
-Currently, fuzzing targets pm_parse. After that completes, the AST is serialized with pm_serialize, pretty printed and rendered as json. Various
-invariants are enforced. 
-* **To run the parse fuzzer:**
-    In the root directory of this repository run
-    ```bash
-    # builds and runs fuzzing code in a container (defaults to nproc / 2 workers, minimum 4)
-    make fuzz-run
+### Quick Start
 
-    # or specify a custom number of fuzzer workers:
-    FUZZ_WORKERS=14 make fuzz-run
-
-    # or launch in the background as a daemon (container name defaults to prism-fuzz):
-    make fuzz-daemon
-    # (equivalent to: FUZZ_DAEMON=1 make fuzz-run)
-
-    # attach to the running tmux dashboard:
-    make fuzz-attach
-    # (equivalent to: docker exec -it prism-fuzz tmux -2 attach-session -t fuzzer)
-
-    # stop the running daemon cleanly:
-    make fuzz-stop
-    ```
-
-This command will start a docker container running `FUZZ_WORKERS` fuzzers (defaulting to half the available CPU cores, or at least 4):
-1. a primary parse-only fuzzer using ASAN, UBSAN, and CmpLog (`main`)
-2. a grammar-driven parse-only fuzzer using custom leak detection (`grammar`, running `build/fuzz.native` since LSAN/ASAN are slower on deep syntax trees)
-3. a full post-processing fuzzer (`-DSLOW`) using MSAN (memory sanitizer) (`msan`, running `pm_parse` followed by `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json`, with `AFL_DISABLE_TRIM=1`)
-4. a fast byte/dictionary parse-only fuzzer using custom leak detection and IJON state guidance (`ldet`, running `build/fuzz.ldet`)
-5. additional secondary parse-only workers (`main-2`, `main-3`, ...) running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase -w ./build/fuzz.sand -- ./build/fuzz.native`) with varied power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), input formats (`-a text`, `-a binary`, generic), mutation strategies (`-P explore`, `-P exploit`, `-L 0` MOpt, `-Z` sequential queue cycling, 50% `AFL_DISABLE_TRIM=1`), and disjoint shards of the initial seed corpus (`/tmp/afl-tmpdir/<worker>/seeds`, while `main` loads the full `$CORPUS_DIR`), executing at native speed with 8 KB arena bump allocation and custom leak detection while dispatching coverage-increasing inputs to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`)
-
-> **Parse-Only Fast Fuzzers vs. `-DSLOW` Post-Processing (`build/fuzz.msan` and `build/fuzz.lsan`)**: To maximize parser execution speed and prevent output-formatter edges from polluting the coverage map or duplicating queue entries, the primary exploration workers (`main`, `grammar`, `ldet`, `main-2..N`, and `fuzz.cmplog`) are built without `-DSLOW` and with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`, running only `pm_parse` and the `check_node_location` AST bounds check. `build/fuzz.msan` ( along with `build/fuzz.lsan`, `fuzz.coverage`, and the `build*.sh` triage scripts) is compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (both plain and color), `pm_prettyprint`, and `pm_dump_json` on every input so MSAN verifies that every AST field, token, and line offset is initialized.
->
-> **CmpLog and `pm_strncasecmp`**: The `main` fuzzer runs alongside a CmpLog binary (`build/fuzz.cmplog`) built with `AFL_LLVM_CMPLOG=1`. When building `build/fuzz.cmplog`, `pm_strncasecmp` is replaced with the standard `strncasecmp` function (`-Dpm_strncasecmp=strncasecmp`, excluding `src/strncasecmp.c`) so AFL++'s CmpLog runtime hooks can instrument case-insensitive string comparisons and solve multi-byte comparisons (such as encoding names and magic comments) for better coverage.
->
-> **Fast Leak Detection and AFL++ SAND (`build/fuzz.native`, `build/fuzz.ldet`, and `build/fuzz.sand`)**: Running LeakSanitizer (LSAN) or ASAN with `-DPM_ARENA_INITIAL_SIZE=0` on every fuzzing iteration slows down fuzzing on larger ASTs. Instead, `build/fuzz.native` and `build/fuzz.ldet` are compiled without sanitizers and with `-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`, which hooks `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` (via `test/fuzz/harness/include/prism_xallocator.h`) to lightweight wrappers in `test/fuzz/harness/fuzz.c`. Each allocation prepends its size in a `size_t` header and updates a running byte counter (`allocated`), and `LLVMFuzzerTestOneInput` asserts `allocated == 0` at the end of every input to catch memory leaks without ASAN/LSAN overhead. The secondary workers (`main-2..N`) combine `build/fuzz.native` with AFL++'s SAND (`AFL_SAN_ABSTRACTION=coverage_increase -w ./build/fuzz.sand`, built with `AFL_LLVM_ONLY_FSRV=1` + ASAN + UBSAN + `-DPM_ARENA_INITIAL_SIZE=0`) so mutations execute at native speed while any input that increases coverage is also checked under ASAN/UBSAN. During `make fuzz-triage`, crashes are tested against `build/fuzz` (for assertions/memory errors) and `build/fuzz.lsan` (to produce detailed leak backtraces).
->
-> **IJON State-Guided Fuzzing (`AFL_LLVM_IJON=1` and `PRISM_FUZZ_IJON` on `ldet`)**: Many parser and lexer bugs depend on data-driven state stacks and bitmasks (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack.top`, `accepts_block_stack.top`, and `current_scope->parameters`) that funnel through shared helper functions and therefore look identical to standard CFG edge coverage. `build/fuzz.ldet` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`, which registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` in `test/fuzz/harness/parse.c` without modifying `src/`. On each token boundary where a tracked state changes, `FUZZ_IJON_SET` records a full-width 32-bit transition hash into AFL++'s dedicated 64 KB IJON bitmap region (above the collision-free LTO edge map) for:
-> 1. Lexer mode stack transitions (top 4 stacked modes in `parser->lex_modes`, including balanced delimiter nesting and heredoc indent/quote flags)
-> 2. Parser context stack transitions (current and parent `pm_context_t` plus the full enclosing `parser->current_context->mask` in `parser->current_context`)
-> 3. Non-CFG parser mode flags (`command_start`, `in_keyword_arg`, `in_endless_def_body`, `pattern_matching_newlines`, `enclosure_nesting`, `brace_nesting`, `lambda_enclosure_nesting`) and the top bits of `do_loop_stack.top` and `accepts_block_stack.top`, combined with `parser->lex_state` and `cur_ctx` when mode flags change
-> 4. Scope parameter, `closed`, and `shareable_constant` flags across the current and enclosing `pm_scope_t`
-> 5. Syntax error / recovery transitions (`parser->error_list.size`, `parser->recovering`) and non-trivial `PM_TOKEN_EOF` states combined with the active context and lex mode stacks
->
-> IJON is active only on the fast `ldet` worker (`grammar` and `afl-tmin` set `AFL_NO_IJON=1`, and `fuzz` / `fuzz.msan` are built without IJON). When `ldet` discovers a novel IJON state and saves the input to `ldet/queue/`, `main`, `msan`, and `main-2..N` automatically execute that input under ASAN/UBSAN/MSAN during AFL++ queue sync, while only importing it into their own mutation queues if it also reaches new CFG coverage.
->
-> **Grammar-Mutator (`test/fuzz/grammar/ruby.json` and `test/fuzz/patches/grammar-mutator.patch`)**: The `grammar` worker uses AFL++'s [Grammar-Mutator](https://github.com/AFLplusplus/Grammar-Mutator) (pinned to commit `b108ec696ad60b2ad88babace7ebda138276bde3` in `test/fuzz/docker/Dockerfile`) compiled during `make fuzz-build` against our custom Prism Ruby grammar (`test/fuzz/grammar/ruby.json`), which includes the 4-byte fuzz option header (`<OPT0>..<OPT3>`) followed by Ruby syntax rules, producing `build/libgrammarmutator-ruby.so` and `build/grammar_generator-ruby`. At startup, `test/fuzz/runtime/run.sh` runs `./build/grammar_generator-ruby 500 500` to generate 500 initial Ruby seeds alongside their pre-serialized derivation `.tree` files in `/tmp/afl-tmpdir/grammar/{seeds,trees}`, and runs `grammar` with `AFL_NO_SYNC=1` so sync is one-way (`grammar -> main -> fleet`): `grammar` does not pull raw byte-mutated inputs from `main` (which have no `.tree` files and would otherwise pre-empt `grammar`'s `virgin_bits` and `top_rated[]` slots), while `main` still imports all coverage-increasing inputs from `$AFL_DIR/grammar/queue`. Before building, `test/fuzz/Makefile` applies `test/fuzz/patches/grammar-mutator.patch` to `Grammar-Mutator` to:
-> - **Store serialized `.tree` files in `tmpfs` (`/tmp/afl-tmpdir/grammar/trees`) and persist to `$AFL_DIR/.grammar-trees` on exit**: Serialized `.tree` files are read from and written directly to `/tmp/afl-tmpdir/grammar/trees` on `tmpfs` during fuzzing for fast RAM I/O without pre-creating `$AFL_DIR/grammar`, and persisted to `$AFL_DIR/.grammar-trees` when `run.sh` exits so `AFL_AUTORESUME=1` can restore them across container runs.
-> - **Disable runtime ANTLR4 reverse-parsing (`load_tree_from_test_case`) and preserve `trimmed_tree` across `afl_custom_post_trim(data, 0)`**: Because `grammar` starts from `grammar_generator-ruby` seeds that already have `.tree` files and every grammar mutation/trim already has its `tree_t` in memory (`data->mutated_tree` / `data->trimmed_tree`), runtime ANTLR4 reverse-parsing of raw byte files (`load_tree_from_test_case`) is skipped. In addition, `data->trimmed_tree` is kept alive across `afl_custom_post_trim(data, 0)` so that when a trim step discovers a new coverage edge and `trim_case_custom` subsequently calls `save_if_interesting() -> afl_custom_queue_new_entry()`, the trimmed `tree_t` is saved to `/tmp/afl-tmpdir/grammar/trees` and added to `chunk_store`.
-> - **Track grammar file changes and set `$ORIGIN` `RPATH`**: Ensures `GNUmakefile` rebuilds generated code when `test/fuzz/grammar/ruby.json` changes and links `grammar_generator-ruby` with `-Wl,-rpath,'$ORIGIN'` so `./build/grammar_generator-ruby` locates `./build/libgrammarmutator-ruby.so` across container runs.
->
-> **Arena Granularity (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, Prism's arena allocator (`src/arena.c`) sub-allocates AST nodes and strings out of 8 KB blocks, which means an out-of-bounds read or write on one arena allocation can silently spill into adjacent allocations within the same block without triggering AddressSanitizer. Sanitizer-instrumented fuzzing and triage binaries (`fuzz`, `fuzz.sand`, `fuzz.msan`, and `fuzz.lsan`) are compiled with `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` always returns the exact requested size (`min_size`). Every `pm_arena_alloc` call therefore allocates its own exact-sized `xmalloc` block surrounded by ASAN/MSAN heap redzones, while `pm_arena_cleanup` still walks the block list and frees all blocks without leaking memory. Non-sanitized builds (`fuzz.ldet`, `fuzz.native`, `fuzz.cmplog`, and `fuzz.coverage`) omit `-DPM_ARENA_INITIAL_SIZE=0` so they exercise the default 8 KB bump-allocation and block-growth paths at full speed.
->
-> **Bignum Divide-and-Conquer Threshold (`-DPM_INTEGER_DIVIDE_THRESHOLD=8`)**: By default, `src/integer.c` only switches from schoolbook decimal parsing (`pm_integer_parse_decimal_schoolbook`) to divide-and-conquer decimal parsing (`pm_integer_parse_decimal_divide`, which calls the base-$2^{32}$ arithmetic and Karatsuba multiplication functions in `src/bignum.c`) above `PM_INTEGER_DIVIDE_THRESHOLD = 224` chunks of 9 digits (2,017 decimal digits), which exceeds `FUZZ_MAX_INPUT_SIZE` (1,024 bytes). Fuzzing, coverage, and triage binaries override `-DPM_INTEGER_DIVIDE_THRESHOLD=8` (72 decimal digits) so both schoolbook (20–72 digits) and divide-and-conquer / Karatsuba (73–1,020 digits) paths are exercised within the 1 KB input budget.
->
-> **Recursion Depth Limit (`-DPRISM_DEPTH_MAXIMUM=128`)**: By default, `src/prism.c` sets `PRISM_DEPTH_MAXIMUM = 10000`, which is unreachable within `FUZZ_MAX_INPUT_SIZE` (1,024 bytes) and allows deeply nested prefix expressions (`((((...`) to trigger quadratic $\Theta(N^2)$ indentation buffer growth in `pm_prettyprint` exceeding `FUZZ_MAX_ALLOCATED` (128 MiB). Fuzzing, coverage, and triage binaries override `-DPRISM_DEPTH_MAXIMUM=128` so `PM_ERR_NESTING_TOO_DEEP` error-recovery paths in `parse_expression` and `parse_pattern` are exercised and `pm_prettyprint` output stays bounded well within the 128 MiB allocation limit.
->
-> **Write-Only ASAN (`-asan-instrument-reads=0`)**: `build/fuzz` (used by the `main` and `main-2..N` fuzzers) is compiled with `-mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0` so AddressSanitizer only instruments stores (illegal writes) and does not abort on out-of-bounds reads, leaving read issues to the `msan` fuzzer (`build/fuzz.msan`).
->
-> **Sanitizer-Free Coverage Instrumentation (`test/fuzz/patches/aflplusplus.patch`)**: In LTO mode (`afl-clang-lto`), Clang runs AddressSanitizer, MemorySanitizer, and UBSAN during `-c` pre-link compilation before `SanitizerCoverageLTO.so` runs in `ld.lld`. Unpatched AFL++ instruments every sanitizer check branch, trap block, ASAN stack-use-after-return prologue/epilogue, and MSAN shadow `select`/`icmp`, inflating the coverage map of `build/fuzz` and `build/fuzz.msan` by 40–130%. During `make fuzz-build`, `test/fuzz/Makefile` applies `test/fuzz/patches/aflplusplus.patch` and builds patched `SanitizerCoverageLTO.so` and `SanitizerCoveragePCGUARD.so` plugins into `build/afl/` (passed via `AFL_PATH`), stripping sanitizer-synthesized CFG edges and branchless shadow selects so all fuzzers (`fuzz`, `fuzz.ldet`, `fuzz.lsan`, and `fuzz.msan`) share near-identical coverage maps focused solely on Prism's control flow. In addition, `build/fuzz.msan` omits `-fsanitize-memory-track-origins=2` for higher fuzzing throughput and cleaner CFG structure, while `test/fuzz/debug/build.memory.sh` retains `-fsanitize-memory-track-origins=2` to report full uninitialized-memory origin chains when reproducing crashes.
-
-### Fleet Dashboard
-
-The terminal opens in a `tmux` session inside the container:
-- **Window 0 (`dashboard`)** runs `test/fuzz/runtime/status.rb`, displaying a live two-page fleet dashboard.
-- **Windows 1..N** each run an individual `afl-fuzz` instance with its full native [AFL++ status screen](https://aflplus.plus/docs/status_screen/). Press `Ctrl+B, w` to pick any fuzzer window from an interactive list, `Ctrl+B, n`/`p` for next/previous window, or `Ctrl+B, 0` to return to the dashboard.
-
-Inside the dashboard (`Window 0`), press **`Tab`**, **`Space`**, **`1`**, **`2`**, or the left/right arrow keys (`h`/`l`) to switch between the two pages:
-
-1. **Page 1 (`[1: Overview]`)** — compact health and findings view:
-   ```text
-   Prism AFL++ Fleet Dashboard (uptime: 26m 16s, dir: ./tmp/fuzz/afl)   [1: Overview]  2: Queue & Sync
-
-     Workers: 12/12 alive   Speed: 21,927/s   Execs: 34,420,027   Corpus: 18,540   Max Cov: 69.91%   Crashes: 0   Hangs: 0
-
-   FUZZER     STATE     SCHED          EXEC/S    COV %             EDGES  CRASHES  HANGS
-   -------------------------------------------------------------------------------------
-   main       RUNNING   exploit       1,720/s   47.66%   15,288 / 32,905        0      0
-   grammar    RUNNING   explore       2,309/s   69.91%   16,234 / 24,169        0      0
-   msan       RUNNING   fast          5,773/s   37.59%   18,890 / 55,121        0      0
-   main-2     RUNNING   explore       1,218/s   47.42%   15,276 / 32,905        0      0
-   ...
-   -------------------------------------------------------------------------------------
-   [Tab/Space/1/2] Switch page   [Ctrl+B, w] Fuzzer window   [Ctrl+B, n/p] Next/Prev   [Ctrl+B, 0] Dashboard   [Ctrl+B, d] Detach   [Ctrl+C] Stop all
+1. **Start the fuzzer** from the repository root:
+   ```bash
+   make fuzz-run
    ```
+   This builds the Docker image and fuzzing binaries (if out of date), prepares the seed corpus from `test/prism/fixtures`, and opens a `tmux` dashboard running a fleet of parallel AFL++ workers.
 
-2. **Page 2 (`[2: Queue & Sync]`)** — detailed corpus progression and cross-fuzzer contribution metrics:
-   ```text
-   Prism AFL++ Fleet Dashboard (uptime: 26m 16s, dir: ./tmp/fuzz/afl)    1: Overview  [2: Queue & Sync]
+2. **Wait for a crash** to appear in the `CRASHES` column of the dashboard, then press **`Ctrl+C`** (and `y` to confirm) to stop all fuzzers cleanly and exit the container.
 
-     Workers: 12/12 alive   Speed: 21,927/s   Execs: 34,420,027   Corpus: 18,540   Max Cov: 69.91%   Crashes: 0   Hangs: 0
-
-   FUZZER     STATE     SCHED          EXEC/S    TOTAL EXECS CYCLES   CORPUS   SHARED DESCENDANTS      LAST FIND  PENDING PEND FAV
-   -------------------------------------------------------------------------------------------------------------------------------
-   main       RUNNING   exploit       1,720/s      2,710,481      0   16,619    1,575       2,207         1s ago   16,339    1,968
-   grammar    RUNNING   explore       2,309/s      3,519,253      0   16,216    4,940         664         1s ago   14,970    1,798
-   msan       RUNNING   fast          5,773/s      9,096,279      0   18,540    3,542       3,655         1s ago   12,144        0
-   main-2     RUNNING   explore       1,218/s      1,918,326      0   14,451      104         220         2s ago   14,050    1,905
-   ...
+3. **Triage the findings**:
+   ```bash
+   make fuzz-triage
    ```
-   - **`SHARED` and `DESCENDANTS`**: Show how useful a fuzzer's outputs have been to the rest of the fleet (refreshed every 15 seconds while viewing Page 2). `SHARED` is how many seeds originated by that fuzzer were imported by other fuzzers (`sync:<name>`), and `DESCENDANTS` is how many additional coverage paths other fuzzers discovered by mutating those imported seeds (`src:<id>`).
-   - **`PENDING` and `PEND FAV`**: Total unfuzzed queue entries and unfuzzed favored entries.
+   Triage runs every crash and hang from `tmp/fuzz/afl/` against the sanitizer binaries, deduplicates them by backtrace signature, minimizes the triggering input, and writes standalone reproducers into `tmp/fuzz/triage/`.
 
-Minimized input corpus files will be generated in `tmp/fuzz/corpus`, and AFL++ fuzzing output will be written to `tmp/fuzz/afl`.
+### Where to Find Crashes and How to Reproduce
 
-To end a fuzzing job, interrupt with **CTRL+C**.
-
-To delete fuzzing run data (`tmp/fuzz/afl`, `tmp/fuzz/corpus`, and `tmp/fuzz/coverage`) while preserving already-triaged results in `tmp/fuzz/triage`, run
-```bash
-make fuzz-clean
-```
-> **WARNING**: `make fuzz-clean` deletes `tmp/fuzz/afl`, so run `make fuzz-triage` first to save any untriaged crashes or hangs into `tmp/fuzz/triage`.
-
-## Coverage and Telemetry Plots
-
-To view an interactive HTML report of AFL++ time-series graphs (`plot_data` and `fuzzer_stats`) with a fleet overview tab and a tab for each fuzzer worker, run
-```bash
-make fuzz-plot
-open tmp/fuzz/plots/index.html
-```
-
-To view source-level coverage information in the browser, run
-```bash
-make fuzz-coverage
-open tmp/fuzz/coverage/report/index.html
-```
-
-> **NOTE** the coverage is calculated over the functions which are reachable in the target
-
-
-## Triaging Crashes and Hangs
-
-From the prism directory where fuzzing is running, run
-```bash
-make fuzz-triage
-```
-
-
-This will create a `tmp/fuzz/triage/` directory with crashes organized by type. Each leaf directory contains:
-
-1.  A C program (`testcase.c`)
-2.  The minimized Ruby program that causes the crash (`input.min`)
-3.  The original unminimized AFL++ crash file (`id:...`), whose filename records the signal (`sig:`), source queue entry, and fuzzer metadata
-
-For example, the `tmp/fuzz/triage` directory may look like this:
-
+`make fuzz-triage` organizes unique bugs under `tmp/fuzz/triage/<category>/<signature>/`:
 
 ```
 tmp/fuzz/triage
-├── ABRT
-│  	├── 14a9275da317ddd6
-│  	│  	├── input.min
-│  	│  	└── testcase.c
-
+└── ABRT                          <-- crash category (e.g., ABRT, SEGV, heap-buffer-overflow, memory-leak)
+    └── 14a9275da317ddd6          <-- hash of the normalized backtrace
+        ├── id:000000,sig:06,...  <-- original unminimized AFL++ crash input
+        ├── input.min             <-- minimized raw input (4-byte option header + Ruby source)
+        └── testcase.c            <-- self-contained C program that reproduces the crash
 ```
-In this case, an `ABRT` (abort signal) crashes was found, most likely from a failing program assert.
 
-### Reproducing a Crash
+Each `testcase.c` embeds the decoded `pm_options_t` settings, the Ruby source as a C byte array (with a readable string dump in a comment at the top), and the sanitizer output captured during triage.
 
-To demonstrate a crash, you can build and run a specific test case:
+To compile and run a `testcase.c` reproducer:
 
 ```bash
-# Build the test case with ASAN enabled
-./test/fuzz/debug/build.asan.sh ./tmp/fuzz/triage/ABRT/d0a90c13bfbe209b/testcase.c
+# Build with AddressSanitizer and UndefinedBehaviorSanitizer:
+./test/fuzz/debug/build.asan.sh ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c
 
-# Run the test case
+# Or, for uninitialized-memory crashes (use-of-uninitialized-value), build with MemorySanitizer:
+./test/fuzz/debug/build.memory.sh ./tmp/fuzz/triage/use-of-uninitialized-value/<signature>/testcase.c
+
+# Or build without sanitizers for plain gdb/lldb debugging:
+./test/fuzz/debug/build.sh ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c
+
+# Run the compiled reproducer:
 ./testcase
 ```
 
-> **NOTE** if you do not have a compiler which supports ASAN (clang, gcc) installed on the host, run `make fuzz-debug` to start a container with clang, fuzzing tools etc installed and follow the instructions as above
+> **Note:** If your host machine does not have `clang` with sanitizer support (for example on macOS when reproducing MSAN crashes), run `make fuzz-debug` to open an interactive shell inside the fuzzing container and run the commands above there.
 
+Running `./testcase` prints the assertion failure or sanitizer report:
 
-The output may be something like
 ```
 testcase: src/util/pm_newline_list.c:51: _Bool pm_newline_list_append(pm_newline_list_t *, const uint8_t *): Assertion `list->size == 0 || newline_offset > list->offsets[list->size - 1]' failed.
 AddressSanitizer:DEADLYSIGNAL
 =================================================================
-==143==ERROR: AddressSanitizer: ABRT on unknown address 0x03e80000008f (pc 0xffff91cf2008 bp 0xfffff8cce460 sp 0xfffff8cce3d0 T0)
+==143==ERROR: AddressSanitizer: ABRT on unknown address 0x03e80000008f
     #0 0xffff91cf2008 in __pthread_kill_implementation nptl/pthread_kill.c:44:76
-    #1 0xffff91caa838 in gsignal signal/../sysdeps/posix/raise.c:26:13
-    #2 0xffff91c97130 in abort stdlib/abort.c:79:7
-    #3 0xffff91ca4110 in __assert_fail_base assert/assert.c:94:3
-    #4 0xffff91ca4188 in __assert_fail assert/assert.c:103:3
+    ...
     #5 0xaaaad388572c in pm_newline_list_append /prism/src/util/pm_newline_list.c:51:5
     #6 0xaaaad38c5b1c in parser_lex /prism/src/prism.c:12248:25
-    #7 0xaaaad38fece0 in accept1 /prism/src/prism.c:13229:9
-    #8 0xaaaad3902cc0 in expect1 /prism/src/prism.c:13261:9
-    #9 0xaaaad390fc3c in parse_string_part /prism/src/prism.c:16193:13
-    #10 0xaaaad38f51e8 in parse_expression_prefix /prism/src/prism.c:20544:29
-    #11 0xaaaad38e45f8 in parse_expression /prism/src/prism.c:22251:23
-    #12 0xaaaad38fb858 in parse_expression_infix /prism/src/prism.c:21887:35
-    #13 0xaaaad38e4b60 in parse_expression /prism/src/prism.c:22303:16
-    #14 0xaaaad38cc880 in parse_statements /prism/src/prism.c:13985:27
-    #15 0xaaaad38b31e4 in parse_program /prism/src/prism.c:22524:40
-    #16 0xaaaad38b2ff8 in pm_parse /prism/src/prism.c:22957:12
-    #17 0xaaaad38b3ff8 in pm_parse_success_p /prism/src/prism.c:23074:23
-    #18 0xaaaad39bdc34 in harness /prism/triage/ABRT/14a9275da317ddd6/d0a90c13bfbe209b/testcase.c:11:3
-    #19 0xaaaad39bdc84 in main /prism/triage/ABRT/14a9275da317ddd6/d0a90c13bfbe209b/testcase.c:80:5
-    #20 0xffff91c973fc in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16
-    #21 0xffff91c974d4 in __libc_start_main csu/../csu/libc-start.c:392:3
-    #22 0xaaaad3762eec in _start (/prism/testcase+0x52eec) (BuildId: 263757dc719fdaad53a70d21f0dcbcaf732902ec)
-
-AddressSanitizer can not provide additional info.
-SUMMARY: AddressSanitizer: ABRT nptl/pthread_kill.c:44:76 in __pthread_kill_implementation
-==143==ABORTING
-Aborted
 ```
-You can then debug the crash using gdb (or lldb):
+
+You can then inspect it in `gdb` or `lldb`:
+
 ```bash
 gdb ./testcase
 ```
 
-It may be useful to set a break point on `__sanitizer::Die` to stop the program exiting after the ASAN/UBSAN
-handler completes.
+Tip: set a breakpoint on `__sanitizer::Die` if you want the debugger to stop before the ASAN/UBSAN handler exits.
 
+> **Note on crash categories:** When compiled as a standalone `testcase.c`, `input` is a `static const uint8_t[]` array in `.rodata` rather than a heap buffer. An out-of-bounds read that originally triggered `heap-buffer-overflow` inside the fuzzer may therefore report as `global-buffer-overflow` in `./testcase`; the underlying bug is the same.
 
+---
 
-## Crash Similarity
+### Running in the Background (Daemon Mode) and Custom Worker Counts
 
-Crashes are deemed to be **identifcal** if:
+By default, `make fuzz-run` launches half the available CPU cores (minimum 4). You can override the worker count or run the campaign in the background:
 
-  * They are in the same category (e.g., `ABRT`, `SEGV`).
-  * Their backtraces have the same hash signature after being stripped of random elements (like memory addresses).
+```bash
+# Run with a specific number of workers:
+FUZZ_WORKERS=14 make fuzz-run
 
-Similar crashes are stored in the output directory under their category and backtrace signature. For example:
+# Launch in the background as a Docker daemon (container name defaults to prism-fuzz):
+make fuzz-daemon
 
+# Attach to the running tmux dashboard at any time:
+make fuzz-attach
+# (Press Ctrl+B then d to detach without stopping the fuzzers)
+
+# Stop the background daemon cleanly:
+make fuzz-stop
 ```
-tmp/fuzz/triage
-├── ABRT  <------------------------type of crash
-│   ├── 14a9275da317ddd6     <-----backtrace signature
-│   │   ├── build.sh
-│   │   ├── input.min
-│   │   └── testcase.c
+
+### Navigating the Fleet Dashboard
+
+Inside the `tmux` session:
+
+- **Window 0 (`dashboard`)** runs `test/fuzz/runtime/status.rb`, showing a live two-page summary of all workers. Press `Tab`, `Space`, `1`, `2`, or the arrow keys to toggle between:
+  - **`[1: Overview]`**: Worker health, execution speed, coverage percentage, edges found, crashes, and hangs.
+  - **`[2: Queue & Sync]`**: Total executions, queue cycles, corpus size, cross-worker `SHARED` and `DESCENDANTS` counts (how many inputs discovered by a worker were imported and further mutated by peers), and pending favored items.
+- **Windows 1..N** each display an individual worker's native [AFL++ status screen](https://aflplus.plus/docs/status_screen/). Use `Ctrl+B, w` to pick a window from a list, `Ctrl+B, n`/`p` for next/previous window, or `Ctrl+B, 0` to return to the dashboard.
+
+### Telemetry Plots and Source Coverage
+
+- **Interactive telemetry plots** (coverage growth, throughput, corpus size, and cross-worker queue sync breakdowns):
+  ```bash
+  make fuzz-plot
+  open tmp/fuzz/plots/index.html
+  ```
+- **Source-level HTML coverage report** (computed across all reachable functions using the current queue in `tmp/fuzz/afl`):
+  ```bash
+  make fuzz-coverage
+  open tmp/fuzz/coverage/report/index.html
+  ```
+
+### Cleaning Up
+
+To delete the current campaign data (`tmp/fuzz/afl`, `tmp/fuzz/corpus`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs in `tmp/fuzz/triage`:
+
+```bash
+make fuzz-clean
 ```
 
+Run `make fuzz-triage` before `make fuzz-clean` if your campaign has untriaged crashes or hangs.
 
-> **A Note on Behavior:**
-> When building and running test cases outside the fuzzing framework, crashes may manifest differently. For example, a "use after poison" crash (from data on the heap surrounded by poisoned pages) might become a "global buffer overflow" in the test harness (where data is stored in a global). Either way, the underlying bug is an out-of-bounds read or write.
+---
 
+## Technical Details
+
+For background on coverage-guided greybox fuzzing and AFL++, see:
+
+- [The Fuzzing Book — Greybox Fuzzing](https://www.fuzzingbook.org/html/GreyboxFuzzer.html) and [Mutation-Based Fuzzing](https://www.fuzzingbook.org/html/MutationFuzzer.html)
+- [AFL++ Documentation](https://aflplus.plus/docs/) and [Best Practices](https://aflplus.plus/docs/best_practices/)
+
+### Harness and Input Format (`test/fuzz/harness/parse.c`)
+
+Every fuzz input begins with a **4-byte options header** consumed by `harness()` before the remaining bytes are passed to `harness_parse()` as Ruby source:
+
+| Byte | Bits | Option Mapped to `pm_options_t` |
+| :--- | :--- | :--- |
+| `input[0]` | `0..5` | Boolean flags: `freeze`, `partial_script`, `attach_comments`, `encoding_locked`, `has_frozen_string_literal`, `frozen_string_literal` |
+| `input[1]` | `0..5`, `6` | Command-line flags (`-a`, `-e`, `-l`, `-n`, `-p`, `-x`) and `main_script` |
+| `input[2]` | `0..1`, `2..3`, `4..7` | Ruby syntax version (`3.3`, `3.4`, `3.5`, `4.1`), enclosing `scopes_count` (`0..3`), and parameter forwarding flags (`*`, `**`, `&`, `...`) |
+| `input[3]` | `0..7` (signed) | `start_line` (`-128..127`) |
+
+Putting options in the input header lets AFL++ mutate parser configuration alongside Ruby syntax so version-specific grammar rules, magic-comment overrides, command-line loops (`-n`/`-p`), and local scope forwarding are all explored automatically.
+
+After `pm_parse()` returns, `harness_parse()` checks two invariants on every run:
+
+1. **Monotonic line offsets**: Verifies that `parser->line_offsets` is strictly increasing.
+2. **AST location bounds (`check_node_location`)**: Walks the entire AST with `pm_visit_node` and aborts if any node has `start > end`, `start < input`, or `end > input + size`.
+
+### Parse-Only Fast Workers vs. `-DSLOW` Post-Processing
+
+Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json` on every fuzzing iteration would slow down parser exploration and pollute the coverage bitmap with output-formatter edges. We split the build into two modes:
+
+- **Fast parse-only binaries** (`build/fuzz`, `build/fuzz.native`, `build/fuzz.ldet`, `build/fuzz.sand`, `build/fuzz.cmplog`): Compiled with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`. They only run `pm_parse` and the AST/line-offset invariant checks.
+- **Slow full-pipeline binaries** (`build/fuzz.msan`, `build/fuzz.lsan`, `build/fuzz.coverage`, and the `test/fuzz/debug/build*.sh` scripts): Compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (plain and color), `pm_prettyprint`, and `pm_dump_json` on every input. Because these serializers and printers read every AST node, token, error, and line offset, running them under MemorySanitizer (`fuzz.msan`) catches uninitialized fields anywhere in the parse tree.
+
+### Worker Fleet Architecture
+
+`test/fuzz/runtime/run.sh` launches `FUZZ_WORKERS` instances of `afl-fuzz` that share queues through `tmp/fuzz/afl`:
+
+1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN worker with CmpLog enabled, seeded with the full minimized fixture corpus.
+2. **`grammar`** (`build/fuzz.native` + `build/libgrammarmutator-ruby.so`): Structure-aware grammar mutator using `test/fuzz/grammar/ruby.json`. Runs with `AFL_NO_SYNC=1` so sync is one-way (`grammar` feeds `main`, without pulling raw byte-mutated inputs that lack grammar trees).
+3. **`msan`** (`build/fuzz.msan`): Runs the full `-DSLOW` pipeline under MemorySanitizer to catch uninitialized memory reads and out-of-bounds reads across parsing, serialization, pretty-printing, and JSON dumping.
+4. **`ldet`** (`build/fuzz.ldet`): Fast native worker with custom leak detection and IJON state-guided instrumentation enabled.
+5. **`main-2 .. main-N`** (`build/fuzz.native` + `-w ./build/fuzz.sand`): Secondary workers running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase`). They execute mutations at native speed without sanitizer overhead, and only forward inputs that discover new coverage to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`). Secondary workers cycle through different AFL++ power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), mutation modes (MOpt `-L 0`, `-P explore/exploit`, `-Z`), and disjoint shards of the initial seed corpus.
+
+### Fast Leak Detection (`PRISM_XALLOCATOR`)
+
+Enabling LeakSanitizer (LSAN) or ASAN per-allocation redzones on every fuzzing execution significantly reduces throughput on inputs that allocate deep ASTs.
+
+For `build/fuzz.native` and `build/fuzz.ldet`, we compile without sanitizers and enable Prism's custom allocator hook (`-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`). `test/fuzz/harness/include/prism_xallocator.h` routes `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` to wrappers in `test/fuzz/harness/fuzz.c` that prepend an 8-byte size header to each allocation and maintain a running `allocated` byte counter. At the end of `LLVMFuzzerTestOneInput`, `assert(allocated == 0)` immediately aborts if any memory was leaked during the parse, with near-zero runtime overhead. Wrappers also enforce a per-input cumulative allocation cap (`FUZZ_MAX_ALLOCATED_BYTES`, 128 MiB) to catch exponential memory-blowup bugs early.
+
+When `make fuzz-triage` processes a leak crash from `fuzz.ldet` or `fuzz.native`, it re-runs the input against `build/fuzz.lsan` so the generated `testcase.c` includes a full LeakSanitizer allocation backtrace.
+
+### Sanitizer-Free Coverage Instrumentation (`test/fuzz/patches/aflplusplus.patch`)
+
+When Clang compiles code with ASAN, UBSAN, or MSAN before LTO linking, it injects thousands of conditional branches for shadow-memory checks, overflow traps, stack-use-after-return prologues, MSAN shadow `select`s, and `assert()` macros. Out of the box, AFL++ instruments all of those compiler-generated branches, inflating the coverage map by 40–130% and breaking dominator-based block pruning.
+
+During `make fuzz-build`, `test/fuzz/Makefile` applies [`test/fuzz/patches/aflplusplus.patch`](../test/fuzz/patches/aflplusplus.patch) to AFL++'s LTO and PCGUARD passes so sanitizer checks and `assert()` traps are invisible to coverage instrumentation. As a result, `fuzz`, `fuzz.msan`, `fuzz.lsan`, and `fuzz.native` share nearly identical coverage maps focused purely on Prism's control flow.
+
+See [`test/fuzz/patches/aflplusplus.md`](../test/fuzz/patches/aflplusplus.md) for a detailed walkthrough of the patch and `make fuzz-test` verification suite.
+
+### Grammar-Mutator (`test/fuzz/grammar/ruby.json` and `test/fuzz/patches/grammar-mutator.patch`)
+
+Byte-level mutations struggle to discover bugs that require syntactically rich Ruby constructs (such as nested heredocs, pattern matching, or endless method definitions inside blocks). The `grammar` worker uses AFL++'s [Grammar-Mutator](https://github.com/AFLplusplus/Grammar-Mutator) with a custom Ruby grammar (`test/fuzz/grammar/ruby.json`) that generates both the 4-byte option header and valid/near-valid Ruby AST structures.
+
+We apply [`test/fuzz/patches/grammar-mutator.patch`](../test/fuzz/patches/grammar-mutator.patch) to fix multi-byte UTF-8 token generation, keep serialized `.tree` files in `tmpfs` (`/tmp/afl-tmpdir/grammar/trees`) instead of slow bind-mounted host storage, skip expensive runtime ANTLR4 reverse-parsing, and preserve trimmed parse trees when `trim_case_custom` discovers new coverage.
+
+See [`test/fuzz/patches/grammar-mutator.md`](../test/fuzz/patches/grammar-mutator.md) for full details.
+
+### CmpLog and `pm_strncasecmp`
+
+The `main` worker runs with a companion CmpLog binary (`build/fuzz.cmplog`, built with `AFL_LLVM_CMPLOG=1`) that logs operands of comparisons so AFL++'s redqueen mutator can solve multi-byte magic strings without guessing byte-by-byte.
+
+Prism normally uses its own `pm_strncasecmp` implementation (`src/strncasecmp.c`) for case-insensitive magic comments and encoding names. When compiling `build/fuzz.cmplog`, we pass `-Dpm_strncasecmp=strncasecmp` and exclude `src/strncasecmp.c` so calls go through libc `strncasecmp`, which AFL++'s CmpLog runtime hooks intercept automatically.
+
+### IJON State-Guided Fuzzing (`PRISM_FUZZ_IJON`)
+
+Many parser and lexer bugs in Prism depend on combinations of state stacks and bitflags (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack`, `accepts_block_stack`, and `current_scope->parameters`) that pass through shared helper functions and therefore produce no new CFG edges on their own.
+
+`build/fuzz.ldet` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s 64 KB IJON bitmap region for:
+
+1. Lexer mode stack transitions (top 4 modes in `parser->lex_modes`, including balanced delimiter nesting and heredoc quote/indent flags).
+2. Parser context stack transitions (current and parent `pm_context_t` plus the enclosing `current_context->mask`).
+3. Parser mode flags (`command_start`, `in_keyword_arg`, `in_endless_def_body`, `pattern_matching_newlines`, nesting counters, `do_loop_stack.top`, and `accepts_block_stack.top`) combined with `lex_state`.
+4. Scope parameter, `closed`, and `shareable_constant` flags across the current and parent `pm_scope_t`.
+5. Syntax error recovery transitions (`error_list.size`, `recovering`) and non-trivial `PM_TOKEN_EOF` states.
+
+When `ldet` reaches a novel state combination and saves the input to `ldet/queue/`, `main` and `msan` automatically test that input under ASAN/UBSAN/MSAN during queue sync.
+
+### Compile-Time Prism Tunings for Fuzzing
+
+`test/fuzz/Makefile` sets several preprocessor flags when building the fuzz binaries:
+
+- **Per-allocation arena redzones (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, `src/arena.c` bump-allocates AST nodes and strings out of 8 KB blocks, which hides intra-block buffer overflows from AddressSanitizer and MemorySanitizer. Sanitizer builds (`fuzz`, `fuzz.sand`, `fuzz.msan`, `fuzz.lsan`) set `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` returns the exact requested size and every `pm_arena_alloc` call gets its own `xmalloc` heap block surrounded by ASAN/MSAN redzones. Non-sanitized builds (`fuzz.native`, `fuzz.ldet`, `fuzz.cmplog`, `fuzz.coverage`) keep the default 8 KB blocks so the normal arena growth and bump-allocation paths are also tested at full speed.
+- **Reachable bignum divide-and-conquer (`-DPM_INTEGER_DIVIDE_THRESHOLD=8`)**: By default, `src/integer.c` only switches from schoolbook decimal parsing to divide-and-conquer parsing (and Karatsuba multiplication in `src/bignum.c`) above 224 chunks (2,017 digits), which cannot be reached within `FUZZ_MAX_INPUT_SIZE` (1,024 bytes). Lowering the threshold to 8 chunks (72 digits) exercises both schoolbook (20–72 digits) and divide-and-conquer / Karatsuba (73–1,020 digits) within the 1 KB input limit.
+- **Reachable recursion depth limit (`-DPRISM_DEPTH_MAXIMUM=128`)**: Lowering `PRISM_DEPTH_MAXIMUM` from `10000` to `128` makes `PM_ERR_NESTING_TOO_DEEP` error-recovery paths in `parse_expression` and `parse_pattern` reachable within 1 KB inputs and prevents deeply nested expressions from causing quadratic indentation buffer growth in `pm_prettyprint`.
+- **Write-only ASAN (`-mllvm -asan-instrument-reads=0`)**: `build/fuzz` and `build/fuzz.sand` disable ASAN read instrumentation so they only trap on illegal writes, UBSAN errors, and assertion failures, leaving out-of-bounds and uninitialized reads to `build/fuzz.msan`.
