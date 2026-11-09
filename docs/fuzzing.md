@@ -29,11 +29,11 @@ test/fuzz
     ├── halfempty.sh          script to use Google Project Zero's halfempty minimizer
     ├── halfempty_compare.sh  identifies similar backtraces
     ├── kill.sh               manages graceful shutdown of tmux
-     ├── plot.rb               generates interactive HTML graphs from AFL++ telemetry
-     ├── signature.sh          generates a crash signature hash
-     ├── status.rb             live terminal dashboard for the fuzzer fleet
-     ├── test_afl_patch.sh     verifies sanitizer-free AFL++ coverage guidance
-     └── triage.rb             automagic triage of crashes
+    ├── plot.rb               generates interactive HTML graphs from AFL++ telemetry
+    ├── signature.sh          generates a crash signature hash
+    ├── status.rb             live terminal dashboard for the fuzzer fleet
+    ├── test_afl_patch.sh     verifies sanitizer-free AFL++ coverage guidance
+    └── triage.rb             automagic triage of crashes
 ```
 
 ## Requirements
