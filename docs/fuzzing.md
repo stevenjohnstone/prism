@@ -30,7 +30,7 @@ test/fuzz
 │   ├── grammar-mutator.patch     patch for AFL++ Grammar-Mutator
 │   └── test_afl_patch.sh         verifies sanitizer-free AFL++ coverage guidance
 ├── report
-│   ├── coverage.sh               generates HTML source coverage report
+│   ├── coverage.sh               generates LCOV, HTML, and text source coverage reports
 │   └── plot.rb                   generates interactive HTML graphs from AFL++ telemetry
 ├── runtime
 │   ├── corpus.rb                 prepares and minimizes the initial seed corpus
@@ -161,11 +161,18 @@ Inside the `tmux` session:
   make fuzz-plot
   open tmp/fuzz/plots/index.html
   ```
-- **Source-level HTML coverage report** (computed across all reachable functions using the current queue in `tmp/fuzz/afl`):
+- **Source-level coverage** (computed across all reachable library functions over the deduplicated corpus in `tmp/fuzz/afl`):
   ```bash
   make fuzz-coverage
-  open tmp/fuzz/coverage/report/index.html
   ```
+  `make fuzz-coverage` prints a per-file coverage table to the terminal and writes four artifacts to `tmp/fuzz/coverage/`:
+  - `tmp/fuzz/coverage/lcov.info` — workspace-relative LCOV line, function, and branch coverage for IDE integration:
+    - **VS Code / Cursor / Antigravity**: Install [Coverage Gutters](https://marketplace.visualstudio.com/items?itemName=ryanluker.vscode-coverage-gutters) and run *Coverage Gutters: Display Coverage* (or *Watch*) to highlight covered/uncovered lines and branches inline in the editor.
+    - **CLion**: Use *Run -> Show Coverage Data...* (`Cmd+Option+F6` / `Ctrl+Alt+F6`) and select `tmp/fuzz/coverage/lcov.info`.
+    - **Neovim**: Point [`nvim-coverage`](https://github.com/andythigpen/nvim-coverage) (`lcov_file`) at `tmp/fuzz/coverage/lcov.info`.
+  - `tmp/fuzz/coverage/report/index.html` — standalone HTML report with line and branch counts (`open tmp/fuzz/coverage/report/index.html`).
+  - `tmp/fuzz/coverage/coverage.profdata` — merged LLVM profile data for custom `llvm-cov` queries.
+  - `tmp/fuzz/coverage/summary.txt` — saved copy of the terminal summary table.
 
 ### Cleaning Up
 
