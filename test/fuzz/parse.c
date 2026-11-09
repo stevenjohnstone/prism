@@ -188,6 +188,18 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
     pm_parser_lex_callback_set(parser, fuzz_ijon_lex_callback, &ijon_state);
 #endif
     pm_node_t *node = pm_parse(parser);
+    // Line offsets must start at 0, be strictly monotonically increasing, and not exceed size
+    // We check the last element in list to make sure it doesn't exceed the input buffer size
+    const size_t offset_count = parser->line_offsets.size;
+    if (offset_count == 0 || parser->line_offsets.offsets[0] != 0 || parser->line_offsets.offsets[offset_count - 1] > size) {
+        abort();
+    }
+    for (size_t i = 1; i < offset_count; i++) {
+        if (parser->line_offsets.offsets[i] <= parser->line_offsets.offsets[i - 1]) {
+            abort();
+        }
+    }
+
 
     pm_visit_node(node, check_node_location, &size);
 
