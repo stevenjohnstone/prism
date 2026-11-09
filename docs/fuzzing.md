@@ -43,9 +43,8 @@ test/fuzz
 
 ## Usage
 
-There is currently one fuzzing target:
-* `pm_parse_success_p`
-
+Currently, fuzzing targets pm_parse. After that completes, the AST is serialized with pm_serialize, pretty printed and rendered as json. Various
+invariants are enforced. 
 * **To run the parse fuzzer:**
     In the root directory of this repository run
     ```bash
