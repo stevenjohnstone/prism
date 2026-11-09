@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verifies test/fuzz/aflplusplus.patch by:
+# Verifies test/fuzz/patches/aflplusplus.patch by:
 # 1. Compiling a multi-stage nested-if target under none, ubsan, asan+ubsan, and
 #    msan with both unpatched and patched AFL++ LTO instrumentation.
 # 2. Asserting that sanitizer edge inflation is stripped so patched edge counts

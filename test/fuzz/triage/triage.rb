@@ -167,7 +167,7 @@ def c_program_heisenbug(input, harness_code, crash_details = "Heisenbug - input 
 end
 
 def testcase_output_signature(testcase_output, siglines = 10)
-  o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, "./test/fuzz/tools/signature.sh", stdin_data: testcase_output)
+  o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, "./test/fuzz/triage/signature.sh", stdin_data: testcase_output)
   o.strip
 end
 
@@ -208,7 +208,7 @@ def minimize(crash, reason, minimized_input, executable, sig_lines)
       tmpfile = File.join(tmpdir, "halfempty")
       Open3.capture2e(
         SANITIZER_ENV.merge({ "SIGLINES" => sig_lines.to_s }),
-        "./test/fuzz/tools/halfempty.sh", executable, crash, tmpfile
+        "./test/fuzz/triage/halfempty.sh", executable, crash, tmpfile
       )
       tmin_input = File.exist?(tmpfile) ? tmpfile : crash
       # afl-tmin runs the target via the AFL++ forkserver, which exits via

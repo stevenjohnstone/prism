@@ -4,36 +4,44 @@ We use fuzzing to test the various entrypoints to the library. The fuzzer we use
 
 ```
 test/fuzz
-├── Makefile                  make targets for building, running, triaging, and coverage
-├── aflplusplus.patch         patch for AFL++ LTO/PCGUARD passes to skip sanitizer checks
+├── Makefile                      make targets for building, running, triaging, and coverage
 ├── corpus
-│   └── parse                 fuzzing corpus for parsing (a symlink to our fixtures)
-├── coverage.c                driver for coverage collection
-├── dict                      an AFL++ dictionary containing various tokens
+│   └── parse                     fuzzing corpus for parsing (a symlink to our fixtures)
+├── debug
+│   ├── backtrace.sh              generates gdb backtraces for a crash directory
+│   ├── build.asan.sh             builds a test case with ASAN/UBSAN enabled
+│   ├── build.memory.sh           builds a test case with MSAN enabled
+│   ├── build.sh                  builds a test case without sanitizers
+│   └── minimize.sh               minimizes crash/hang inputs in a directory via afl-tmin
+├── dict                          an AFL++ dictionary containing various tokens
 ├── docker
-│   └── Dockerfile            for building a container with the fuzzer toolchain
-├── fuzz.c                    generic entrypoint for fuzzing
+│   └── Dockerfile                for building a container with the fuzzer toolchain
 ├── grammar
-│   ├── grammar-mutator.patch patch for AFL++ Grammar-Mutator
-│   └── ruby.json             Ruby grammar for AFL++ Grammar-Mutator
-├── include
-│   └── prism_xallocator.h    custom allocator header for fast leak detection
-├── parse.c                   fuzz harness for parsing, serialization, and formatting
-├── run.sh                    script to launch the parallel fuzzing session in tmux
-└── tools
-    ├── build.sh              builds a test case
-    ├── build.asan.sh         builds a test case with ASAN/UBSAN enabled
-    ├── build.memory.sh       builds a test case with MSAN enabled
-    ├── corpus.rb             script to prepare and minimize a fuzzing corpus
-    ├── coverage.sh           generate coverage report in html
-    ├── halfempty.sh          script to use Google Project Zero's halfempty minimizer
-    ├── halfempty_compare.sh  identifies similar backtraces
-    ├── kill.sh               manages graceful shutdown of tmux
-    ├── plot.rb               generates interactive HTML graphs from AFL++ telemetry
-    ├── signature.sh          generates a crash signature hash
-    ├── status.rb             live terminal dashboard for the fuzzer fleet
-    ├── test_afl_patch.sh     verifies sanitizer-free AFL++ coverage guidance
-    └── triage.rb             automagic triage of crashes
+│   └── ruby.json                 Ruby grammar for AFL++ Grammar-Mutator
+├── harness
+│   ├── coverage.c                driver for coverage collection
+│   ├── fuzz.c                    generic entrypoint for fuzzing
+│   ├── heisenbug.c               standalone harness template for non-deterministic crashes
+│   ├── include
+│   │   └── prism_xallocator.h    custom allocator header for fast leak detection
+│   └── parse.c                   fuzz harness for parsing, serialization, and formatting
+├── patches
+│   ├── aflplusplus.patch         patch for AFL++ LTO/PCGUARD passes to skip sanitizer checks
+│   ├── grammar-mutator.patch     patch for AFL++ Grammar-Mutator
+│   └── test_afl_patch.sh         verifies sanitizer-free AFL++ coverage guidance
+├── report
+│   ├── coverage.sh               generate coverage report in html
+│   └── plot.rb                   generates interactive HTML graphs from AFL++ telemetry
+├── runtime
+│   ├── corpus.rb                 script to prepare and minimize a fuzzing corpus
+│   ├── kill.sh                   manages graceful shutdown of tmux
+│   ├── run.sh                    script to launch the parallel fuzzing session in tmux
+│   └── status.rb                 live terminal dashboard for the fuzzer fleet
+└── triage
+    ├── halfempty.sh              script to use Google Project Zero's halfempty minimizer
+    ├── halfempty_compare.sh      identifies similar backtraces
+    ├── signature.sh              generates a crash signature hash
+    └── triage.rb                 automagic triage of crashes
 ```
 
 ## Requirements
@@ -77,9 +85,9 @@ This command will start a docker container running `FUZZ_WORKERS` fuzzers (defau
 >
 > **CmpLog and `pm_strncasecmp`**: The `main` fuzzer runs alongside a CmpLog binary (`build/fuzz.cmplog`) built with `AFL_LLVM_CMPLOG=1`. When building `build/fuzz.cmplog`, `pm_strncasecmp` is replaced with the standard `strncasecmp` function (`-Dpm_strncasecmp=strncasecmp`, excluding `src/strncasecmp.c`) so AFL++'s CmpLog runtime hooks can instrument case-insensitive string comparisons and solve multi-byte comparisons (such as encoding names and magic comments) for better coverage.
 >
-> **Fast Leak Detection and AFL++ SAND (`build/fuzz.native`, `build/fuzz.ldet`, and `build/fuzz.sand`)**: Running LeakSanitizer (LSAN) or ASAN with `-DPM_ARENA_INITIAL_SIZE=0` on every fuzzing iteration slows down fuzzing on larger ASTs. Instead, `build/fuzz.native` and `build/fuzz.ldet` are compiled without sanitizers and with `-DPRISM_XALLOCATOR -Itest/fuzz/include`, which hooks `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` (via `test/fuzz/include/prism_xallocator.h`) to lightweight wrappers in `test/fuzz/fuzz.c`. Each allocation prepends its size in a `size_t` header and updates a running byte counter (`allocated`), and `LLVMFuzzerTestOneInput` asserts `allocated == 0` at the end of every input to catch memory leaks without ASAN/LSAN overhead. The secondary workers (`main-2..N`) combine `build/fuzz.native` with AFL++'s SAND (`AFL_SAN_ABSTRACTION=coverage_increase -w ./build/fuzz.sand`, built with `AFL_LLVM_ONLY_FSRV=1` + ASAN + UBSAN + `-DPM_ARENA_INITIAL_SIZE=0`) so mutations execute at native speed while any input that increases coverage is also checked under ASAN/UBSAN. During `make fuzz-triage`, crashes are tested against `build/fuzz` (for assertions/memory errors) and `build/fuzz.lsan` (to produce detailed leak backtraces).
+> **Fast Leak Detection and AFL++ SAND (`build/fuzz.native`, `build/fuzz.ldet`, and `build/fuzz.sand`)**: Running LeakSanitizer (LSAN) or ASAN with `-DPM_ARENA_INITIAL_SIZE=0` on every fuzzing iteration slows down fuzzing on larger ASTs. Instead, `build/fuzz.native` and `build/fuzz.ldet` are compiled without sanitizers and with `-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`, which hooks `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` (via `test/fuzz/harness/include/prism_xallocator.h`) to lightweight wrappers in `test/fuzz/harness/fuzz.c`. Each allocation prepends its size in a `size_t` header and updates a running byte counter (`allocated`), and `LLVMFuzzerTestOneInput` asserts `allocated == 0` at the end of every input to catch memory leaks without ASAN/LSAN overhead. The secondary workers (`main-2..N`) combine `build/fuzz.native` with AFL++'s SAND (`AFL_SAN_ABSTRACTION=coverage_increase -w ./build/fuzz.sand`, built with `AFL_LLVM_ONLY_FSRV=1` + ASAN + UBSAN + `-DPM_ARENA_INITIAL_SIZE=0`) so mutations execute at native speed while any input that increases coverage is also checked under ASAN/UBSAN. During `make fuzz-triage`, crashes are tested against `build/fuzz` (for assertions/memory errors) and `build/fuzz.lsan` (to produce detailed leak backtraces).
 >
-> **IJON State-Guided Fuzzing (`AFL_LLVM_IJON=1` and `PRISM_FUZZ_IJON` on `ldet`)**: Many parser and lexer bugs depend on data-driven state stacks and bitmasks (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack.top`, `accepts_block_stack.top`, and `current_scope->parameters`) that funnel through shared helper functions and therefore look identical to standard CFG edge coverage. `build/fuzz.ldet` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`, which registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` in `test/fuzz/parse.c` without modifying `src/`. On each token boundary where a tracked state changes, `FUZZ_IJON_SET` records a full-width 32-bit transition hash into AFL++'s dedicated 64 KB IJON bitmap region (above the collision-free LTO edge map) for:
+> **IJON State-Guided Fuzzing (`AFL_LLVM_IJON=1` and `PRISM_FUZZ_IJON` on `ldet`)**: Many parser and lexer bugs depend on data-driven state stacks and bitmasks (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack.top`, `accepts_block_stack.top`, and `current_scope->parameters`) that funnel through shared helper functions and therefore look identical to standard CFG edge coverage. `build/fuzz.ldet` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`, which registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` in `test/fuzz/harness/parse.c` without modifying `src/`. On each token boundary where a tracked state changes, `FUZZ_IJON_SET` records a full-width 32-bit transition hash into AFL++'s dedicated 64 KB IJON bitmap region (above the collision-free LTO edge map) for:
 > 1. Lexer mode stack transitions (top 4 stacked modes in `parser->lex_modes`, including balanced delimiter nesting and heredoc indent/quote flags)
 > 2. Parser context stack transitions (current and parent `pm_context_t` plus the full enclosing `parser->current_context->mask` in `parser->current_context`)
 > 3. Non-CFG parser mode flags (`command_start`, `in_keyword_arg`, `in_endless_def_body`, `pattern_matching_newlines`, `enclosure_nesting`, `brace_nesting`, `lambda_enclosure_nesting`) and the top bits of `do_loop_stack.top` and `accepts_block_stack.top`, combined with `parser->lex_state` and `cur_ctx` when mode flags change
@@ -88,7 +96,7 @@ This command will start a docker container running `FUZZ_WORKERS` fuzzers (defau
 >
 > IJON is active only on the fast `ldet` worker (`grammar` and `afl-tmin` set `AFL_NO_IJON=1`, and `fuzz` / `fuzz.msan` are built without IJON). When `ldet` discovers a novel IJON state and saves the input to `ldet/queue/`, `main`, `msan`, and `main-2..N` automatically execute that input under ASAN/UBSAN/MSAN during AFL++ queue sync, while only importing it into their own mutation queues if it also reaches new CFG coverage.
 >
-> **Grammar-Mutator (`test/fuzz/grammar/ruby.json` and `test/fuzz/grammar/grammar-mutator.patch`)**: The `grammar` worker uses AFL++'s [Grammar-Mutator](https://github.com/AFLplusplus/Grammar-Mutator) (pinned to commit `b108ec696ad60b2ad88babace7ebda138276bde3` in `test/fuzz/docker/Dockerfile`) compiled during `make fuzz-build` against our custom Prism Ruby grammar (`test/fuzz/grammar/ruby.json`), which includes the 4-byte fuzz option header (`<OPT0>..<OPT3>`) followed by Ruby syntax rules, producing `build/libgrammarmutator-ruby.so` and `build/grammar_generator-ruby`. At startup, `test/fuzz/run.sh` runs `./build/grammar_generator-ruby 500 500` to generate 500 initial Ruby seeds alongside their pre-serialized derivation `.tree` files in `/tmp/afl-tmpdir/grammar/{seeds,trees}`, and runs `grammar` with `AFL_NO_SYNC=1` so sync is one-way (`grammar -> main -> fleet`): `grammar` does not pull raw byte-mutated inputs from `main` (which have no `.tree` files and would otherwise pre-empt `grammar`'s `virgin_bits` and `top_rated[]` slots), while `main` still imports all coverage-increasing inputs from `$AFL_DIR/grammar/queue`. Before building, `test/fuzz/Makefile` applies `test/fuzz/grammar/grammar-mutator.patch` to `Grammar-Mutator` to:
+> **Grammar-Mutator (`test/fuzz/grammar/ruby.json` and `test/fuzz/patches/grammar-mutator.patch`)**: The `grammar` worker uses AFL++'s [Grammar-Mutator](https://github.com/AFLplusplus/Grammar-Mutator) (pinned to commit `b108ec696ad60b2ad88babace7ebda138276bde3` in `test/fuzz/docker/Dockerfile`) compiled during `make fuzz-build` against our custom Prism Ruby grammar (`test/fuzz/grammar/ruby.json`), which includes the 4-byte fuzz option header (`<OPT0>..<OPT3>`) followed by Ruby syntax rules, producing `build/libgrammarmutator-ruby.so` and `build/grammar_generator-ruby`. At startup, `test/fuzz/runtime/run.sh` runs `./build/grammar_generator-ruby 500 500` to generate 500 initial Ruby seeds alongside their pre-serialized derivation `.tree` files in `/tmp/afl-tmpdir/grammar/{seeds,trees}`, and runs `grammar` with `AFL_NO_SYNC=1` so sync is one-way (`grammar -> main -> fleet`): `grammar` does not pull raw byte-mutated inputs from `main` (which have no `.tree` files and would otherwise pre-empt `grammar`'s `virgin_bits` and `top_rated[]` slots), while `main` still imports all coverage-increasing inputs from `$AFL_DIR/grammar/queue`. Before building, `test/fuzz/Makefile` applies `test/fuzz/patches/grammar-mutator.patch` to `Grammar-Mutator` to:
 > - **Store serialized `.tree` files in `tmpfs` (`/tmp/afl-tmpdir/grammar/trees`) and persist to `$AFL_DIR/.grammar-trees` on exit**: Serialized `.tree` files are read from and written directly to `/tmp/afl-tmpdir/grammar/trees` on `tmpfs` during fuzzing for fast RAM I/O without pre-creating `$AFL_DIR/grammar`, and persisted to `$AFL_DIR/.grammar-trees` when `run.sh` exits so `AFL_AUTORESUME=1` can restore them across container runs.
 > - **Disable runtime ANTLR4 reverse-parsing (`load_tree_from_test_case`) and preserve `trimmed_tree` across `afl_custom_post_trim(data, 0)`**: Because `grammar` starts from `grammar_generator-ruby` seeds that already have `.tree` files and every grammar mutation/trim already has its `tree_t` in memory (`data->mutated_tree` / `data->trimmed_tree`), runtime ANTLR4 reverse-parsing of raw byte files (`load_tree_from_test_case`) is skipped. In addition, `data->trimmed_tree` is kept alive across `afl_custom_post_trim(data, 0)` so that when a trim step discovers a new coverage edge and `trim_case_custom` subsequently calls `save_if_interesting() -> afl_custom_queue_new_entry()`, the trimmed `tree_t` is saved to `/tmp/afl-tmpdir/grammar/trees` and added to `chunk_store`.
 > - **Track grammar file changes and set `$ORIGIN` `RPATH`**: Ensures `GNUmakefile` rebuilds generated code when `test/fuzz/grammar/ruby.json` changes and links `grammar_generator-ruby` with `-Wl,-rpath,'$ORIGIN'` so `./build/grammar_generator-ruby` locates `./build/libgrammarmutator-ruby.so` across container runs.
@@ -101,12 +109,12 @@ This command will start a docker container running `FUZZ_WORKERS` fuzzers (defau
 >
 > **Write-Only ASAN (`-asan-instrument-reads=0`)**: `build/fuzz` (used by the `main` and `main-2..N` fuzzers) is compiled with `-mllvm -asan-instrument-reads=0 -Wl,-mllvm,-asan-instrument-reads=0` so AddressSanitizer only instruments stores (illegal writes) and does not abort on out-of-bounds reads, leaving read issues to the `msan` fuzzer (`build/fuzz.msan`).
 >
-> **Sanitizer-Free Coverage Instrumentation (`test/fuzz/aflplusplus.patch`)**: In LTO mode (`afl-clang-lto`), Clang runs AddressSanitizer, MemorySanitizer, and UBSAN during `-c` pre-link compilation before `SanitizerCoverageLTO.so` runs in `ld.lld`. Unpatched AFL++ instruments every sanitizer check branch, trap block, ASAN stack-use-after-return prologue/epilogue, and MSAN shadow `select`/`icmp`, inflating the coverage map of `build/fuzz` and `build/fuzz.msan` by 40–130%. During `make fuzz-build`, `test/fuzz/Makefile` applies `test/fuzz/aflplusplus.patch` and builds patched `SanitizerCoverageLTO.so` and `SanitizerCoveragePCGUARD.so` plugins into `build/afl/` (passed via `AFL_PATH`), stripping sanitizer-synthesized CFG edges and branchless shadow selects so all fuzzers (`fuzz`, `fuzz.ldet`, `fuzz.lsan`, and `fuzz.msan`) share near-identical coverage maps focused solely on Prism's control flow. In addition, `build/fuzz.msan` omits `-fsanitize-memory-track-origins=2` for higher fuzzing throughput and cleaner CFG structure, while `test/fuzz/tools/build.memory.sh` retains `-fsanitize-memory-track-origins=2` to report full uninitialized-memory origin chains when reproducing crashes.
+> **Sanitizer-Free Coverage Instrumentation (`test/fuzz/patches/aflplusplus.patch`)**: In LTO mode (`afl-clang-lto`), Clang runs AddressSanitizer, MemorySanitizer, and UBSAN during `-c` pre-link compilation before `SanitizerCoverageLTO.so` runs in `ld.lld`. Unpatched AFL++ instruments every sanitizer check branch, trap block, ASAN stack-use-after-return prologue/epilogue, and MSAN shadow `select`/`icmp`, inflating the coverage map of `build/fuzz` and `build/fuzz.msan` by 40–130%. During `make fuzz-build`, `test/fuzz/Makefile` applies `test/fuzz/patches/aflplusplus.patch` and builds patched `SanitizerCoverageLTO.so` and `SanitizerCoveragePCGUARD.so` plugins into `build/afl/` (passed via `AFL_PATH`), stripping sanitizer-synthesized CFG edges and branchless shadow selects so all fuzzers (`fuzz`, `fuzz.ldet`, `fuzz.lsan`, and `fuzz.msan`) share near-identical coverage maps focused solely on Prism's control flow. In addition, `build/fuzz.msan` omits `-fsanitize-memory-track-origins=2` for higher fuzzing throughput and cleaner CFG structure, while `test/fuzz/debug/build.memory.sh` retains `-fsanitize-memory-track-origins=2` to report full uninitialized-memory origin chains when reproducing crashes.
 
 ### Fleet Dashboard
 
 The terminal opens in a `tmux` session inside the container:
-- **Window 0 (`dashboard`)** runs `test/fuzz/tools/status.rb`, displaying a live two-page fleet dashboard.
+- **Window 0 (`dashboard`)** runs `test/fuzz/runtime/status.rb`, displaying a live two-page fleet dashboard.
 - **Windows 1..N** each run an individual `afl-fuzz` instance with its full native [AFL++ status screen](https://aflplus.plus/docs/status_screen/). Press `Ctrl+B, w` to pick any fuzzer window from an interactive list, `Ctrl+B, n`/`p` for next/previous window, or `Ctrl+B, 0` to return to the dashboard.
 
 Inside the dashboard (`Window 0`), press **`Tab`**, **`Space`**, **`1`**, **`2`**, or the left/right arrow keys (`h`/`l`) to switch between the two pages:
@@ -205,7 +213,7 @@ To demonstrate a crash, you can build and run a specific test case:
 
 ```bash
 # Build the test case with ASAN enabled
-./test/fuzz/tools/build.asan.sh ./tmp/fuzz/triage/ABRT/d0a90c13bfbe209b/testcase.c
+./test/fuzz/debug/build.asan.sh ./tmp/fuzz/triage/ABRT/d0a90c13bfbe209b/testcase.c
 
 # Run the test case
 ./testcase
