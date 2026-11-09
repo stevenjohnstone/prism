@@ -5,8 +5,6 @@ We use fuzzing to test the various entrypoints to the library. The fuzzer we use
 ```
 test/fuzz
 ├── Makefile                      make targets for building, running, triaging, and coverage
-├── corpus
-│   └── parse                     fuzzing corpus for parsing (a symlink to our fixtures)
 ├── debug
 │   ├── backtrace.sh              generates gdb backtraces for a crash directory
 │   ├── build.asan.sh             builds a test case with ASAN/UBSAN enabled
