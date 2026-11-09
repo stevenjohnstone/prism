@@ -45,9 +45,36 @@ mkdir -p "$AFL_DIR"
 # Trap SIGINT (Ctrl+C) and SIGTERM (docker stop)
 trap cleanup TERM INT EXIT
 
-SCHEDULES=("explore" "coe" "fast")
+SCHEDULES=("explore" "fast" "coe" "lin" "quad" "exploit" "rare" "mmopt")
+INPUT_FORMATS=("" "-a text" "-a binary")
+MUTATION_STRATEGIES=("-P explore" "" "-P exploit" "-P explore" "")
 WORKER_NAMES=()
 WORKER_CMDS=()
+
+shopt -s nullglob
+CORPUS_FILES=("$CORPUS_DIR"/*)
+shopt -u nullglob
+NUM_SHARDS=$(( FUZZ_WORKERS > 2 ? FUZZ_WORKERS - 2 : 1 ))
+
+prepare_seed_shard() {
+    local name=$1
+    local shard_idx=$2
+    local shard_dir="/tmp/afl-tmpdir/$name/seeds"
+    rm -rf "$shard_dir"
+    mkdir -p "$shard_dir"
+
+    local total=${#CORPUS_FILES[@]}
+    local files=()
+    for (( idx = shard_idx; idx < total; idx += NUM_SHARDS )); do
+        files+=("${CORPUS_FILES[$idx]}")
+    done
+    if [ "${#files[@]}" -eq 0 ] && [ "$total" -gt 0 ]; then
+        files+=("${CORPUS_FILES[$(( shard_idx % total ))]}")
+    fi
+    if [ "${#files[@]}" -gt 0 ]; then
+        cp "${files[@]}" "$shard_dir/"
+    fi
+}
 
 add_worker() {
     local name=$1
@@ -74,15 +101,31 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             add_worker "grammar" "ulimit -v 4194304 && AFL_NO_SYNC=1 AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.native"
             ;;
         2)
-            add_worker "msan" "AFL_DISABLE_TRIM=1 AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
+            prepare_seed_shard "msan" 0
+            add_worker "msan" "AFL_DISABLE_TRIM=1 AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
             ;;
         3)
-            add_worker "ldet" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S ldet -p explore -- ./build/fuzz.ldet"
+            prepare_seed_shard "ldet" 1
+            add_worker "ldet" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ldet/seeds -o $AFL_DIR -S ldet -p explore -- ./build/fuzz.ldet"
             ;;
         *)
-            sched=${SCHEDULES[$(( (i - 4) % ${#SCHEDULES[@]} ))]}
+            idx=$(( i - 4 ))
             name="main-$(( i - 2 ))"
-            add_worker "$name" "AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i $CORPUS_DIR -o $AFL_DIR -S $name -p $sched -w ./build/fuzz.sand -- ./build/fuzz.native"
+            prepare_seed_shard "$name" $(( i - 2 ))
+            sched=${SCHEDULES[$(( idx % ${#SCHEDULES[@]} ))]}
+            fmt=${INPUT_FORMATS[$(( idx % ${#INPUT_FORMATS[@]} ))]}
+            strat=${MUTATION_STRATEGIES[$(( idx % ${#MUTATION_STRATEGIES[@]} ))]}
+            extra_flags="$fmt $strat"
+            if [ "$idx" -eq 0 ]; then
+                extra_flags="$extra_flags -L 0"
+            elif [ "$idx" -eq 1 ]; then
+                extra_flags="$extra_flags -Z"
+            fi
+            extra_env=""
+            if [ $(( idx % 2 )) -eq 0 ]; then
+                extra_env="AFL_DISABLE_TRIM=1 "
+            fi
+            add_worker "$name" "${extra_env}AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name -p $sched $extra_flags -w ./build/fuzz.sand -- ./build/fuzz.native"
             ;;
     esac
 done
