@@ -5,7 +5,7 @@ require "fileutils"
 require "tmpdir"
 
 OUTPUT_DIR = File.absolute_path(ARGV[0] || "./tmp/fuzz/corpus")
-CORPUS_DIR = "./test/fuzz/corpus/"
+CORPUS_DIR = "./test/prism/fixtures"
 # 4-byte options header consumed by harness() in test/fuzz/harness/parse.c:
 #   byte 0 (0x00): default opt_flags (encoding_locked=false, freeze=false, etc.)
 #   byte 1 (0x00): default cmd_flags=0, main_script=false
@@ -28,7 +28,7 @@ begin
   Dir.mktmpdir do |tmpdir|
     count = 0
 
-    Dir.glob("**{,/*/**}/*.txt") do |filename|
+    Dir.glob("**/*.txt") do |filename|
       next if File.directory?(filename)
 
       target_filename = File.join(tmpdir, "#{filename.gsub(/[^a-zA-Z0-9.-]/, "_")}.rb")
