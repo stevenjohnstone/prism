@@ -237,12 +237,13 @@ def process_crash(crash_dir, crash, executable, harness_code, semaphore)
   end
 
   reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
-  if executable.end_with?("ldet")
-    # fuzz.ldet is built without sanitizers, so it produces no stack trace on a
-    # leak or crash. Try ./build/fuzz (ASAN/UBSAN) first for assertions/crashes
-    # so they deduplicate with main; next try ./build/fuzz.lsan for memory
-    # leaks; finally fall back to ./build/fuzz.ldet for cumulative allocation
-    # limit assertions in PRISM_XALLOCATOR.
+  if executable.end_with?("ldet", "native")
+    # fuzz.ldet and fuzz.native are built without sanitizers (and SAND workers
+    # record fuzz.native in cmdline while running fuzz.sand under -w), so try
+    # ./build/fuzz (ASAN/UBSAN) first for sanitizer crashes and assertions so
+    # they deduplicate with main; next try ./build/fuzz.lsan for memory leaks;
+    # finally fall back to executable for cumulative allocation limit assertions
+    # in PRISM_XALLOCATOR.
     testcase_output, crashed = run_testcase("./build/fuzz", crash)
     if crashed
       executable = "./build/fuzz"
