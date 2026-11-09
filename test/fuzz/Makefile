@@ -164,9 +164,21 @@ fuzz-test: fuzz-docker-build
 	$(ECHO) "testing AFL++ instrumentation patch"
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh"
 
-define TTY_CONFIRM
+define FUZZ_CLEAN_CONFIRM
 @if [ -t 1 ]; then \
-	echo "$(1) (Y/n)"; \
+	echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"; \
+	echo "@         WARNING: DESTRUCTIVE OPERATION AHEAD!           @"; \
+	echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"; \
+	echo "This will permanently delete:"; \
+	echo "  - tmp/fuzz/afl      ($(FUZZ_FINDINGS) crash/hang findings)"; \
+	echo "  - tmp/fuzz/corpus"; \
+	echo "  - tmp/fuzz/coverage"; \
+	echo "  - tmp/fuzz/plots"; \
+	echo ""; \
+	echo "Preserved:"; \
+	echo "  - tmp/fuzz/triage"; \
+	echo ""; \
+	printf "Continue? (Y/n) "; \
 	read response; \
 	case "$$response" in \
 		[Y]*) \
@@ -181,8 +193,8 @@ endef
 
 fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 fuzz-clean:
-	$(call TTY_CONFIRM,This will destroy $(FUZZ_FINDINGS) fuzz findings in $(FUZZ_AFL_DIR) ($(FUZZ_TRIAGE_DIR) will be preserved). Continue?)
-	$(ECHO) "Removing fuzz data (preserving $(FUZZ_TRIAGE_DIR))"
+	$(FUZZ_CLEAN_CONFIRM)
+	$(ECHO) "Removing fuzz data (preserving tmp/fuzz/triage)"
 	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR)
 	$(ECHO) "done"
 
