@@ -44,19 +44,11 @@ static inline uint32_t fuzz_ijon_mix32(uint32_t h) {
     return h;
 }
 
-static inline uint32_t fuzz_ijon_combine(uint32_t a, uint32_t b) {
-    uint64_t x = (((uint64_t) a) << 32) | (uint64_t) b;
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    return (uint32_t) (x ^ (x >> 32));
-}
-
 #define FUZZ_IJON_SET(x) \
     do { \
         static uint32_t loc_hash = 0; \
         if (loc_hash == 0) loc_hash = ijon_hashstr(__LINE__, __FILE__); \
-        ijon_set(loc_hash, fuzz_ijon_mix32(loc_hash ^ (uint32_t) (x))); \
+        ijon_set(loc_hash, fuzz_ijon_mix32(loc_hash ^ (uint32_t) (x)) & 0x1ffu); \
     } while (0)
 
 typedef struct {
@@ -68,6 +60,7 @@ typedef struct {
 } fuzz_ijon_state_t;
 
 static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void *data) {
+    (void) token;
     fuzz_ijon_state_t *state = (fuzz_ijon_state_t *) data;
 
     // 1. Lexer mode stack signature (top 4 modes with delimiter-nesting / heredoc flags).
@@ -91,37 +84,31 @@ static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void 
         lex_mode_sig |= (hd_bits << 16);
     }
     if (lex_mode_sig != state->prev_lex_mode_sig) {
-        FUZZ_IJON_SET(fuzz_ijon_combine(state->prev_lex_mode_sig, lex_mode_sig));
+        FUZZ_IJON_SET(lex_mode_sig);
         state->prev_lex_mode_sig = lex_mode_sig;
     }
 
-    // 2. Parser context stack signature (current, parent, and full enclosing context mask).
+    // 2. Parser context stack signature (current and parent context).
     uint32_t cur_ctx = parser->current_context != NULL ? (uint32_t) parser->current_context->context : 0;
     uint32_t prev_ctx = (parser->current_context != NULL && parser->current_context->prev != NULL)
         ? (uint32_t) parser->current_context->prev->context
         : 0;
-    uint64_t ctx_mask = parser->current_context != NULL ? parser->current_context->mask : 0;
-    uint32_t mask_fold = fuzz_ijon_mix32((uint32_t) ctx_mask ^ (uint32_t) (ctx_mask >> 32)) & 0xfffffu;
-    uint32_t ctx_sig = (cur_ctx << 26) | (prev_ctx << 20) | mask_fold;
+    uint32_t ctx_sig = (cur_ctx << 6) | prev_ctx;
     if (ctx_sig != state->prev_ctx_sig) {
-        FUZZ_IJON_SET(fuzz_ijon_combine(state->prev_ctx_sig, ctx_sig));
+        FUZZ_IJON_SET(ctx_sig);
         state->prev_ctx_sig = ctx_sig;
     }
 
-    // 3. Non-CFG parser mode flags and boolean stacks combined with lex_state on transitions.
+    // 3. Non-CFG parser mode flags and boolean stacks.
     uint32_t mode_flags =
         (uint32_t) (parser->do_loop_stack.top & 0x7u) |
         ((uint32_t) (parser->accepts_block_stack.top & 0x7u) << 3) |
-        ((uint32_t) parser->command_start << 6) |
-        ((uint32_t) parser->in_keyword_arg << 7) |
-        ((uint32_t) parser->in_endless_def_body << 8) |
-        ((uint32_t) parser->pattern_matching_newlines << 9) |
-        ((uint32_t) (parser->enclosure_nesting > 0) << 10) |
-        ((uint32_t) (parser->brace_nesting > 0) << 11) |
-        ((uint32_t) (parser->lambda_enclosure_nesting >= 0) << 12);
+        ((uint32_t) parser->in_keyword_arg << 6) |
+        ((uint32_t) parser->in_endless_def_body << 7) |
+        ((uint32_t) parser->pattern_matching_newlines << 8) |
+        ((uint32_t) (parser->lambda_enclosure_nesting >= 0) << 9);
     if (mode_flags != state->prev_state_flags) {
-        uint32_t full_state = (mode_flags << 13) | ((uint32_t) parser->lex_state & 0x1fffu);
-        FUZZ_IJON_SET(fuzz_ijon_combine(full_state, cur_ctx));
+        FUZZ_IJON_SET(mode_flags);
         state->prev_state_flags = mode_flags;
     }
 
@@ -141,15 +128,12 @@ static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void 
         }
     }
 
-    // 5. Syntax error / recovery transitions and non-trivial EOF across context and lex mode stacks.
+    // 5. Syntax error and recovery across active context and top lex mode.
     size_t error_count = parser->error_list.size;
-    if (error_count != state->prev_error_count || parser->recovering ||
-        (token->type == PM_TOKEN_EOF && (cur_ctx != PM_CONTEXT_MAIN || lex_mode_sig != ((uint32_t) PM_LEX_DEFAULT + 1u)))) {
+    if (error_count != state->prev_error_count || parser->recovering) {
         state->prev_error_count = error_count;
-        uint32_t err_bucket = error_count < 4 ? (uint32_t) error_count : 4u;
-        uint32_t rec_key = fuzz_ijon_combine(ctx_sig, lex_mode_sig);
-        uint32_t rec_val = (err_bucket << 17) | ((uint32_t) parser->recovering << 16) | (uint32_t) token->type;
-        FUZZ_IJON_SET(fuzz_ijon_combine(rec_key, rec_val));
+        uint32_t rec_sig = ((uint32_t) parser->recovering << 10) | (cur_ctx << 4) | (lex_mode_sig & 0x0fu);
+        FUZZ_IJON_SET(rec_sig);
     }
 }
 #endif
