@@ -26,7 +26,7 @@ FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_M
 
 cleanup() {
     if tmux has-session -t "$SESSION" 2>/dev/null; then
-        bash ./test/fuzz/tools/kill.sh "$SESSION"
+        bash ./test/fuzz/runtime/kill.sh "$SESSION"
     fi
     if [ -d "/tmp/afl-tmpdir/grammar/trees" ] && [ -d "$AFL_DIR/grammar" ]; then
         rm -rf "$AFL_DIR/.grammar-trees"
@@ -36,7 +36,7 @@ cleanup() {
 }
 
 if [ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]; then
-    ruby test/fuzz/tools/corpus.rb "$CORPUS_DIR" || exit 1
+    ruby test/fuzz/runtime/corpus.rb "$CORPUS_DIR" || exit 1
 fi
 
 mkdir -p "$AFL_DIR"
@@ -138,7 +138,7 @@ if [[ -n $TERM ]]; then
 fi
 
 # Window 0: Fleet status dashboard
-tmux -2 new-session -d -s "$SESSION" -n "dashboard" "ruby ./test/fuzz/tools/status.rb '$AFL_DIR' ${WORKER_NAMES[*]}"
+tmux -2 new-session -d -s "$SESSION" -n "dashboard" "ruby ./test/fuzz/runtime/status.rb '$AFL_DIR' ${WORKER_NAMES[*]}"
 tmux set-option -g default-terminal "tmux-256color"
 tmux set-option -g remain-on-exit on
 
@@ -148,7 +148,7 @@ for (( i = 0; i < ${#WORKER_NAMES[@]}; i++ )); do
 done
 
 tmux select-window -t "$SESSION:0"
-tmux bind-key -n C-c confirm-before -p "Stop all fuzzers and exit? (y/n) [Tip: press Ctrl+B then d to detach]" "run-shell 'bash ./test/fuzz/tools/kill.sh'"
+tmux bind-key -n C-c confirm-before -p "Stop all fuzzers and exit? (y/n) [Tip: press Ctrl+B then d to detach]" "run-shell 'bash ./test/fuzz/runtime/kill.sh'"
 
 echo "Fuzzers started."
 
