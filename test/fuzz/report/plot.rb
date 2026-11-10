@@ -865,14 +865,21 @@ def hydrate_chain_steps(chain)
       loupe_url: parsed[:loupe_url]
     )
   end
-  # If Step 0 is a virtual root node (corpus or grammar) and Step 1 is its imported seed copy, share Step 1's Loupe link
-  if hydrated.size >= 2 && hydrated[0][:loupe_url].nil? && hydrated[1][:loupe_url]
-    hydrated[0][:loupe_url] = hydrated[1][:loupe_url]
+  # If Step 0 is a virtual root node (corpus or grammar) and Step 1 is its imported seed copy, share Step 1's source/metadata
+  if hydrated.size >= 2
+    hydrated[0][:preview] ||= hydrated[1][:preview]
+    hydrated[0][:opts_desc] ||= hydrated[1][:opts_desc]
+    hydrated[0][:size] ||= hydrated[1][:size]
+    hydrated[0][:loupe_url] ||= hydrated[1][:loupe_url]
   end
   hydrated
 end
 
 def analyze_fleet_lineage(afl_dir)
+  fuzz_root = File.dirname(afl_dir)
+  corpus_dir = File.join(fuzz_root, "corpus")
+  seeds_dir = File.join(fuzz_root, "seeds")
+
   q_index = {}
   Dir.glob(File.join(afl_dir, "*/queue/id:*")).each do |p|
     next unless File.file?(p)
@@ -893,16 +900,22 @@ def analyze_fleet_lineage(afl_dir)
     step = { path: path, worker: w, kind: kind, base: base, id: base[/\Aid:(\d+)/, 1] }
 
     chain = if base =~ /,sync:seeds(?:_\d+)?,src:([^,]+)/ || base =~ /,sync:grammar,src:([^,]+)/ || base =~ /,orig:(seed_[^,]+)/
-              [{ path: nil, worker: "grammar", kind: "seed", base: $1, id: $1 }, step]
+              seed_id = $1
+              seed_file = File.join(seeds_dir, seed_id)
+              root_path = File.file?(seed_file) ? seed_file : path
+              [{ path: root_path, worker: "grammar", kind: "seed", base: seed_id, id: seed_id }, step]
             elsif base =~ /,sync:([^,]+),src:(\d+)/
               peer = normalize_sync_source($1)
               parent = q_index[[peer, $2]]
-              parent ? (trace_chain.call(parent, seen) + [step]) : [{ path: nil, worker: peer, kind: "sync_root", base: "id:#{$2}", id: $2 }, step]
+              parent ? (trace_chain.call(parent, seen) + [step]) : [{ path: path, worker: peer, kind: "sync_root", base: "id:#{$2}", id: $2 }, step]
             elsif base =~ /,src:(\d+)/
               parent = q_index[[w, $1]]
               parent ? (trace_chain.call(parent, seen) + [step]) : [step]
             elsif base =~ /,orig:([^,]+)/
-              [{ path: nil, worker: "corpus", kind: "corpus", base: $1, id: $1 }, step]
+              orig_name = $1
+              corpus_file = File.join(corpus_dir, orig_name)
+              root_path = File.file?(corpus_file) ? corpus_file : path
+              [{ path: root_path, worker: "corpus", kind: "corpus", base: orig_name, id: orig_name }, step]
             else
               [step]
             end
@@ -911,7 +924,7 @@ def analyze_fleet_lineage(afl_dir)
   end
 
   # 1. Grammar queue propagation pathways across the fleet
-  grammar_queue_pathways = Hash.new(0)
+  grammar_queue_pathways = {}
   total_grammar_queue_items = 0
   q_index.each_value do |qpath|
     ch = trace_chain.call(qpath)
@@ -919,7 +932,13 @@ def analyze_fleet_lineage(afl_dir)
     total_grammar_queue_items += 1
     hops = []
     ch.each { |s| hops << s[:worker] if hops.empty? || hops.last != s[:worker] }
-    grammar_queue_pathways[hops] += 1
+    qp_entry = (grammar_queue_pathways[hops] ||= {
+      hops: hops,
+      count: 0,
+      sample_raw_chain: ch
+    })
+    qp_entry[:count] += 1
+    qp_entry[:sample_raw_chain] = ch if ch.size > qp_entry[:sample_raw_chain].size
   end
 
   # 2. Crash & hang lineage across all workers
@@ -962,7 +981,10 @@ def analyze_fleet_lineage(afl_dir)
       })
       g_entry[:count] += 1
       g_entry[:parents][[parent_step[:worker], parent_step[:id]]] = true
-      g_entry[:sample_raw_chain] = ch if ch.size > g_entry[:sample_raw_chain].size
+      if ch.size > g_entry[:sample_raw_chain].size
+        g_entry[:sample_raw_chain] = ch
+        g_entry[:hops] = hops
+      end
     elsif root_origin == "corpus"
       total_corpus_crashes += 1
       corpus_roots[root_seed] += 1
@@ -996,6 +1018,10 @@ def analyze_fleet_lineage(afl_dir)
     g[:sample_chain] = hydrate_chain_steps(g[:sample_raw_chain])
     g.delete(:sample_raw_chain)
   end
+  grammar_queue_pathways.each_value do |qp|
+    qp[:sample_chain] = hydrate_chain_steps(qp[:sample_raw_chain])
+    qp.delete(:sample_raw_chain)
+  end
 
   sorted_pathways = pathways.values.sort_by do |p|
     [p[:root_origin] == "grammar" ? 0 : 1, -p[:count], -p[:fuzzer_hop_count], p[:hops].join("->")]
@@ -1009,7 +1035,7 @@ def analyze_fleet_lineage(afl_dir)
     unique_grammar_crash_seeds: grammar_roots.size,
     unique_corpus_crash_seeds: corpus_roots.size,
     total_grammar_queue_items: total_grammar_queue_items,
-    grammar_queue_pathways: grammar_queue_pathways.sort_by { |_, c| -c },
+    grammar_queue_pathways: grammar_queue_pathways.values.sort_by { |qp| -qp[:count] },
     pathways: sorted_pathways,
     grammar_seed_crashes: grammar_seed_crashes.values.sort_by { |g| [-g[:count], g[:seed]] }
   }
@@ -1208,11 +1234,20 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
   g_crashes = fleet_lineage[:grammar_seed_crashes] || []
   return "" if q_paths.empty? && g_crashes.empty?
 
-  q_pills_html = q_paths.map do |hops, cnt|
+  q_pills_html = q_paths.map do |qp|
+    hops = qp.is_a?(Hash) ? qp[:hops] : qp[0]
+    cnt = qp.is_a?(Hash) ? qp[:count] : qp[1]
+    sample_last = qp.is_a?(Hash) ? (qp[:sample_chain] || []).last : nil
+    loupe_a = if sample_last && sample_last[:loupe_url]
+                %(<a class="cov-link" style="margin-left:8px;font-size:0.74rem;" href="#{CGI.escapeHTML(sample_last[:loupe_url])}" target="_blank" rel="noopener" title="Animate sample queue testcase from this pathway in Prism Loupe">Prism Loupe &nearr;</a>)
+              else
+                ""
+              end
     <<~PILL
       <div class="excl-pill" style="padding:4px 10px;">
         #{render_pathway_pills(hops, color_by_name)}
         <strong style="margin-left:6px;color:#34d399;">#{format_int(cnt)}</strong>
+        #{loupe_a}
       </div>
     PILL
   end.join("\n")
@@ -1221,14 +1256,14 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
     drawer_id = "gram-seed-crash-#{idx}"
     first_step = g[:sample_chain].first || {}
     last_step = g[:sample_chain].last || {}
-    parent_step = g[:sample_chain][-2] || {}
     loupe_links = []
     if first_step[:loupe_url]
-      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(first_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate original grammar seed in Prism Loupe">Seed &nearr;</a>)
+      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(first_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate original grammar seed in Prism Loupe">Prism Loupe (Seed) &nearr;</a>)
     end
     if last_step[:loupe_url]
-      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(last_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate mutated crash input in Prism Loupe">Crash &nearr;</a>)
+      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(last_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate mutated crash input in Prism Loupe">Prism Loupe (Crash) &nearr;</a>)
     end
+    sample_crash_short = last_step[:id] ? "#{last_step[:worker]} id:#{last_step[:id]}" : last_step[:base].to_s
     <<~ROW
       <tr class="clickable-row" onclick="toggleHunkDrawer('#{drawer_id}')">
         <td>
@@ -1238,8 +1273,8 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
         <td>#{render_pathway_pills(g[:hops], color_by_name)}</td>
         <td class="num"><strong class="text-danger">#{format_int(g[:count])}</strong></td>
         <td class="num">#{format_int(g[:parents].size)}</td>
-        <td><code>#{CGI.escapeHTML(parent_step[:base].to_s)}</code></td>
-        <td><code>#{CGI.escapeHTML(last_step[:base].to_s)}</code></td>
+        <td class="num">#{g[:sample_chain].size} steps</td>
+        <td><code title="#{CGI.escapeHTML(last_step[:base].to_s)}">#{CGI.escapeHTML(sample_crash_short)}</code></td>
         <td class="num" style="white-space:nowrap;">#{loupe_links.join(" &bull; ")}</td>
       </tr>
       <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
@@ -1260,12 +1295,12 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
                         <thead>
                           <tr>
                             <th>Grammar Seed ID</th>
-                            <th>Pathway</th>
+                            <th>Deepest Pathway</th>
                             <th class="num">Crashes</th>
                             <th class="num">Queue Intermediates</th>
-                            <th>Imported Queue Entry</th>
-                            <th>Sample Crash File</th>
-                            <th class="num">Prism Loupe</th>
+                            <th class="num">Max Depth</th>
+                            <th>Sample Crash</th>
+                            <th class="num">Parse Animator</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -1277,16 +1312,31 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
                     %(<div style="padding:12px 16px;" class="muted">No crashes traced to grammar seeds yet.</div>)
                   end
 
+  grammar_paths = (fleet_lineage[:pathways] || []).select { |p| p[:hops].include?("grammar") }
+  grammar_pathway_table = if grammar_paths.any?
+                            render_crash_lineage_table(
+                              grammar_paths,
+                              grammar_paths.sum { |p| p[:count] },
+                              color_by_name,
+                              id_prefix: "w-lineage-grammar",
+                              title: "Crash Lineage Involving <code>grammar</code> (#{format_int(fleet_lineage[:total_grammar_crashes])} Crashes from #{format_int(fleet_lineage[:unique_grammar_crash_seeds])} Seeds across #{grammar_paths.size} Pathways)",
+                              subtitle: "Pathways where grammar-generated seeds were imported via -F foreign sync and mutated into crashes across the fuzzer fleet."
+                            )
+                          else
+                            ""
+                          end
+
   <<~HTML
+    #{grammar_pathway_table}
     <div class="table-card" style="margin-top: 18px;">
       <div class="table-card-header">
         <div>
-          <h3><span class="legend-dot" style="background:#{color_by_name['grammar'] || '#34d399'}"></span> Grammar Seed Fleet Propagation &amp; Crash Lineage</h3>
+          <h3><span class="legend-dot" style="background:#{color_by_name['grammar'] || '#34d399'}"></span> Grammar Seed Fleet Propagation &amp; Per-Seed Crash Breakdown</h3>
           <p class="chart-sub">
             <strong>#{format_int(fleet_lineage[:total_grammar_queue_items])}</strong> queue testcases across the fleet and
             <strong class="#{fleet_lineage[:total_grammar_crashes] > 0 ? 'text-danger' : ''}">#{format_int(fleet_lineage[:total_grammar_crashes])} crashes</strong>
             (from <strong>#{format_int(fleet_lineage[:unique_grammar_crash_seeds])}</strong> generated seeds) trace their ancestry back to <code>grammar</code>.
-            Click any seed row below to inspect the generated Ruby code and the mutation steps that triggered the crash.
+            Click any seed row below to inspect the generated Ruby code and the mutation steps that triggered the crash, or open directly in Prism Loupe.
           </p>
         </div>
         <div>
