@@ -182,12 +182,14 @@ end
 
 # Build terminal generators with fixed matching delimiters (`"` for tSTRING_END)
 # and unary +/- operators (`+` / `-` rather than method names `+@` / `-@`).
+# Note: in CRuby's parse.y, tQWORDS_BEG/tQSYMBOLS_BEG are the non-interpolating
+# %w/%i forms, while tWORDS_BEG/tSYMBOLS_BEG are the interpolating %W/%I forms.
 def build_ruby_terminals(rng)
   terminals = Lrama::Fuzz::RubyTerminals.build(random: rng)
-  terminals["tWORDS_BEG"] = '%w"'
-  terminals["tQWORDS_BEG"] = '%W"'
-  terminals["tSYMBOLS_BEG"] = '%i"'
-  terminals["tQSYMBOLS_BEG"] = '%I"'
+  terminals["tWORDS_BEG"] = '%W"'
+  terminals["tQWORDS_BEG"] = '%w"'
+  terminals["tSYMBOLS_BEG"] = '%I"'
+  terminals["tQSYMBOLS_BEG"] = '%i"'
   terminals["tXSTRING_BEG"] = '%x"'
   terminals["tUPLUS"] = "+"
   terminals["tUMINUS"] = "-"
@@ -303,7 +305,10 @@ end
 
 def build_evolvers(grammar, rng, fitness, validator)
   classifier = Lrama::Fuzz::Ruby.method(:classifier)
-  avoid = Lrama::Fuzz::Ruby::AVOID_SYMBOLS
+  # Also avoid dsym (tSYMBEG string_contents tSTRING_END emits `:..."` without an
+  # opening quote because tSYMBEG is `:`) and END_OF_INPUT (string_dend -> END_OF_INPUT
+  # omits the closing `}` on `#{...}`).
+  avoid = Lrama::Fuzz::Ruby::AVOID_SYMBOLS + Set["dsym", "END_OF_INPUT"]
 
   comp_rng = Random.new(rng.rand(2**32))
   comp_gen = Lrama::Fuzz::Generator.new(
@@ -314,6 +319,13 @@ def build_evolvers(grammar, rng, fitness, validator)
     max_depth: rng.rand(8..12),
     random: comp_rng
   )
+  # Filter avoided rules upfront in pick_rule so once all non-avoided rules of a
+  # non-terminal are covered, `uncovered` does not fall back to avoided rules.
+  comp_gen.singleton_class.prepend(Module.new do
+    def pick_rule(rules)
+      super(filter_avoided(rules))
+    end
+  end)
   composed_evolver = Lrama::Fuzz::ComposedEvolver.new(
     comp_gen,
     fitness: fitness,
