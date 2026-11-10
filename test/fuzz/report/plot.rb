@@ -753,6 +753,488 @@ else
   ""
 end
 
+def format_testcase_preview(path, max_bytes = 512)
+  return nil unless path && File.file?(path)
+
+  total_size = File.size(path)
+  raw = File.binread(path, max_bytes) || "".b
+  formatted = raw.bytes.map do |b|
+    case b
+    when 0x0A then "\n"
+    when 0x09 then "\t"
+    when 0x20..0x7E then b.chr
+    else format("\\x%02X", b)
+    end
+  end.join
+  formatted << "\n... (#{total_size - max_bytes} more bytes)" if total_size > max_bytes
+  formatted
+rescue StandardError
+  nil
+end
+
+def describe_afl_step_op(base, kind)
+  return "Root Corpus Seed" if kind == "corpus"
+  return "Grammar Generated Seed (lrama-fuzz)" if kind == "seed"
+
+  parts = []
+  if base =~ /,sync:([^,]+),src:([^,+]+)/
+    src_w = normalize_sync_source($1)
+    parts << (src_w == "grammar" ? "Foreign Sync (-F) from grammar (#{$2})" : "Peer Sync from #{src_w} (id:#{$2})")
+  elsif base =~ /,orig:([^,]+)/
+    parts << "Initial Seed (#{$1})"
+  end
+  if base =~ /,op:([^,]+)/
+    op = $1
+    rep = base[/,rep:(\d+)/, 1]
+    pos = base[/,pos:(\d+)/, 1]
+    detail = op
+    detail += " (rep:#{rep})" if rep
+    detail += " @ byte #{pos}" if pos
+    parts << "Mutate: #{detail}"
+  end
+  parts << "+cov" if base.include?(",+cov")
+  if base =~ /,sig:(\d+)/
+    parts << "CRASH (sig:#{$1})"
+  elsif kind == "hangs"
+    parts << "HANG"
+  end
+  parts.empty? ? kind : parts.join(" &bull; ")
+end
+
+def hydrate_chain_steps(chain)
+  chain.map do |s|
+    p = s[:path]
+    sz = (p && File.file?(p)) ? File.size(p) : nil
+    s.merge(
+      size: sz,
+      op_desc: describe_afl_step_op(s[:base].to_s, s[:kind].to_s),
+      preview: format_testcase_preview(p)
+    )
+  end
+end
+
+def analyze_fleet_lineage(afl_dir)
+  q_index = {}
+  Dir.glob(File.join(afl_dir, "*/queue/id:*")).each do |p|
+    next unless File.file?(p)
+    w = File.basename(File.dirname(File.dirname(p)))
+    id = File.basename(p)[/\Aid:(\d+)/, 1]
+    q_index[[w, id]] = p if id
+  end
+
+  memo = {}
+  trace_chain = lambda do |path, seen = {}|
+    return memo[path] if memo.key?(path)
+    return [] if seen[path]
+
+    seen = seen.merge(path => true)
+    base = File.basename(path)
+    w = File.basename(File.dirname(File.dirname(path)))
+    kind = File.basename(File.dirname(path))
+    step = { path: path, worker: w, kind: kind, base: base, id: base[/\Aid:(\d+)/, 1] }
+
+    chain = if base =~ /,sync:seeds(?:_\d+)?,src:([^,]+)/ || base =~ /,sync:grammar,src:([^,]+)/ || base =~ /,orig:(seed_[^,]+)/
+              [{ path: nil, worker: "grammar", kind: "seed", base: $1, id: $1 }, step]
+            elsif base =~ /,sync:([^,]+),src:(\d+)/
+              peer = normalize_sync_source($1)
+              parent = q_index[[peer, $2]]
+              parent ? (trace_chain.call(parent, seen) + [step]) : [{ path: nil, worker: peer, kind: "sync_root", base: "id:#{$2}", id: $2 }, step]
+            elsif base =~ /,src:(\d+)/
+              parent = q_index[[w, $1]]
+              parent ? (trace_chain.call(parent, seen) + [step]) : [step]
+            elsif base =~ /,orig:([^,]+)/
+              [{ path: nil, worker: "corpus", kind: "corpus", base: $1, id: $1 }, step]
+            else
+              [step]
+            end
+    memo[path] = chain if kind == "queue"
+    chain
+  end
+
+  # 1. Grammar queue propagation pathways across the fleet
+  grammar_queue_pathways = Hash.new(0)
+  total_grammar_queue_items = 0
+  q_index.each_value do |qpath|
+    ch = trace_chain.call(qpath)
+    next unless ch.first && ch.first[:worker] == "grammar"
+    total_grammar_queue_items += 1
+    hops = []
+    ch.each { |s| hops << s[:worker] if hops.empty? || hops.last != s[:worker] }
+    grammar_queue_pathways[hops] += 1
+  end
+
+  # 2. Crash & hang lineage across all workers
+  crash_files = Dir.glob(File.join(afl_dir, "*/{crashes,hangs}/id:*")).select do |p|
+    File.file?(p) && !p.end_with?(".bt", ".min", ".md")
+  end.sort
+
+  pathways = {}
+  grammar_seed_crashes = {}
+  corpus_roots = Hash.new(0)
+  grammar_roots = Hash.new(0)
+  total_grammar_crashes = 0
+  total_corpus_crashes = 0
+  total_multi_worker_crashes = 0
+
+  crash_files.each do |cpath|
+    ch = trace_chain.call(cpath)
+    next if ch.empty?
+
+    hops = []
+    ch.each { |s| hops << s[:worker] if hops.empty? || hops.last != s[:worker] }
+    root_origin = hops.first
+    root_seed = ch.first[:base].to_s
+    crash_worker = hops.last
+    parent_step = ch[-2] || ch.first
+
+    # Number of distinct fuzzer workers (excluding "corpus" and "grammar" seed origins)
+    fuzzer_hops = hops.reject { |h| h == "corpus" || h == "grammar" }.uniq
+    total_multi_worker_crashes += 1 if fuzzer_hops.size >= 2
+
+    if root_origin == "grammar"
+      total_grammar_crashes += 1
+      grammar_roots[root_seed] += 1
+      g_entry = (grammar_seed_crashes[root_seed] ||= {
+        seed: root_seed,
+        count: 0,
+        hops: hops,
+        parents: {},
+        sample_raw_chain: ch
+      })
+      g_entry[:count] += 1
+      g_entry[:parents][[parent_step[:worker], parent_step[:id]]] = true
+      g_entry[:sample_raw_chain] = ch if ch.size > g_entry[:sample_raw_chain].size
+    elsif root_origin == "corpus"
+      total_corpus_crashes += 1
+      corpus_roots[root_seed] += 1
+    end
+
+    p_entry = (pathways[hops] ||= {
+      hops: hops,
+      root_origin: root_origin,
+      crash_worker: crash_worker,
+      fuzzer_hop_count: fuzzer_hops.size,
+      count: 0,
+      parents: {},
+      roots: Hash.new(0),
+      max_steps: 0,
+      sample_raw_chain: ch
+    })
+    p_entry[:count] += 1
+    p_entry[:parents][[parent_step[:worker], parent_step[:id]]] = true
+    p_entry[:roots][root_seed] += 1
+    if ch.size > p_entry[:max_steps]
+      p_entry[:max_steps] = ch.size
+      p_entry[:sample_raw_chain] = ch
+    end
+  end
+
+  pathways.each_value do |p|
+    p[:sample_chain] = hydrate_chain_steps(p[:sample_raw_chain])
+    p.delete(:sample_raw_chain)
+  end
+  grammar_seed_crashes.each_value do |g|
+    g[:sample_chain] = hydrate_chain_steps(g[:sample_raw_chain])
+    g.delete(:sample_raw_chain)
+  end
+
+  sorted_pathways = pathways.values.sort_by do |p|
+    [p[:root_origin] == "grammar" ? 0 : 1, -p[:count], -p[:fuzzer_hop_count], p[:hops].join("->")]
+  end
+
+  {
+    total_crashes: crash_files.size,
+    total_grammar_crashes: total_grammar_crashes,
+    total_corpus_crashes: total_corpus_crashes,
+    total_multi_worker_crashes: total_multi_worker_crashes,
+    unique_grammar_crash_seeds: grammar_roots.size,
+    unique_corpus_crash_seeds: corpus_roots.size,
+    total_grammar_queue_items: total_grammar_queue_items,
+    grammar_queue_pathways: grammar_queue_pathways.sort_by { |_, c| -c },
+    pathways: sorted_pathways,
+    grammar_seed_crashes: grammar_seed_crashes.values.sort_by { |g| [-g[:count], g[:seed]] }
+  }
+rescue StandardError
+  {
+    total_crashes: 0,
+    total_grammar_crashes: 0,
+    total_corpus_crashes: 0,
+    total_multi_worker_crashes: 0,
+    unique_grammar_crash_seeds: 0,
+    unique_corpus_crash_seeds: 0,
+    total_grammar_queue_items: 0,
+    grammar_queue_pathways: [],
+    pathways: [],
+    grammar_seed_crashes: []
+  }
+end
+
+def render_pathway_pills(hops, color_by_name)
+  hops.map do |w|
+    color = if w == "corpus"
+              "#fbbf24"
+            elsif w == "grammar"
+              color_by_name["grammar"] || "#34d399"
+            else
+              color_by_name[w] || "#9ca3af"
+            end
+    star = w == "grammar" ? "&#9733; " : ""
+    if color_by_name.key?(w)
+      %(<span class="hop-pill clickable-pill" onclick="event.stopPropagation(); selectTab('#{CGI.escapeHTML(w)}')" title="Open #{CGI.escapeHTML(w)} tab"><span class="legend-dot" style="background:#{color}"></span>#{star}#{CGI.escapeHTML(w)}</span>)
+    elsif w == "corpus"
+      %(<span class="hop-pill" title="Initial Seed Corpus"><span class="legend-dot" style="background:#{color}"></span>corpus</span>)
+    else
+      %(<span class="hop-pill"><span class="legend-dot" style="background:#{color}"></span>#{CGI.escapeHTML(w)}</span>)
+    end
+  end.join('<span class="hop-arrow">&rarr;</span>')
+end
+
+def render_evolution_chain_steps(chain, color_by_name)
+  return "" if chain.nil? || chain.empty?
+
+  steps_html = chain.each_with_index.map do |s, idx|
+    w = s[:worker].to_s
+    color = if w == "corpus"
+              "#fbbf24"
+            elsif w == "grammar"
+              color_by_name["grammar"] || "#34d399"
+            else
+              color_by_name[w] || "#9ca3af"
+            end
+    is_last = (idx == chain.size - 1)
+    step_cls = if idx == 0
+                 "evo-step evo-step-root"
+               elsif is_last && (s[:kind] == "crashes" || s[:kind] == "hangs")
+                 "evo-step evo-step-crash"
+               else
+                 "evo-step"
+               end
+    size_badge = s[:size] ? %(<span class="evo-size">#{format_int(s[:size])} B</span>) : ""
+    preview_block = if s[:preview]
+                      %(<pre class="evo-preview">#{CGI.escapeHTML(s[:preview])}</pre>)
+                    else
+                      ""
+                    end
+    <<~STEP
+      <div class="#{step_cls}">
+        <div class="evo-step-head">
+          <span class="evo-step-num">Step #{idx}</span>
+          <span class="hop-pill"><span class="legend-dot" style="background:#{color}"></span>#{CGI.escapeHTML(w)}</span>
+          <code class="evo-fname">#{CGI.escapeHTML(s[:base].to_s)}</code>
+          <span class="evo-op">#{s[:op_desc]}</span>
+          #{size_badge}
+        </div>
+        #{preview_block}
+      </div>
+    STEP
+  end.join('<div class="evo-connector">&darr;</div>')
+
+  %(<div class="evo-chain-wrap">#{steps_html}</div>)
+end
+
+fleet_lineage = analyze_fleet_lineage(afl_dir)
+
+def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix:, title:, subtitle:, filter_controls: false)
+  return "" if pathways.nil? || pathways.empty?
+
+  max_count = [pathways.map { |p| p[:count] }.max.to_i, 1].max
+  rows_html = pathways.each_with_index.map do |p, idx|
+    drawer_id = "#{id_prefix}-drawer-#{idx}"
+    top_root, top_root_cnt = p[:roots].max_by { |_, c| c } || ["-", 0]
+    pct_of_total = total_crashes > 0 ? (p[:count] * 100.0 / total_crashes) : 0.0
+    bar_w = (p[:count] * 100.0 / max_count).round(1)
+    bar_color = p[:root_origin] == "grammar" ? "#34d399" : "#fb7185"
+    row_tags = []
+    row_tags << "grammar" if p[:root_origin] == "grammar"
+    row_tags << "multihop" if p[:fuzzer_hop_count] >= 2
+    row_tags << "singlehop" if p[:fuzzer_hop_count] < 2
+
+    <<~ROW
+      <tr class="clickable-row lineage-row" data-lineage-Prefix="#{id_prefix}" data-lineage-tags="#{row_tags.join(' ')}" onclick="toggleHunkDrawer('#{drawer_id}')">
+        <td>
+          <span id="caret-#{drawer_id}" class="muted" style="display:inline-block;width:14px;">&#9656;</span>
+          #{render_pathway_pills(p[:hops], color_by_name)}
+        </td>
+        <td class="num">
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;">
+            <div style="width:70px;height:7px;background:#0b0f19;border:1px solid #1f2937;border-radius:4px;overflow:hidden;">
+              <div style="width:#{bar_w}%;height:100%;background:#{bar_color};"></div>
+            </div>
+            <strong>#{format_int(p[:count])}</strong>
+            <span class="muted" style="min-width:44px;text-align:right;">(#{format("%.1f%%", pct_of_total)})</span>
+          </div>
+        </td>
+        <td class="num">#{format_int(p[:parents].size)}</td>
+        <td class="num">#{format_int(p[:roots].size)}</td>
+        <td class="num">#{p[:max_steps]} steps</td>
+        <td><code>#{CGI.escapeHTML(top_root.to_s)}</code> <span class="muted">(#{format_int(top_root_cnt)})</span></td>
+      </tr>
+      <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
+        <td colspan="6" class="hunk-drawer-cell">
+          <div class="origin-hunk-title">
+            <span>Representative Testcase Evolution: #{render_pathway_pills(p[:hops], color_by_name)}</span>
+            <span class="muted">#{format_int(p[:count])} crashes from #{format_int(p[:parents].size)} parent queue items (#{format_int(p[:roots].size)} root seeds)</span>
+          </div>
+          #{render_evolution_chain_steps(p[:sample_chain], color_by_name)}
+        </td>
+      </tr>
+    ROW
+  end.join("\n")
+
+  controls_html = if filter_controls
+                    <<~CTRL
+                      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        <button class="cov-btn" onclick="filterLineageRows('#{id_prefix}', 'all', this)">All Pathways (#{pathways.size})</button>
+                        <button class="cov-btn cov-btn-secondary" onclick="filterLineageRows('#{id_prefix}', 'grammar', this)">&#9733; Grammar Rooted</button>
+                        <button class="cov-btn cov-btn-secondary" onclick="filterLineageRows('#{id_prefix}', 'multihop', this)">Multi-Fuzzer Hops (&ge;2)</button>
+                        <button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, '#{id_prefix}-drawer-')">Expand All Evolution Chains</button>
+                      </div>
+                    CTRL
+                  else
+                    <<~CTRL
+                      <div>
+                        <button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, '#{id_prefix}-drawer-')">Expand All Evolution Chains</button>
+                      </div>
+                    CTRL
+                  end
+
+  <<~HTML
+    <div class="table-card" style="margin-top: 18px;">
+      <div class="table-card-header">
+        <div>
+          <h3>#{title}</h3>
+          <p class="chart-sub">#{subtitle}</p>
+        </div>
+        #{controls_html}
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Lineage Pathway (Origin &rarr; Worker Hops &rarr; Crash Discoverer)</th>
+            <th class="num">Crashes</th>
+            <th class="num">Queue Parents</th>
+            <th class="num">Root Seeds</th>
+            <th class="num">Max Depth</th>
+            <th>Top Root Seed (Crashes)</th>
+          </tr>
+        </thead>
+        <tbody id="#{id_prefix}-tbody">
+          #{rows_html}
+        </tbody>
+      </table>
+    </div>
+  HTML
+end
+
+def render_grammar_lineage_section(fleet_lineage, color_by_name)
+  q_paths = fleet_lineage[:grammar_queue_pathways] || []
+  g_crashes = fleet_lineage[:grammar_seed_crashes] || []
+  return "" if q_paths.empty? && g_crashes.empty?
+
+  q_pills_html = q_paths.map do |hops, cnt|
+    <<~PILL
+      <div class="excl-pill" style="padding:4px 10px;">
+        #{render_pathway_pills(hops, color_by_name)}
+        <strong style="margin-left:6px;color:#34d399;">#{format_int(cnt)}</strong>
+      </div>
+    PILL
+  end.join("\n")
+
+  seed_rows_html = g_crashes.each_with_index.map do |g, idx|
+    drawer_id = "gram-seed-crash-#{idx}"
+    last_step = g[:sample_chain].last || {}
+    parent_step = g[:sample_chain][-2] || {}
+    <<~ROW
+      <tr class="clickable-row" onclick="toggleHunkDrawer('#{drawer_id}')">
+        <td>
+          <span id="caret-#{drawer_id}" class="muted" style="display:inline-block;width:14px;">&#9656;</span>
+          <code>#{CGI.escapeHTML(g[:seed])}</code>
+        </td>
+        <td>#{render_pathway_pills(g[:hops], color_by_name)}</td>
+        <td class="num"><strong class="text-danger">#{format_int(g[:count])}</strong></td>
+        <td class="num">#{format_int(g[:parents].size)}</td>
+        <td><code>#{CGI.escapeHTML(parent_step[:base].to_s)}</code></td>
+        <td><code>#{CGI.escapeHTML(last_step[:base].to_s)}</code></td>
+      </tr>
+      <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
+        <td colspan="6" class="hunk-drawer-cell">
+          <div class="origin-hunk-title">
+            <span>Grammar Seed <code>#{CGI.escapeHTML(g[:seed])}</code> &rarr; Crash Evolution</span>
+            <span class="muted">#{format_int(g[:count])} crashes</span>
+          </div>
+          #{render_evolution_chain_steps(g[:sample_chain], color_by_name)}
+        </td>
+      </tr>
+    ROW
+  end.join("\n")
+
+  crashes_table = if g_crashes.any?
+                    <<~TBL
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Grammar Seed ID</th>
+                            <th>Pathway</th>
+                            <th class="num">Crashes</th>
+                            <th class="num">Queue Intermediates</th>
+                            <th>Imported Queue Entry</th>
+                            <th>Sample Crash File</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          #{seed_rows_html}
+                        </tbody>
+                      </table>
+                    TBL
+                  else
+                    %(<div style="padding:12px 16px;" class="muted">No crashes traced to grammar seeds yet.</div>)
+                  end
+
+  <<~HTML
+    <div class="table-card" style="margin-top: 18px;">
+      <div class="table-card-header">
+        <div>
+          <h3><span class="legend-dot" style="background:#{color_by_name['grammar'] || '#34d399'}"></span> Grammar Seed Fleet Propagation &amp; Crash Lineage</h3>
+          <p class="chart-sub">
+            <strong>#{format_int(fleet_lineage[:total_grammar_queue_items])}</strong> queue testcases across the fleet and
+            <strong class="#{fleet_lineage[:total_grammar_crashes] > 0 ? 'text-danger' : ''}">#{format_int(fleet_lineage[:total_grammar_crashes])} crashes</strong>
+            (from <strong>#{format_int(fleet_lineage[:unique_grammar_crash_seeds])}</strong> generated seeds) trace their ancestry back to <code>grammar</code>.
+            Click any seed row below to inspect the generated Ruby code and the mutation steps that triggered the crash.
+          </p>
+        </div>
+        <div>
+          <button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, 'gram-seed-crash-')">Expand All Seed Crash Chains</button>
+        </div>
+      </div>
+      <div style="padding: 12px 16px; border-bottom: 1px solid var(--panel-border);">
+        <div class="kpi-label" style="margin-bottom:8px;">Queue Propagation Pathways Across Fleet (#{format_int(fleet_lineage[:total_grammar_queue_items])} queue entries rooted in grammar)</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          #{q_pills_html}
+        </div>
+      </div>
+      #{crashes_table}
+    </div>
+  HTML
+end
+
+overview_crash_lineage_html = if fleet_lineage[:total_crashes] > 0
+  multi_pct = (fleet_lineage[:total_multi_worker_crashes] * 100.0 / fleet_lineage[:total_crashes]).round(1)
+  render_crash_lineage_table(
+    fleet_lineage[:pathways],
+    fleet_lineage[:total_crashes],
+    color_by_name,
+    id_prefix: "ov-lineage",
+    title: "Crash Lineage &amp; Multi-Worker Evolution (#{format_int(fleet_lineage[:total_crashes])} Crashes across #{fleet_lineage[:pathways].size} Pathways)",
+    subtitle: "Backwards walk from every crash file through local mutations (src:) and peer syncs (sync:) to its root origin: " \
+              "#{format_int(fleet_lineage[:total_grammar_crashes])} crashes from #{fleet_lineage[:unique_grammar_crash_seeds]} grammar seeds (#{format_int(fleet_lineage[:total_grammar_queue_items])} grammar-rooted queue items fleet-wide) &bull; " \
+              "#{format_int(fleet_lineage[:total_corpus_crashes])} crashes from #{fleet_lineage[:unique_corpus_crash_seeds]} initial corpus seeds &bull; " \
+              "#{format_int(fleet_lineage[:total_multi_worker_crashes])} (#{multi_pct}%) involved &ge;2 fuzzers. Click any pathway to view step-by-step testcase evolution.",
+    filter_controls: true
+  )
+else
+  ""
+end
+
 # Overview comparison charts
 overview_chart_list = [
   render_svg_chart(
@@ -1719,7 +2201,7 @@ fuzzers.each do |f|
                 <div class="kpi-card">
                   <div class="kpi-label">Imported by #{CGI.escapeHTML(intake_name)}</div>
                   <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
-                  <div class="kpi-sub">foreign sync (-F) into #{CGI.escapeHTML(intake_name)} queue</div>
+                  <div class="kpi-sub">#{format_int(fleet_lineage[:total_grammar_queue_items])} fleet queue items &bull; #{format_int(fleet_lineage[:total_grammar_crashes])} crashes (#{fleet_lineage[:unique_grammar_crash_seeds]} seeds)</div>
                 </div>
               SYNC_KPI
             else
@@ -1732,6 +2214,7 @@ fuzzers.each do |f|
           #{gen_charts}
         </div>
 
+        #{render_grammar_lineage_section(fleet_lineage, color_by_name)}
         #{render_worker_cov_files_table(oc, f[:color])}
       </section>
     HTML
@@ -1928,6 +2411,23 @@ fuzzers.each do |f|
         #{fuzzer_charts}
       </div>
 
+      #{
+        worker_paths = (fleet_lineage[:pathways] || []).select { |p| p[:hops].include?(name) }
+        if worker_paths.any?
+          direct_cnt = worker_paths.select { |p| p[:crash_worker] == name }.sum { |p| p[:count] }
+          assist_cnt = worker_paths.reject { |p| p[:crash_worker] == name }.sum { |p| p[:count] }
+          render_crash_lineage_table(
+            worker_paths,
+            worker_paths.sum { |p| p[:count] },
+            color_by_name,
+            id_prefix: "w-lineage-#{name.gsub(/[^a-zA-Z0-9_-]/, '_')}",
+            title: "Crash Lineage Involving <code>#{safe_name}</code> (#{format_int(direct_cnt)} Direct Crashes &bull; #{format_int(assist_cnt)} Forwarded to Peers)",
+            subtitle: "Pathways where #{safe_name} either discovered the crash directly or mutated/forwarded an ancestor queue item that later crashed in another worker."
+          )
+        else
+          ""
+        end
+      }
       #{render_worker_cov_files_table(oc, f[:color])}
     </section>
   HTML
@@ -2664,6 +3164,91 @@ html = <<~HTML
       .hunk-src {
         overflow-x: visible;
       }
+      .hop-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--panel-border);
+        border-radius: 6px;
+        padding: 2px 8px;
+        font-size: 0.75rem;
+        font-weight: 600;
+      }
+      .hop-arrow {
+        color: var(--muted);
+        margin: 0 5px;
+        font-size: 0.78rem;
+      }
+      .evo-chain-wrap {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .evo-step {
+        background: #0b0f19;
+        border: 1px solid #1f2937;
+        border-left: 3px solid #38bdf8;
+        border-radius: 7px;
+        padding: 8px 12px;
+      }
+      .evo-step-root {
+        border-left-color: #34d399;
+      }
+      .evo-step-crash {
+        border-left-color: #fb7185;
+        background: rgba(251, 113, 133, 0.05);
+      }
+      .evo-step-head {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        font-size: 0.76rem;
+      }
+      .evo-step-num {
+        font-weight: 700;
+        color: var(--muted);
+        text-transform: uppercase;
+        font-size: 0.68rem;
+        letter-spacing: 0.04em;
+      }
+      .evo-fname {
+        color: #e2e8f0;
+        font-size: 0.74rem;
+      }
+      .evo-op {
+        color: #93c5fd;
+        font-size: 0.74rem;
+      }
+      .evo-size {
+        margin-left: auto;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        font-size: 0.73rem;
+      }
+      .evo-preview {
+        margin: 6px 0 0 0;
+        padding: 6px 10px;
+        background: #060911;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 5px;
+        font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+        font-size: 0.73rem;
+        line-height: 1.4;
+        color: #d1d5db;
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-height: 160px;
+        overflow-y: auto;
+      }
+      .evo-connector {
+        text-align: left;
+        padding-left: 24px;
+        color: var(--muted);
+        font-size: 0.75rem;
+        line-height: 1;
+      }
     </style>
   </head>
   <body>
@@ -2736,7 +3321,7 @@ html = <<~HTML
           <div class="kpi-card">
             <div class="kpi-label">Saved Crashes</div>
             <div class="kpi-value #{fleet_crashes > 0 ? 'text-danger' : ''}">#{fleet_crashes}</div>
-            <div class="kpi-sub">Saved hangs: #{fleet_hangs}</div>
+            <div class="kpi-sub">#{fleet_lineage[:total_grammar_crashes]} grammar &bull; #{fleet_lineage[:total_corpus_crashes]} corpus &bull; #{fleet_hangs} hangs</div>
           </div>
         </div>
 
@@ -2777,6 +3362,7 @@ html = <<~HTML
         </div>
 
         #{generator_table_html}
+        #{overview_crash_lineage_html}
       </section>
 
       #{tab_panels_html}
@@ -3009,6 +3595,29 @@ html = <<~HTML
           const caret = document.getElementById('caret-' + drawerId);
           if (caret) caret.innerHTML = '&#9662;';
         }
+      }
+
+      function filterLineageRows(prefix, tag, btn) {
+        const tbody = document.getElementById(prefix + '-tbody');
+        if (!tbody) return;
+        if (btn && btn.parentElement) {
+          Array.from(btn.parentElement.querySelectorAll('button')).forEach(b => {
+            if (b.textContent.includes('Expand') || b.textContent.includes('Collapse')) return;
+            b.classList.toggle('cov-btn-secondary', b !== btn);
+          });
+        }
+        const rows = Array.from(tbody.querySelectorAll('tr.lineage-row'));
+        rows.forEach((r, idx) => {
+          const tags = (r.dataset.lineageTags || '').split(/\s+/);
+          const show = (tag === 'all') || tags.includes(tag);
+          r.style.display = show ? 'table-row' : 'none';
+          const drawer = document.getElementById(prefix + '-drawer-' + idx);
+          if (drawer && !show) {
+            drawer.style.display = 'none';
+            const caret = document.getElementById('caret-' + prefix + '-drawer-' + idx);
+            if (caret) caret.innerHTML = '&#9656;';
+          }
+        });
       }
 
       window.addEventListener('popstate', applyHashTab);

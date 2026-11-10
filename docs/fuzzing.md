@@ -151,15 +151,27 @@ Inside the `tmux` session:
   - **`[2: Queue & Sync]`**: Total executions, queue cycles, corpus size, cross-worker `SHARED` and `DESCENDANTS` counts (how many inputs discovered by a worker were imported and further mutated by peers), and pending favored items.
 - **Windows 1..N** each display an individual worker's native [AFL++ status screen](https://aflplus.plus/docs/status_screen/). Use `Ctrl+B, w` to pick a window from a list, `Ctrl+B, n`/`p` for next/previous window, or `Ctrl+B, 0` to return to the dashboard.
 
-### Telemetry Plots and Source Coverage
+### Telemetry Plots, Crash Lineage, and Source Coverage
 
-- **Unified telemetry & coverage report** (coverage growth, throughput, corpus size, cross-worker queue sync breakdowns, plus per-worker and combined LLVM source coverage):
+- **Unified telemetry, crash lineage, & coverage dashboard**:
   ```bash
   make fuzz-plot
   open tmp/fuzz/plots/index.html
   ```
   `make fuzz-plot` automatically runs `test/fuzz/report/coverage.sh` if `tmp/fuzz/coverage/coverage.json` is missing or older than the queues in `tmp/fuzz/afl` (set `FUZZ_SKIP_COVERAGE=1` to skip coverage collection).
-- **Standalone coverage collection** (partitions inputs across `corpus`, `grammar`, and each fuzzer worker, evaluates each origin's standalone/marginal/exclusive coverage, and merges their profiles into the combined report):
+
+  The generated dashboard (`tmp/fuzz/plots/index.html`) includes:
+  - **Fleet Overview & Peer Sync Telemetry**: Interactive time-series charts for coverage growth, throughput, corpus size, and pending queue items, plus a cross-worker sync yield breakdown showing how each worker's queue discoveries are tested and imported by peers.
+  - **Crash Lineage & Multi-Worker Evolution (`Origin → ... → Crash Discoverer`)**: Because AFL++ preserves every queue item in `tmp/fuzz/afl/<worker>/queue/` (including unmutated copies of `-F` grammar seeds imported into `ldet/queue/` before `grammar.rb` prunes the temporary staging file), `test/fuzz/report/plot.rb` walks backwards from every saved crash/hang file through local mutation pointers (`src:NNNNNN`) and cross-worker sync pointers (`sync:<peer>,src:NNNNNN`) all the way to the root seed (`corpus` vs. `grammar`):
+    - Breaks down all crashes by their full multi-worker evolutionary pathway (e.g., `★ grammar → ldet` or `corpus → main → main-7 → ldet → msan`).
+    - Clicking any pathway (or any crash-producing seed on the `#grammar` tab) expands an inline **Step-by-Step Testcase Evolution** chain showing `Step 0 (Root Seed)` → intermediate queue mutations/syncs (`op:flip2`, `op:havoc`, byte size) → final `Crash`, with the formatted testcase bytes at each step.
+    - On the `#grammar` tab, tracks fleet-wide queue propagation (`grammar → ldet → main-* / msan`) and lists every `lrama-fuzz` seed that produced a crash alongside its generated Ruby source.
+  - **Per-Origin LLVM Source Coverage & Exclusive Code Hunks**: Partitions all campaign inputs by root origin (`corpus`, `grammar`, `main`, `ldet`, `msan`, `main-2..N`) and computes three metrics per origin:
+    1. **Standalone coverage**: lines/branches covered by that origin's inputs alone.
+    2. **Gain vs. Corpus**: marginal lines/branches added when merged with the initial seed corpus (`merge(corpus, origin) - corpus`).
+    3. **Exclusive coverage (`combined - merge(all_other_origins)`)**: lines and branches uniquely covered *only* by that worker/generator.
+    - Clicking any file with exclusive coverage (on the **Source Coverage** tab or on a worker's tab) opens an inline C source code drawer showing the exact exclusive lines (`LINE Nx`) and conditional branch outcomes (`BR → True (Nx)` / `BR → False (Nx)`), with exact sub-expression highlighting on compound `&&`/`||` lines and macro expansion resolution (e.g., showing which `case` inside `PM_CASE_KEYWORD` matched).
+- **Standalone coverage collection**:
   ```bash
   make fuzz-coverage
   ```
@@ -169,8 +181,8 @@ Inside the `tmux` session:
     - **CLion**: Use *Run -> Show Coverage Data...* (`Cmd+Option+F6` / `Ctrl+Alt+F6`) and select `tmp/fuzz/coverage/lcov.info`.
     - **Neovim**: Point [`nvim-coverage`](https://github.com/andythigpen/nvim-coverage) (`lcov_file`) at `tmp/fuzz/coverage/lcov.info`.
   - `tmp/fuzz/coverage/report/index.html` — combined annotated HTML source report (`open tmp/fuzz/coverage/report/index.html`).
-  - `tmp/fuzz/coverage/workers/<origin>/report/index.html` — per-origin annotated HTML source reports (`corpus`, `grammar`, `main`, `ldet`, `msan`, `main-2..N`).
-  - `tmp/fuzz/coverage/coverage.json` — structured JSON breakdown of combined and per-origin coverage, gains over `corpus`, and exclusive leave-one-out contributions.
+  - `tmp/fuzz/coverage/workers/<origin>/report/index.html` — per-origin annotated HTML source reports (`corpus`, `grammar`, `main`, `ldet`, `msan`, `main-2..N`), post-processed to highlight exclusive lines/branches inline and add a `next exclusive to <origin> (E)` keyboard shortcut (`E`).
+  - `tmp/fuzz/coverage/coverage.json` — structured JSON breakdown of combined and per-origin coverage, gains over `corpus`, and exclusive leave-one-out source hunks and branch outcomes.
   - `tmp/fuzz/coverage/coverage.profdata` — merged LLVM profile data for custom `llvm-cov` queries.
   - `tmp/fuzz/coverage/summary.txt` — saved copy of the terminal summary table.
 
@@ -248,7 +260,7 @@ See [`test/fuzz/patches/aflplusplus.md`](../test/fuzz/patches/aflplusplus.md) fo
 
 Byte-level mutations struggle to discover bugs that require syntactically rich Ruby constructs (such as nested heredocs, pattern matching, or endless method definitions inside blocks).
 
-The `grammar` worker runs `test/fuzz/runtime/grammar.rb`, which uses [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz) (`ComposedEvolver` and `Evolver`) derived directly from CRuby's `parse.y` grammar to evolve structurally rich valid and near-valid Ruby programs (including multi-heredoc and nested-heredoc rewrites). Each unique snippet is prefixed with the 4-byte options header, written atomically to `/tmp/afl-tmpdir/grammar/seeds` on `tmpfs`, imported into `ldet` via AFL++'s `-F` foreign sync whenever it discovers new CFG edges or IJON parser/lexer state transitions, and automatically pruned from `tmpfs` once scanned.
+The `grammar` worker runs `test/fuzz/runtime/grammar.rb`, which uses [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz) (`ComposedEvolver` and `Evolver`) derived directly from CRuby's `parse.y` grammar to evolve structurally rich valid and near-valid Ruby programs (including multi-heredoc and nested-heredoc rewrites). Each unique snippet is prefixed with the 4-byte options header, written atomically to `/tmp/afl-tmpdir/grammar/seeds` on `tmpfs`, imported into `ldet` via AFL++'s `-F` foreign sync whenever it discovers new CFG edges or IJON parser/lexer state transitions, and automatically pruned from `tmpfs` once scanned. Because `ldet` writes an unmutated copy of each imported seed to `tmp/fuzz/afl/ldet/queue/id:NNNNNN,sync:seeds_0,src:<sha1>`, the original generated seed remains preserved in `ldet/queue/` even after `tmpfs` pruning, allowing `make fuzz-plot` to trace downstream queue entries and crashes all the way back to the exact `lrama-fuzz` seed.
 
 ### CmpLog and `pm_strncasecmp`
 
