@@ -1,10 +1,14 @@
 # frozen_string_literal: true
 
+require "base64"
+require "cgi"
 require "concurrent"
 require "digest"
 require "fileutils"
 require "open3"
 require "tmpdir"
+
+PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
 OUTPUT_DIR = "tmp/fuzz/afl"
 TESTCASES_DIR = "tmp/fuzz/triage"
@@ -80,9 +84,10 @@ end
 def c_array(input_file)
   raw = File.binread(input_file)
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
+  loupe_url = "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(source))}"
   bytes = source.bytes.map { |c| format("0x%02x", c) }.join(",")
   bytes = "0x00" if bytes.empty?
-  "/*\n#{escape_c_comment(source.dump)}\n*/\nstatic const uint8_t input[] = {#{bytes}};"
+  "/*\n#{escape_c_comment(source.dump)}\nPrism Loupe: #{escape_c_comment(loupe_url)}\n*/\nstatic const uint8_t input[] = {#{bytes}};"
 end
 
 def c_program(input, harness_code, crash_details)
