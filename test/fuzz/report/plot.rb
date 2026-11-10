@@ -57,6 +57,51 @@ rescue StandardError
   {}
 end
 
+def normalize_sync_source(src)
+  return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
+
+  src
+end
+
+def parse_generator_plot_data(path)
+  return [] unless File.exist?(path)
+
+  rows = []
+  File.foreach(path) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+
+    parts = line.split(",").map(&:strip)
+    next if parts.size < 4
+
+    rows << {
+      relative_time: parts[0].to_i,
+      files_created: parts[1].to_i,
+      files_per_sec: parts[2].to_f,
+      avg_files_per_sec: parts[3].to_f,
+      attempts_done: (parts[4] || parts[1]).to_i,
+      files_valid: parts[5].to_i,
+      files_invalid: parts[6].to_i,
+      corpus_count: parts[1].to_i,
+      execs_per_sec: parts[2].to_f,
+      total_execs: (parts[4] || parts[1]).to_i,
+      cycles_done: 0,
+      cur_item: 0,
+      pending_total: 0,
+      pending_favs: 0,
+      map_size: 0.0,
+      saved_crashes: 0,
+      saved_hangs: 0,
+      max_depth: 0,
+      edges_found: 0,
+      total_crashes: 0
+    }
+  end
+  rows
+rescue StandardError
+  []
+end
+
 def parse_plot_data(path)
   return [] unless File.exist?(path)
 
@@ -109,10 +154,10 @@ def parse_queue_origins(queue_dir)
     id = fname[3, 6].to_i
     max_id = id if id > max_id
     if fname =~ /,sync:([^,]+)/
-      src_name = Regexp.last_match(1)
+      src_name = normalize_sync_source(Regexp.last_match(1))
       item_kind[id] = :sync
       item_source[id] = src_name
-      if fname =~ /,src:(\d+)/
+      if fname =~ /,src:(\d{6})(?:[,+]|$)/
         src_end = Regexp.last_match(1).to_i + 1
         max_src_by_source[src_name] = src_end if src_end > max_src_by_source[src_name]
       end
@@ -308,6 +353,8 @@ def render_svg_chart(title:, subtitle:, series:, y_format: :compact, fill_area: 
       format_int(v.round)
     when :rate
       "#{format_compact(v)}/s"
+    when :file_rate
+      "#{format_compact(v)} files/s"
     else
       format_compact(v)
     end
@@ -427,16 +474,40 @@ end
 fuzzers = fuzzer_names.each_with_index.map do |name, idx|
   dir = File.join(afl_dir, name)
   stats = parse_fuzzer_stats(File.join(dir, "fuzzer_stats"))
-  raw_plot = parse_plot_data(File.join(dir, "plot_data"))
+  is_generator = stats["fuzzer_role"] == "generator"
+  raw_plot = if is_generator
+               parse_generator_plot_data(File.join(dir, "plot_data"))
+             else
+               parse_plot_data(File.join(dir, "plot_data"))
+             end
   origins = parse_queue_origins(File.join(dir, "queue"))
   synced_cursors = parse_synced_cursors(dir)
+
+  run_time = stats["run_time"]&.to_i || raw_plot.last&.dig(:relative_time) || 0
+  if is_generator && raw_plot.size < 2 && stats["files_created"]
+    fc = stats["files_created"].to_i
+    fps = (stats["files_per_sec"] || stats["avg_files_per_sec"]).to_f
+    avg_fps = (stats["avg_files_per_sec"] || fps).to_f
+    att = (stats["attempts_done"] || fc).to_i
+    fv = stats["files_valid"].to_i
+    fi = stats["files_invalid"].to_i
+    raw_plot = [
+      { relative_time: 0, files_created: 0, files_per_sec: fps, avg_files_per_sec: avg_fps, attempts_done: 0, files_valid: 0, files_invalid: 0, corpus_count: 0, execs_per_sec: fps, total_execs: 0, cycles_done: 0, cur_item: 0, pending_total: 0, pending_favs: 0, map_size: 0.0, saved_crashes: 0, saved_hangs: 0, max_depth: 0, edges_found: 0, total_crashes: 0 },
+      { relative_time: [run_time, 1].max, files_created: fc, files_per_sec: fps, avg_files_per_sec: avg_fps, attempts_done: att, files_valid: fv, files_invalid: fi, corpus_count: fc, execs_per_sec: fps, total_execs: att, cycles_done: 0, cur_item: 0, pending_total: 0, pending_favs: 0, map_size: 0.0, saved_crashes: 0, saved_hangs: 0, max_depth: 0, edges_found: 0, total_crashes: 0 }
+    ]
+  end
+
   sampled = downsample(raw_plot).map do |r|
     cc = r[:corpus_count]
-    r.merge(
-      synced_count: lookup_prefix(origins[:prefix_sync], cc),
-      local_count: lookup_prefix(origins[:prefix_local], cc),
-      seed_count: lookup_prefix(origins[:prefix_seed], cc)
-    )
+    if is_generator
+      r.merge(synced_count: 0, local_count: cc, seed_count: 0)
+    else
+      r.merge(
+        synced_count: lookup_prefix(origins[:prefix_sync], cc),
+        local_count: lookup_prefix(origins[:prefix_local], cc),
+        seed_count: lookup_prefix(origins[:prefix_seed], cc)
+      )
+    end
   end
 
   sched = stats["power_mode"] || stats["command_line"]&.[](/-p\s+(\S+)/, 1) || "default"
@@ -454,12 +525,23 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
   saved_hangs = stats["saved_hangs"]&.to_i || sampled.last&.dig(:saved_hangs) || 0
   cycles_done = stats["cycles_done"]&.to_i || sampled.last&.dig(:cycles_done) || 0
   max_depth = stats["max_depth"]&.to_i || sampled.last&.dig(:max_depth) || 0
-  run_time = stats["run_time"]&.to_i || sampled.last&.dig(:relative_time) || 0
   stability = stats["stability"] || "100.00%"
   banner = stats["afl_banner"] || "./build/fuzz"
 
+  files_created = (stats["files_created"] || corpus_count).to_i
+  pending_files = stats["pending_files"].to_i
+  max_pending_files = (stats["max_pending_files"] || "50000").to_i
+  files_pruned = stats["files_pruned"].to_i
+  files_per_sec = (stats["files_per_sec"] || stats["avg_files_per_sec"] || execs_per_sec).to_f
+  avg_files_per_sec = (stats["avg_files_per_sec"] || files_per_sec).to_f
+  attempts_done = (stats["attempts_done"] || execs_done).to_i
+  files_valid = stats["files_valid"].to_i
+  files_invalid = stats["files_invalid"].to_i
+  duplicates_skipped = stats["duplicates_skipped"].to_i
+
   {
     name: name,
+    role: is_generator ? :generator : :fuzzer,
     color: PALETTE[idx % PALETTE.size],
     sched: sched,
     banner: banner,
@@ -483,20 +565,32 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
     cycles_done: cycles_done,
     max_depth: max_depth,
     run_time: run_time,
-    stability: stability
+    stability: stability,
+    files_created: files_created,
+    pending_files: pending_files,
+    max_pending_files: max_pending_files,
+    files_pruned: files_pruned,
+    files_per_sec: files_per_sec,
+    avg_files_per_sec: avg_files_per_sec,
+    attempts_done: attempts_done,
+    files_valid: files_valid,
+    files_invalid: files_invalid,
+    duplicates_skipped: duplicates_skipped
   }
 end
 
 color_by_name = fuzzers.to_h { |f| [f[:name], f[:color]] }
+afl_fuzzers = fuzzers.reject { |f| f[:role] == :generator }
+gen_fuzzers = fuzzers.select { |f| f[:role] == :generator }
 
 # Compute Fleet Overview KPIs
-fleet_execs = fuzzers.sum { |f| f[:execs_done] }
-fleet_speed = fuzzers.sum { |f| f[:execs_per_sec] }
+fleet_execs = afl_fuzzers.sum { |f| f[:execs_done] }
+fleet_speed = afl_fuzzers.sum { |f| f[:execs_per_sec] }
 fleet_crashes = fuzzers.sum { |f| f[:saved_crashes] }
-fleet_hangs = fuzzers.sum { |f| f[:saved_hangs] }
-fleet_max_corpus = fuzzers.map { |f| f[:corpus_count] }.max || 0
+fleet_hangs = afl_fuzzers.sum { |f| f[:saved_hangs] }
+fleet_max_corpus = afl_fuzzers.map { |f| f[:corpus_count] }.max || 0
 fleet_max_runtime = fuzzers.map { |f| f[:run_time] }.max || 0
-main_fuzzer = fuzzers.find { |f| f[:name] == "main" } || fuzzers.first
+main_fuzzer = afl_fuzzers.find { |f| f[:name] == "main" } || afl_fuzzers.first || fuzzers.first
 
 # Compute snapshot sync progress of `main` across each peer queue (from main/.synced/<peer> + queue origins)
 main_name = main_fuzzer[:name]
@@ -509,6 +603,36 @@ fuzzers.each do |f|
   next if f[:name] == main_name
 
   peer_name = f[:name]
+  if f[:role] == :generator
+    intake_fuzzer = afl_fuzzers.max_by { |af| lookup_prefix(af[:origins][:by_source][peer_name] || [], af[:corpus_count]) }
+    if intake_fuzzer.nil? || lookup_prefix(intake_fuzzer[:origins][:by_source][peer_name] || [], intake_fuzzer[:corpus_count]).zero?
+      intake_fuzzer = afl_fuzzers.find { |af| af[:name] == "ldet" } || main_fuzzer
+    end
+    peer_total = f[:files_created]
+    imported_count = lookup_prefix(intake_fuzzer[:origins][:by_source][peer_name] || [], intake_fuzzer[:corpus_count])
+    tested_count = [peer_total, imported_count].max
+    rejected_count = [tested_count - imported_count, 0].max
+    yield_pct = tested_count > 0 ? (imported_count * 100.0 / tested_count) : 0.0
+    peer_sync_by_name[peer_name] = {
+      is_generator: true,
+      intake_fuzzer: intake_fuzzer,
+      intake_name: intake_fuzzer[:name],
+      peer_total: tested_count,
+      watermark: tested_count,
+      cursor: tested_count,
+      skipped_from_main: 0,
+      tested_by_main: tested_count,
+      imported_by_main: imported_count,
+      rejected_by_main: rejected_count,
+      unsynced_backlog: 0,
+      sync_pct: 100.0,
+      yield_pct: yield_pct,
+      peer_from_main_cursor: 0,
+      peer_from_main_pct: 0.0
+    }
+    next
+  end
+
   peer_total = f[:corpus_count]
   watermark = main_synced_cursors[peer_name] || 0
   in_flight = main_max_src[peer_name] || 0
@@ -530,6 +654,7 @@ fuzzers.each do |f|
   peer_from_main_pct = main_fuzzer[:corpus_count] > 0 ? (peer_from_main_cursor * 100.0 / main_fuzzer[:corpus_count]) : 100.0
 
   peer_sync_by_name[peer_name] = {
+    is_generator: false,
     peer_total: peer_total,
     watermark: watermark,
     cursor: cursor,
@@ -620,14 +745,14 @@ else
 end
 
 # Overview comparison charts
-overview_charts = [
+overview_chart_list = [
   render_svg_chart(
     title: "Edge Coverage (%)",
     subtitle: "Percentage of instrumented CFG edges reached over time (map_size)",
     y_format: :percent,
     zero_base: false,
     chart_id: "ov-cvg",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:map_size]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:map_size]] } } }
   ),
   render_svg_chart(
     title: "Edges Discovered",
@@ -635,7 +760,7 @@ overview_charts = [
     y_format: :int,
     zero_base: false,
     chart_id: "ov-edges",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:edges_found]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:edges_found]] } } }
   ),
   render_svg_chart(
     title: "Corpus Size Growth",
@@ -643,7 +768,7 @@ overview_charts = [
     y_format: :compact,
     zero_base: true,
     chart_id: "ov-corpus",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:corpus_count]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:corpus_count]] } } }
   ),
   render_svg_chart(
     title: "Execution Throughput (execs/sec)",
@@ -651,7 +776,7 @@ overview_charts = [
     y_format: :rate,
     zero_base: true,
     chart_id: "ov-speed",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:execs_per_sec]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:execs_per_sec]] } } }
   ),
   render_svg_chart(
     title: "Cumulative Executions",
@@ -659,7 +784,7 @@ overview_charts = [
     y_format: :compact,
     zero_base: true,
     chart_id: "ov-execs",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:total_execs]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:total_execs]] } } }
   ),
   render_svg_chart(
     title: "Pending Favored Queue",
@@ -667,7 +792,7 @@ overview_charts = [
     y_format: :compact,
     zero_base: true,
     chart_id: "ov-favs",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:pending_favs]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:pending_favs]] } } }
   ),
   render_svg_chart(
     title: "Synced Queue Items (Foreign Imports)",
@@ -675,7 +800,7 @@ overview_charts = [
     y_format: :compact,
     zero_base: true,
     chart_id: "ov-synced",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:synced_count]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:synced_count]] } } }
   ),
   render_svg_chart(
     title: "Locally Discovered Queue Items",
@@ -683,16 +808,52 @@ overview_charts = [
     y_format: :compact,
     zero_base: true,
     chart_id: "ov-local",
-    series: fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:local_count]] } } }
+    series: afl_fuzzers.map { |f| { name: f[:name], color: f[:color], points: f[:samples].map { |r| [r[:relative_time], r[:local_count]] } } }
   )
-].join("\n")
+]
 
-# Fleet summary table rows
-summary_rows_html = fuzzers.map do |f|
+if gen_fuzzers.any?
+  overview_chart_list << render_svg_chart(
+    title: "Grammar Seeds Imported (-F)",
+    subtitle: "Cumulative grammar-generated seeds imported into the fuzzer queue via foreign sync",
+    y_format: :int,
+    fill_area: true,
+    zero_base: true,
+    chart_id: "ov-gen-imports",
+    series: gen_fuzzers.map do |gf|
+      ps = peer_sync_by_name[gf[:name]]
+      intake = ps ? ps[:intake_fuzzer] : main_fuzzer
+      imp_prefix = intake[:origins][:by_source][gf[:name]] || []
+      {
+        name: "#{gf[:name]} -> #{intake[:name]}",
+        color: "#34d399",
+        points: intake[:samples].map { |r| [r[:relative_time], lookup_prefix(imp_prefix, r[:corpus_count])] }
+      }
+    end
+  )
+  overview_chart_list << render_svg_chart(
+    title: "Grammar File Creation Rate (files/sec)",
+    subtitle: "Seed file creation rate over time (rolling and cumulative average)",
+    y_format: :file_rate,
+    zero_base: true,
+    chart_id: "ov-gen-rate",
+    series: gen_fuzzers.flat_map do |gf|
+      [
+        { name: "#{gf[:name]} (files/s)", color: gf[:color], points: gf[:samples].map { |r| [r[:relative_time], r[:files_per_sec]] } },
+        { name: "#{gf[:name]} (avg)", color: "#38bdf8", points: gf[:samples].map { |r| [r[:relative_time], r[:avg_files_per_sec]] } }
+      ]
+    end
+  )
+end
+
+overview_charts = overview_chart_list.join("\n")
+
+# Fleet summary table rows (AFL++ fuzzers only; generators rendered in their own table below)
+summary_rows_html = afl_fuzzers.map do |f|
+  ps = peer_sync_by_name[f[:name]]
   edges_str = f[:total_edges] > 0 ? "#{format_int(f[:edges_found])} / #{format_int(f[:total_edges])}" : format_int(f[:edges_found])
   crash_cls = f[:saved_crashes] > 0 ? "badge-danger" : "badge-muted"
   hang_cls = f[:saved_hangs] > 0 ? "badge-warn" : "badge-muted"
-  ps = peer_sync_by_name[f[:name]]
   if ps
     main_sync_cell = "#{format_int(ps[:cursor])} / #{format_int(ps[:peer_total])} <span class=\"muted\">(#{format('%.0f%%', ps[:sync_pct])})</span>"
     main_yield_cell = "<strong>+#{format_int(ps[:imported_by_main])}</strong> / #{format_int(ps[:tested_by_main])} <span class=\"muted\">(#{format('%.1f%%', ps[:yield_pct])})</span>"
@@ -724,6 +885,60 @@ summary_rows_html = fuzzers.map do |f|
   HTML
 end.join("\n")
 
+generator_table_html = if gen_fuzzers.any?
+  gen_rows = gen_fuzzers.map do |gf|
+    ps = peer_sync_by_name[gf[:name]]
+    yield_cell = if ps
+                   "<strong>+#{format_int(ps[:imported_by_main])}</strong> / #{format_int(ps[:tested_by_main])} <span class=\"muted\">(#{format('%.1f%%', ps[:yield_pct])} into #{CGI.escapeHTML(ps[:intake_name])})</span>"
+                 else
+                   "<span class=\"muted\">&mdash;</span>"
+                 end
+    <<~ROW
+      <tr class="clickable-row" onclick="selectTab('#{CGI.escapeHTML(gf[:name])}')">
+        <td>
+          <span class="legend-dot" style="background:#{gf[:color]}"></span>
+          <strong>#{CGI.escapeHTML(gf[:name])}</strong>
+        </td>
+        <td><code>#{CGI.escapeHTML(File.basename(gf[:banner]))}</code></td>
+        <td><span class="sched-pill">#{CGI.escapeHTML(gf[:sched])}</span></td>
+        <td class="num">#{format_compact(gf[:files_per_sec])} files/s</td>
+        <td class="num">#{format_compact(gf[:avg_files_per_sec])} files/s</td>
+        <td class="num">#{format_int(gf[:pending_files])} <span class="muted">/ #{format_int(gf[:max_pending_files])}</span></td>
+        <td class="num">#{format_int(gf[:files_created])}</td>
+        <td class="num">#{format_int(gf[:files_pruned])}</td>
+        <td class="num">#{format_int(gf[:duplicates_skipped])}</td>
+        <td class="num">#{yield_cell}</td>
+      </tr>
+    ROW
+  end.join("\n")
+
+  <<~GEN_TABLE
+    <div class="table-card" style="margin-top: 18px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Seed Generator</th>
+            <th>Engine</th>
+            <th>Mode</th>
+            <th class="num">Rate</th>
+            <th class="num">Avg Rate</th>
+            <th class="num">Pending</th>
+            <th class="num">Created</th>
+            <th class="num">Pruned</th>
+            <th class="num">Duplicates</th>
+            <th class="num">Foreign Sync Yield (-F)</th>
+          </tr>
+        </thead>
+        <tbody>
+          #{gen_rows}
+        </tbody>
+      </table>
+    </div>
+  GEN_TABLE
+else
+  ""
+end
+
 # Per-fuzzer tab buttons and panels
 tab_buttons_html = +%(<button class="tab-btn active" data-tab="overview" onclick="selectTab('overview')">Fleet Overview (#{fuzzers.size})</button>\n)
 tab_panels_html = +""
@@ -741,6 +956,118 @@ fuzzers.each do |f|
   HTML
 
   s = f[:samples]
+  cmd_line = f[:stats]["command_line"] || ""
+
+  if f[:role] == :generator
+    ps = peer_sync_by_name[name]
+    intake = ps ? ps[:intake_fuzzer] : main_fuzzer
+    intake_name = intake[:name]
+    imp_prefix = intake[:origins][:by_source][name] || []
+    unique_pct = f[:attempts_done] > 0 ? (f[:files_created] * 100.0 / f[:attempts_done]) : 100.0
+    gen_charts = [
+      render_svg_chart(
+        title: "Cumulative Files Created",
+        subtitle: "Unique seed files written to disk vs. total generation attempts",
+        y_format: :compact,
+        fill_area: true,
+        zero_base: true,
+        chart_id: "#{name}-files",
+        series: [
+          { name: "files_created", color: f[:color], points: s.map { |r| [r[:relative_time], r[:files_created]] } },
+          { name: "attempts_done", color: "#9ca3af", points: s.map { |r| [r[:relative_time], r[:attempts_done]] } }
+        ]
+      ),
+      render_svg_chart(
+        title: "File Creation Rate (files/sec)",
+        subtitle: "Seed file creation rate over time (rolling interval and cumulative average)",
+        y_format: :file_rate,
+        fill_area: true,
+        zero_base: true,
+        chart_id: "#{name}-rate",
+        series: [
+          { name: "files_per_sec", color: "#a78bfa", points: s.map { |r| [r[:relative_time], r[:files_per_sec]] } },
+          { name: "avg_files_per_sec", color: "#38bdf8", points: s.map { |r| [r[:relative_time], r[:avg_files_per_sec]] } }
+        ]
+      ),
+      render_svg_chart(
+        title: "Valid vs. Invalid Generated Files",
+        subtitle: "Breakdown of syntactically valid vs. error-injected Ruby seeds created",
+        y_format: :compact,
+        fill_area: false,
+        zero_base: true,
+        chart_id: "#{name}-validity",
+        series: [
+          { name: "files_valid", color: "#34d399", points: s.map { |r| [r[:relative_time], r[:files_valid]] } },
+          { name: "files_invalid", color: "#fbbf24", points: s.map { |r| [r[:relative_time], r[:files_invalid]] } }
+        ]
+      ),
+      render_svg_chart(
+        title: "Imports into #{intake_name} Queue",
+        subtitle: "Cumulative #{name} seed files imported by #{intake_name} via -F foreign sync",
+        y_format: :compact,
+        fill_area: true,
+        zero_base: true,
+        chart_id: "#{name}-imports",
+        series: [
+          {
+            name: "imported_by_#{intake_name}",
+            color: "#34d399",
+            points: intake[:samples].map { |r| [r[:relative_time], lookup_prefix(imp_prefix, r[:corpus_count])] }
+          }
+        ]
+      )
+    ].join("\n")
+
+    tab_panels_html << <<~HTML
+      <section id="tab-#{safe_name}" class="tab-panel">
+        <div class="fuzzer-banner">
+          <div>
+            <h2><span class="legend-dot" style="background:#{f[:color]}"></span> #{safe_name}</h2>
+            <p class="cmd-line"><code>#{CGI.escapeHTML(cmd_line)}</code></p>
+          </div>
+          <div class="fuzzer-meta">
+            <span class="sched-pill">Role: Seed Generator (#{CGI.escapeHTML(f[:sched])})</span>
+            <span class="sched-pill">Runtime: #{format_duration(f[:run_time])}</span>
+            <span class="sched-pill">Samples: #{format_int(f[:sample_count])}</span>
+          </div>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">Files Created</div>
+            <div class="kpi-value">#{format_int(f[:files_created])}</div>
+            <div class="kpi-sub">#{format("%.1f%%", unique_pct)} unique of #{format_int(f[:attempts_done])} generated (#{format_int(f[:duplicates_skipped])} dup)</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">File Creation Rate</div>
+            <div class="kpi-value">#{format_compact(f[:files_per_sec])} files/s</div>
+            <div class="kpi-sub">avg #{format_compact(f[:avg_files_per_sec])} files/s over #{format_duration(f[:run_time])}</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Valid / Invalid Split</div>
+            <div class="kpi-value">#{format_int(f[:files_valid])} / #{format_int(f[:files_invalid])}</div>
+            <div class="kpi-sub">valid vs. mutated/invalid Ruby seeds</div>
+          </div>
+          #{if ps
+              <<~SYNC_KPI
+                <div class="kpi-card">
+                  <div class="kpi-label">Imported by #{CGI.escapeHTML(intake_name)}</div>
+                  <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
+                  <div class="kpi-sub">foreign sync (-F) into #{CGI.escapeHTML(intake_name)} queue</div>
+                </div>
+              SYNC_KPI
+            else
+              ""
+            end}
+        </div>
+
+        <div class="charts-grid">
+          #{gen_charts}
+        </div>
+      </section>
+    HTML
+    next
+  end
   fuzzer_charts = [
     render_svg_chart(
       title: "Coverage & Edges Discovered",
@@ -1387,7 +1714,7 @@ html = <<~HTML
         <div class="kpi-grid">
           <div class="kpi-card">
             <div class="kpi-label">Fuzzer Workers</div>
-            <div class="kpi-value">#{fuzzers.size}</div>
+            <div class="kpi-value">#{afl_fuzzers.size}</div>
             <div class="kpi-sub">Uptime #{format_duration(fleet_max_runtime)}</div>
           </div>
           <div class="kpi-card">
@@ -1403,8 +1730,21 @@ html = <<~HTML
           <div class="kpi-card">
             <div class="kpi-label">Max Queue Size</div>
             <div class="kpi-value">#{format_int(fleet_max_corpus)}</div>
-            <div class="kpi-sub">across all workers</div>
+            <div class="kpi-sub">across AFL++ workers</div>
           </div>
+          #{if gen_fuzzers.any?
+              gen_total_files = gen_fuzzers.sum { |gf| gf[:files_created] }
+              gen_total_rate = gen_fuzzers.sum { |gf| gf[:files_per_sec] }
+              <<~GEN_KPI
+                <div class="kpi-card">
+                  <div class="kpi-label">Grammar Seeds</div>
+                  <div class="kpi-value">#{format_int(gen_total_files)}</div>
+                  <div class="kpi-sub">#{format_compact(gen_total_rate)} files/s</div>
+                </div>
+              GEN_KPI
+            else
+              ""
+            end}
           <div class="kpi-card">
             <div class="kpi-label">Saved Crashes</div>
             <div class="kpi-value #{fleet_crashes > 0 ? 'text-danger' : ''}">#{fleet_crashes}</div>
@@ -1444,6 +1784,8 @@ html = <<~HTML
             </tbody>
           </table>
         </div>
+
+        #{generator_table_html}
       </section>
 
       #{tab_panels_html}
