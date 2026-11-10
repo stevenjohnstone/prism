@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -x
 
 AFL_DIR=${1:-./tmp/fuzz/afl}
 CORPUS_DIR=${2:-./tmp/fuzz/corpus}
@@ -17,6 +17,7 @@ fi
 export AFL_AUTORESUME=1
 export AFL_FUZZER_STATS_UPDATE_INTERVAL=1
 export AFL_FUZZER_LOOPCOUNT=10000
+export AFL_SYNC_TIME=2
 
 FUZZ_MAX_ALLOCATED=${FUZZ_MAX_ALLOCATED:-128}
 FUZZ_HARD_RSS_LIMIT=$(( FUZZ_MAX_ALLOCATED * 16 ))
@@ -27,10 +28,6 @@ FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_M
 cleanup() {
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         bash ./test/fuzz/runtime/kill.sh "$SESSION"
-    fi
-    if [ -d "/tmp/afl-tmpdir/grammar/trees" ] && [ -d "$AFL_DIR/grammar" ]; then
-        rm -rf "$AFL_DIR/.grammar-trees"
-        cp -r "/tmp/afl-tmpdir/grammar/trees" "$AFL_DIR/.grammar-trees"
     fi
     exit 0
 }
@@ -85,21 +82,26 @@ add_worker() {
     WORKER_CMDS+=("/bin/bash -c 'AFL_TMPDIR=/tmp/afl-tmpdir/$name $cmd'")
 }
 
+mkdir -p "/tmp/afl-tmpdir/grammar/seeds"
+
+# When ldet (worker 3) is active, let ldet (-M ldet -F ...) ingest grammar seeds
+# so IJON state-transition coverage + fast native execution filter them before
+# syncing winners to main, msan, and SAND workers; fall back to main when < 4 workers.
+if [ "$FUZZ_WORKERS" -ge 4 ]; then
+    MAIN_FOREIGN_FLAGS=""
+    LDET_SYNC_FLAGS="-M ldet -F /tmp/afl-tmpdir/grammar/seeds"
+else
+    MAIN_FOREIGN_FLAGS="-F /tmp/afl-tmpdir/grammar/seeds"
+    LDET_SYNC_FLAGS="-S ldet"
+fi
+
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
-            add_worker "main" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -M main -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
+            add_worker "main" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
             ;;
         1)
-            mkdir -p "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees"
-            if [ -f "$AFL_DIR/grammar/fuzzer_stats" ] && [ -d "$AFL_DIR/.grammar-trees" ]; then
-                cp -r "$AFL_DIR/.grammar-trees/." "/tmp/afl-tmpdir/grammar/trees/"
-                printf '\x00\x00\x00\x001\n' > "/tmp/afl-tmpdir/grammar/seeds/seed_1"
-            else
-                rm -rf "$AFL_DIR/grammar" "$AFL_DIR/.grammar-trees"
-                ./build/grammar_generator-ruby 500 500 "/tmp/afl-tmpdir/grammar/seeds" "/tmp/afl-tmpdir/grammar/trees" >/dev/null
-            fi
-            add_worker "grammar" "ulimit -v 4194304 && AFL_NO_SYNC=1 AFL_CRASH_EXITCODE=23 AFL_CUSTOM_MUTATOR_ONLY=1 AFL_CUSTOM_MUTATOR_LIBRARY=./build/libgrammarmutator-ruby.so afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/grammar/seeds -o $AFL_DIR -S grammar -p explore -- ./build/fuzz.native"
+            add_worker "grammar" "ulimit -v 4194304 && ruby ./test/fuzz/runtime/grammar.rb '$AFL_DIR' '/tmp/afl-tmpdir/grammar/seeds'"
             ;;
         2)
             prepare_seed_shard "msan" 0
@@ -107,7 +109,7 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             ;;
         3)
             prepare_seed_shard "ldet" 1
-            add_worker "ldet" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ldet/seeds -o $AFL_DIR -S ldet -p explore -- ./build/fuzz.ldet"
+            add_worker "ldet" "ulimit -v 4194304 && AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ldet/seeds -o $AFL_DIR $LDET_SYNC_FLAGS -p explore -- ./build/fuzz.ldet"
             ;;
         *)
             idx=$(( i - 4 ))

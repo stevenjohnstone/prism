@@ -12,8 +12,37 @@ YELLOW = "\e[33m"
 CYAN = "\e[36m"
 RESET = "\e[0m"
 
+GRAMMAR_SEEDS_DIR = "/tmp/afl-tmpdir/grammar/seeds"
+
 def format_int(num)
   num.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+end
+
+def format_fit(num, width)
+  full = format_int(num)
+  return full if full.length <= width
+
+  n = num.to_f
+  if n >= 1_000_000_000
+    format("%.1fB", n / 1_000_000_000.0)
+  elsif n >= 1_000_000
+    s = format("%.2fM", n / 1_000_000.0)
+    s.length <= width ? s : format("%.1fM", n / 1_000_000.0)
+  elsif n >= 1_000
+    s = format("%.1fK", n / 1_000.0)
+    s.length <= width ? s : format("%dK", (n / 1_000.0).round)
+  else
+    full
+  end
+end
+
+def format_rate(rate)
+  r = rate.to_f
+  if r >= 10.0
+    "#{format_int(r.round)}/s"
+  else
+    format("%.1f/s", r)
+  end
 end
 
 def format_duration(seconds)
@@ -31,6 +60,12 @@ def format_duration(seconds)
   else
     format("%ds", secs)
   end
+end
+
+def normalize_origin(origin)
+  return "grammar" if origin =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
+
+  origin
 end
 
 def pid_alive?(pid)
@@ -58,67 +93,74 @@ rescue StandardError
 end
 
 def compute_contributions(afl_dir)
-  shared = Hash.new(0)
-  descendants = Hash.new(0)
-  main_origin = {}
+  origin = Hash.new { |h, k| h[k] = {} }
+  sync_items = []
+  local_items = []
+  grammar_shared_srcs = {}
 
-  main_q_dir = File.join(afl_dir, "main", "queue")
-  main_q = Dir.exist?(main_q_dir) ? Dir.children(main_q_dir).sort : []
-  main_q.each do |f|
-    id = f[/^id:(\d+)/, 1]
-    next unless id
-
-    if f =~ /sync:([^,]+)/
-      origin = Regexp.last_match(1)
-      main_origin[id] = origin
-      shared[origin] += 1
-    elsif !f.include?("orig:")
-      srcs = f[/src:([0-9+]+)/, 1]&.split("+") || []
-      parent_origins = srcs.filter_map { |s| main_origin[s] }.uniq
-      non_main = parent_origins.reject { |o| o == "main" }
-      if non_main.any?
-        non_main.each { |o| descendants[o] += 1 }
-        main_origin[id] = non_main.first
-      else
-        main_origin[id] = "main"
-      end
-    end
-  end
-
-  main_shared_ids = {}
   Dir.glob(File.join(afl_dir, "*/queue")).each do |qdir|
     fuzzer = File.basename(File.dirname(qdir))
-    next if fuzzer == "main"
-
-    local_origin = {}
     entries = Dir.children(qdir).sort rescue next
     entries.each do |f|
       id = f[/^id:(\d+)/, 1]
       next unless id
 
-      if f =~ /sync:main,src:(\d+)/
-        src_id = Regexp.last_match(1)
-        orig = main_origin[src_id]
-        local_origin[id] = orig if orig
-        main_shared_ids[src_id] = true if orig == "main"
-      elsif !f.include?("orig:") && !f.include?("sync:")
-        srcs = f[/src:([0-9+]+)/, 1]&.split("+") || []
-        p_origins = srcs.filter_map { |s| local_origin[s] }.uniq.reject { |o| o == fuzzer }
-        if p_origins.any?
-          p_origins.each { |o| descendants[o] += 1 }
-          local_origin[id] = p_origins.first
+      if f.include?("orig:")
+        origin[fuzzer][id] = :seed
+      elsif f =~ /sync:([^,]+),src:([^,]+)/
+        peer = normalize_origin(Regexp.last_match(1))
+        src_ref = Regexp.last_match(2)
+        if peer == "grammar"
+          origin[fuzzer][id] = "grammar"
+          grammar_shared_srcs[src_ref] = true
+        else
+          origin[fuzzer][id] = peer
+          sync_items << [fuzzer, id, peer, src_ref]
         end
+      else
+        srcs = f[/src:([0-9+]+)/, 1]&.split("+") || []
+        origin[fuzzer][id] = fuzzer
+        local_items << [fuzzer, id, srcs]
       end
     end
   end
-  shared["main"] = main_shared_ids.size
+
+  # Propagate transitive origins across multi-hop syncs (e.g. grammar -> ldet -> main -> main-2)
+  3.times do
+    sync_items.each do |fuzzer, id, peer, src_ref|
+      src_orig = origin[peer][src_ref]
+      origin[fuzzer][id] = (src_orig && src_orig != :seed) ? src_orig : peer
+    end
+    local_items.each do |fuzzer, id, srcs|
+      foreign = srcs.filter_map { |s| origin[fuzzer][s] }.reject { |o| o == :seed || o == fuzzer }.uniq
+      origin[fuzzer][id] = foreign.first || fuzzer
+    end
+  end
+
+  shared_ids = Hash.new { |h, k| h[k] = {} }
+  sync_items.each do |_fuzzer, _id, peer, src_ref|
+    src_orig = origin[peer][src_ref]
+    if src_orig.nil? || src_orig == :seed || src_orig == peer
+      shared_ids[peer][src_ref] = true
+    end
+  end
+
+  shared = Hash.new(0)
+  shared_ids.each { |peer, ids| shared[peer] = ids.size }
+  shared["grammar"] = grammar_shared_srcs.size
+
+  descendants = Hash.new(0)
+  local_items.each do |fuzzer, _id, srcs|
+    foreign = srcs.filter_map { |s| origin[fuzzer][s] }.reject { |o| o == :seed || o == fuzzer }.uniq
+    foreign.each { |o| descendants[o] += 1 }
+  end
 
   { shared: shared, descendants: descendants }
 rescue StandardError
   { shared: Hash.new(0), descendants: Hash.new(0) }
 end
 
-def collect_fuzzer_rows(afl_dir, expected_fuzzers)
+def collect_fuzzer_rows(afl_dir, expected_fuzzers, started_at, now)
   discovered = Dir.glob(File.join(afl_dir, "*/fuzzer_stats")).map { |p| File.basename(File.dirname(p)) }
   names = (expected_fuzzers + discovered).uniq
 
@@ -129,12 +171,31 @@ def collect_fuzzer_rows(afl_dir, expected_fuzzers)
       pid = stats["fuzzer_pid"].to_i
       alive = pid_alive?(pid)
       sched = stats["power_mode"] || stats["command_line"]&.[](/-p\s+(\S+)/, 1) || "fast"
+      is_generator = stats["fuzzer_role"] == "generator"
+      files_created = (stats["files_created"] || stats["corpus_count"]).to_i
+      start_t = stats["start_time"].to_i
+      elapsed = start_t > 0 ? [now - start_t, 1].max : [now - started_at, 1].max
+      avg_files_rate = if stats["avg_files_per_sec"]
+                         stats["avg_files_per_sec"].to_f
+                       else
+                         files_created.to_f / elapsed
+                       end
+      files_rate = stats["files_per_sec"] ? stats["files_per_sec"].to_f : avg_files_rate
       {
         name: name,
+        role: is_generator ? :generator : :fuzzer,
         state: alive ? :alive : :dead,
         sched: sched,
         execs_per_sec: stats["execs_per_sec"].to_f,
         execs_done: stats["execs_done"].to_i,
+        attempts_done: (stats["attempts_done"] || stats["execs_done"]).to_i,
+        files_created: files_created,
+        pending_files: stats["pending_files"].to_i,
+        max_pending_files: (stats["max_pending_files"] || "50000").to_i,
+        files_pruned: stats["files_pruned"].to_i,
+        duplicates_skipped: stats["duplicates_skipped"].to_i,
+        files_per_sec: files_rate,
+        avg_files_per_sec: avg_files_rate,
         cycles_done: stats["cycles_done"].to_i,
         corpus_count: stats["corpus_count"].to_i,
         pending_total: stats["pending_total"].to_i,
@@ -145,15 +206,55 @@ def collect_fuzzer_rows(afl_dir, expected_fuzzers)
         saved_crashes: stats["saved_crashes"].to_i,
         saved_hangs: stats["saved_hangs"].to_i,
         last_find: stats["last_find"].to_i,
-        start_time: stats["start_time"].to_i
+        start_time: start_t
+      }
+    elsif name == "grammar" && Dir.exist?(GRAMMAR_SEEDS_DIR)
+      pending = Dir.children(GRAMMAR_SEEDS_DIR).count { |f| !f.start_with?(".") } rescue 0
+      elapsed = [now - started_at, 1].max
+      rate = pending.to_f / elapsed
+      {
+        name: name,
+        role: :generator,
+        state: pending > 0 ? :alive : :starting,
+        sched: "lrama",
+        execs_per_sec: 0.0,
+        execs_done: 0,
+        attempts_done: pending,
+        files_created: pending,
+        pending_files: pending,
+        max_pending_files: 50_000,
+        files_pruned: 0,
+        duplicates_skipped: 0,
+        files_per_sec: rate,
+        avg_files_per_sec: rate,
+        cycles_done: 0,
+        corpus_count: pending,
+        pending_total: 0,
+        pending_favs: 0,
+        bitmap_cvg: "-",
+        edges_found: 0,
+        total_edges: 0,
+        saved_crashes: 0,
+        saved_hangs: 0,
+        last_find: pending > 0 ? now : 0,
+        start_time: started_at
       }
     else
       {
         name: name,
+        role: name == "grammar" ? :generator : :fuzzer,
         state: :starting,
-        sched: "-",
+        sched: name == "grammar" ? "lrama" : "-",
         execs_per_sec: 0.0,
         execs_done: 0,
+        attempts_done: 0,
+        files_created: 0,
+        pending_files: 0,
+        max_pending_files: 50_000,
+        files_pruned: 0,
+        duplicates_skipped: 0,
+        files_per_sec: 0.0,
+        avg_files_per_sec: 0.0,
         cycles_done: 0,
         corpus_count: 0,
         pending_total: 0,
@@ -170,17 +271,34 @@ def collect_fuzzer_rows(afl_dir, expected_fuzzers)
   end
 end
 
+def state_badge(state, pad = nil)
+  label = case state
+          when :alive then "RUNNING"
+          when :starting then "STARTING"
+          else "STOPPED"
+          end
+  color = case state
+          when :alive then GREEN
+          when :starting then YELLOW
+          else RED
+          end
+  formatted = pad ? format("%-#{pad}s", label) : label
+  "#{color}#{formatted}#{RESET}"
+end
+
 def render(afl_dir, expected_fuzzers, started_at, page, contribs)
   now = Time.now.to_i
-  rows = collect_fuzzer_rows(afl_dir, expected_fuzzers)
+  rows = collect_fuzzer_rows(afl_dir, expected_fuzzers, started_at, now)
+  afl_rows = rows.reject { |r| r[:role] == :generator }
+  gen_rows = rows.select { |r| r[:role] == :generator }
 
-  alive_count = rows.count { |r| r[:state] == :alive }
-  total_execs_sec = rows.select { |r| r[:state] == :alive }.sum { |r| r[:execs_per_sec] }
-  total_execs = rows.sum { |r| r[:execs_done] }
-  max_corpus = rows.map { |r| r[:corpus_count] }.max || 0
-  max_cvg = rows.map { |r| r[:bitmap_cvg].to_f }.max || 0.0
+  alive_count = afl_rows.count { |r| r[:state] == :alive }
+  total_execs_sec = afl_rows.select { |r| r[:state] == :alive }.sum { |r| r[:execs_per_sec] }
+  total_execs = afl_rows.sum { |r| r[:execs_done] }
+  max_corpus = afl_rows.map { |r| r[:corpus_count] }.max || 0
+  max_cvg = afl_rows.map { |r| r[:bitmap_cvg].to_f }.max || 0.0
   total_crashes = rows.sum { |r| r[:saved_crashes] }
-  total_hangs = rows.sum { |r| r[:saved_hangs] }
+  total_hangs = afl_rows.sum { |r| r[:saved_hangs] }
   earliest_start = rows.map { |r| r[:start_time] }.reject(&:zero?).min || started_at
   uptime = format_duration(now - earliest_start)
 
@@ -194,14 +312,14 @@ def render(afl_dir, expected_fuzzers, started_at, page, contribs)
   crash_color = total_crashes > 0 ? "#{BOLD}#{RED}" : GREEN
   hang_color = total_hangs > 0 ? "#{BOLD}#{YELLOW}" : GREEN
   out << format(
-    "  #{BOLD}Workers:#{RESET} %d/%d alive   " \
+    "  #{BOLD}Fuzzers:#{RESET} %d/%d alive   " \
     "#{BOLD}Speed:#{RESET} %s/s   " \
     "#{BOLD}Execs:#{RESET} %s   " \
     "#{BOLD}Corpus:#{RESET} %s   " \
     "#{BOLD}Max Cov:#{RESET} %.2f%%   " \
     "#{BOLD}Crashes:#{RESET} #{crash_color}%d#{RESET}   " \
     "#{BOLD}Hangs:#{RESET} #{hang_color}%d#{RESET}\n\n",
-    alive_count, rows.size,
+    alive_count, afl_rows.size,
     format_int(total_execs_sec.round),
     format_int(total_execs),
     format_int(max_corpus),
@@ -225,15 +343,8 @@ def render(afl_dir, expected_fuzzers, started_at, page, contribs)
   out << "#{BOLD}#{header}#{RESET}\n"
   out << ("-" * header.length) << "\n"
 
-  rows.each do |r|
-    state_str = case r[:state]
-                when :alive
-                  "#{GREEN}#{format('%-9s', 'RUNNING')}#{RESET}"
-                when :starting
-                  "#{YELLOW}#{format('%-9s', 'STARTING')}#{RESET}"
-                else
-                  "#{RED}#{format('%-9s', 'STOPPED')}#{RESET}"
-                end
+  afl_rows.each do |r|
+    state_str = state_badge(r[:state], 9)
 
     if page == 1
       crashes_str = if r[:saved_crashes] > 0
@@ -294,6 +405,75 @@ def render(afl_dir, expected_fuzzers, started_at, page, contribs)
   end
 
   out << ("-" * header.length) << "\n"
+
+  if gen_rows.any?
+    gen_header = if page == 1
+                   format(
+                     "%-10s %-9s %-8s %12s %8s %17s %8s %6s",
+                     "GENERATOR", "STATE", "MODE", "FILES/S", "CREATED", "PENDING", "CRASHES", "PRUNED"
+                   )
+                 else
+                   format(
+                     "%-10s %-9s %-8s %12s %14s %6s %8s %8s %11s %14s %8s %8s",
+                     "GENERATOR", "STATE", "MODE", "FILES/S", "ATTEMPTS", "UNIQ %",
+                     "CREATED", "SHARED", "DESCENDANTS", "LAST FIND", "PENDING", "PRUNED"
+                   )
+                 end
+    out << "\n#{BOLD}#{gen_header}#{RESET}\n"
+    out << ("-" * gen_header.length) << "\n"
+
+    gen_rows.each do |g|
+      state_str = state_badge(g[:state], 9)
+      pend_raw = format("%17s", "#{format_int(g[:pending_files])} / #{format_int(g[:max_pending_files])}")
+      pend_str = g[:pending_files] >= g[:max_pending_files] ? "#{YELLOW}#{pend_raw}#{RESET}" : pend_raw
+      crashes_str = if g[:saved_crashes] > 0
+                      "#{BOLD}#{RED}#{format('%8d', g[:saved_crashes])}#{RESET}"
+                    else
+                      format("%8d", 0)
+                    end
+
+      if page == 1
+        out << format(
+          "%-10s %s %-8s %12s %8s %s %s %6s\n",
+          g[:name],
+          state_str,
+          g[:sched],
+          format_rate(g[:files_per_sec]),
+          format_fit(g[:files_created], 8),
+          pend_str,
+          crashes_str,
+          format_fit(g[:files_pruned], 6)
+        )
+      else
+        last_find_str = if g[:last_find] > 0 && now >= g[:last_find]
+                          "#{format_duration(now - g[:last_find])} ago"
+                        else
+                          "-"
+                        end
+        uniq_pct = g[:attempts_done] > 0 ? format("%.1f%%", g[:files_created] * 100.0 / g[:attempts_done]) : "-"
+        shared_count = contribs[:shared][g[:name]] || 0
+        desc_count = contribs[:descendants][g[:name]] || 0
+
+        out << format(
+          "%-10s %s %-8s %12s %14s %6s %8s %8s %11s %14s %8s %8s\n",
+          g[:name],
+          state_str,
+          g[:sched],
+          format_rate(g[:files_per_sec]),
+          format_fit(g[:attempts_done], 14),
+          uniq_pct,
+          format_fit(g[:files_created], 8),
+          format_fit(shared_count, 8),
+          format_fit(desc_count, 11),
+          last_find_str,
+          format_fit(g[:pending_files], 8),
+          format_fit(g[:files_pruned], 8)
+        )
+      end
+    end
+    out << ("-" * gen_header.length) << "\n"
+  end
+
   out << "#{DIM}[Tab/Space/1/2] Switch page   [Ctrl+B, w] Fuzzer window   [Ctrl+B, n/p] Next/Prev   [Ctrl+B, 0] Dashboard   [Ctrl+B, d] Detach   [Ctrl+C] Stop all#{RESET}\n"
   $stdout.write(out)
   $stdout.flush
@@ -346,4 +526,3 @@ loop do
     end
   end
 end
-

@@ -14,8 +14,6 @@ test/fuzz
 ├── dict                          an AFL++ dictionary containing Ruby tokens
 ├── docker
 │   └── Dockerfile                for building a container with the fuzzer toolchain
-├── grammar
-│   └── ruby.json                 Ruby grammar for AFL++ Grammar-Mutator
 ├── harness
 │   ├── coverage.c                driver for coverage collection
 │   ├── fuzz.c                    generic entrypoint for fuzzing
@@ -26,14 +24,13 @@ test/fuzz
 ├── patches
 │   ├── aflplusplus.md            explanation of the AFL++ sanitizer coverage patch
 │   ├── aflplusplus.patch         patch for AFL++ LTO/PCGUARD passes to skip sanitizer checks
-│   ├── grammar-mutator.md        explanation of the Grammar-Mutator patch
-│   ├── grammar-mutator.patch     patch for AFL++ Grammar-Mutator
 │   └── test_afl_patch.sh         verifies sanitizer-free AFL++ coverage guidance
 ├── report
 │   ├── coverage.sh               generates LCOV, HTML, and text source coverage reports
 │   └── plot.rb                   generates interactive HTML graphs from AFL++ telemetry
 ├── runtime
 │   ├── corpus.rb                 prepares and minimizes the initial seed corpus
+│   ├── grammar.rb                generates grammar-guided Ruby seeds via lrama-fuzz
 │   ├── kill.sh                   manages graceful shutdown of the tmux session
 │   ├── run.sh                    launches the parallel fuzzing fleet in tmux
 │   └── status.rb                 live terminal dashboard for the fuzzer fleet
@@ -220,12 +217,12 @@ Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json`
 
 ### Worker Fleet Architecture
 
-`test/fuzz/runtime/run.sh` launches `FUZZ_WORKERS` instances of `afl-fuzz` that share queues through `tmp/fuzz/afl`:
+`test/fuzz/runtime/run.sh` launches `FUZZ_WORKERS` workers that coordinate through `tmp/fuzz/afl`:
 
-1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN worker with CmpLog enabled, seeded with the full minimized fixture corpus.
-2. **`grammar`** (`build/fuzz.native` + `build/libgrammarmutator-ruby.so`): Structure-aware grammar mutator using `test/fuzz/grammar/ruby.json`. Runs with `AFL_NO_SYNC=1` so sync is one-way (`grammar` feeds `main`, without pulling raw byte-mutated inputs that lack grammar trees).
+1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN worker (`-M main`) with CmpLog enabled, seeded with the full minimized fixture corpus.
+2. **`grammar`** (`test/fuzz/runtime/grammar.rb`): Structure-aware Ruby seed generator powered by [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz), continuously feeding `ldet` via foreign sync.
 3. **`msan`** (`build/fuzz.msan`): Runs the full `-DSLOW` pipeline under MemorySanitizer to catch uninitialized memory reads and out-of-bounds reads across parsing, serialization, pretty-printing, and JSON dumping.
-4. **`ldet`** (`build/fuzz.ldet`): Fast native worker with custom leak detection and IJON state-guided instrumentation enabled.
+4. **`ldet`** (`build/fuzz.ldet`): Fast native worker (`-M ldet -F /tmp/afl-tmpdir/grammar/seeds`) with custom leak detection and IJON state-guided instrumentation enabled, acting as the intake filter for grammar-generated seeds and sharing IJON/CFG discoveries with `main`, `msan`, and secondary workers.
 5. **`main-2 .. main-N`** (`build/fuzz.native` + `-w ./build/fuzz.sand`): Secondary workers running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase`). They execute mutations at native speed without sanitizer overhead, and only forward inputs that discover new coverage to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`). Secondary workers cycle through different AFL++ power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), mutation modes (MOpt `-L 0`, `-P explore/exploit`, `-Z`), and disjoint shards of the initial seed corpus.
 
 ### Fast Leak Detection (`PRISM_XALLOCATOR`)
@@ -244,13 +241,11 @@ During `make fuzz-build`, `test/fuzz/Makefile` applies [`test/fuzz/patches/aflpl
 
 See [`test/fuzz/patches/aflplusplus.md`](../test/fuzz/patches/aflplusplus.md) for a detailed walkthrough of the patch and `make fuzz-test` verification suite.
 
-### Grammar-Mutator (`test/fuzz/grammar/ruby.json` and `test/fuzz/patches/grammar-mutator.patch`)
+### Grammar-Guided Seed Generation (`lrama-fuzz` and `test/fuzz/runtime/grammar.rb`)
 
-Byte-level mutations struggle to discover bugs that require syntactically rich Ruby constructs (such as nested heredocs, pattern matching, or endless method definitions inside blocks). The `grammar` worker uses AFL++'s [Grammar-Mutator](https://github.com/AFLplusplus/Grammar-Mutator) with a custom Ruby grammar (`test/fuzz/grammar/ruby.json`) that generates both the 4-byte option header and valid/near-valid Ruby AST structures.
+Byte-level mutations struggle to discover bugs that require syntactically rich Ruby constructs (such as nested heredocs, pattern matching, or endless method definitions inside blocks).
 
-We apply [`test/fuzz/patches/grammar-mutator.patch`](../test/fuzz/patches/grammar-mutator.patch) to fix multi-byte UTF-8 token generation, keep serialized `.tree` files in `tmpfs` (`/tmp/afl-tmpdir/grammar/trees`) instead of slow bind-mounted host storage, skip expensive runtime ANTLR4 reverse-parsing, and preserve trimmed parse trees when `trim_case_custom` discovers new coverage.
-
-See [`test/fuzz/patches/grammar-mutator.md`](../test/fuzz/patches/grammar-mutator.md) for full details.
+The `grammar` worker runs `test/fuzz/runtime/grammar.rb`, which uses [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz) (`ComposedEvolver` and `Evolver`) derived directly from CRuby's `parse.y` grammar to evolve structurally rich valid and near-valid Ruby programs (including multi-heredoc and nested-heredoc rewrites). Each unique snippet is prefixed with the 4-byte options header, written atomically to `/tmp/afl-tmpdir/grammar/seeds` on `tmpfs`, imported into `ldet` via AFL++'s `-F` foreign sync whenever it discovers new CFG edges or IJON parser/lexer state transitions, and automatically pruned from `tmpfs` once scanned.
 
 ### CmpLog and `pm_strncasecmp`
 
