@@ -1,0 +1,65 @@
+Filename                                      Regions    Missed Regions     Cover   Functions  Missed Functions  Executed       Lines      Missed Lines     Cover    Branches   Missed Branches     Cover
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+include/prism/compiler/stack.h                      1                 0   100.00%           1                 0   100.00%          23                18    21.74%           0                 0         -
+include/prism/constant_pool.h                       1                 1     0.00%           1                 1     0.00%           3                 3     0.00%           0                 0         -
+include/prism/integer.h                             5                 0   100.00%           2                 0   100.00%          12                 1    91.67%           2                 0   100.00%
+include/prism/internal/arena.h                     20                 7    65.00%           4                 1    75.00%          48                25    47.92%          10                 6    40.00%
+include/prism/internal/bignum.h                   148                35    76.35%           9                 0   100.00%         101                22    78.22%          74                18    75.68%
+include/prism/internal/char.h                       3                 3     0.00%           3                 3     0.00%          13                13     0.00%           0                 0         -
+include/prism/internal/constant_pool.h              1                 0   100.00%           1                 0   100.00%           6                 0   100.00%           0                 0         -
+include/prism/internal/integer.h                    8                 0   100.00%           1                 0   100.00%           6                 0   100.00%           4                 0   100.00%
+include/prism/internal/line_offset_list.h           1                 1     0.00%           1                 1     0.00%          11                11     0.00%           0                 0         -
+include/prism/internal/node.h                       1                 1     0.00%           1                 1     0.00%           7                 7     0.00%           0                 0         -
+include/prism/internal/parser.h                     4                 1    75.00%           1                 0   100.00%           5                 0   100.00%           2                 1    50.00%
+src/arena.c                                        68                29    57.35%           7                 0   100.00%          46                 5    89.13%          24                15    37.50%
+src/bignum.c                                       67                52    22.39%          12                 7    41.67%          70                46    34.29%          22                18    18.18%
+src/buffer.c                                      181                39    78.45%          24                 1    95.83%         224                11    95.09%         103                19    81.55%
+src/char.c                                         82                 1    98.78%          18                 0   100.00%          89                 0   100.00%          40                 2    95.00%
+src/comments.c                                    222                12    94.59%          10                 0   100.00%         224                 0   100.00%         136                 6    95.59%
+src/constant_pool.c                               171                38    77.78%          13                 0   100.00%         173                 2    98.84%          78                17    78.21%
+src/diagnostic.c                                   60                19    68.33%           7                 0   100.00%          59                 2    96.61%          16                 7    56.25%
+src/double.c                                      329                74    77.51%           6                 0   100.00%         231                10    95.67%         210                44    79.05%
+src/encoding.c                                   1651                81    95.09%          36                 0   100.00%         522                23    95.59%        1190               122    89.75%
+src/errors_format.c                               317                46    85.49%          18                 0   100.00%         328                23    92.99%         194                26    86.60%
+src/integer.c                                     432               150    65.28%          18                 3    83.33%         323                61    81.11%         231                75    67.53%
+src/json.c                                       1656               217    86.90%           3                 0   100.00%        4273               373    91.27%        1268               218    82.81%
+src/line_offset_list.c                             25                 0   100.00%           5                 0   100.00%          52                 0   100.00%          12                 0   100.00%
+src/list.c                                          6                 0   100.00%           2                 0   100.00%          12                 0   100.00%           2                 0   100.00%
+src/memchr.c                                       20                 0   100.00%           1                 0   100.00%          19                 0   100.00%          12                 0   100.00%
+src/node.c                                       1658               396    76.12%         150                 1    99.33%        2342                14    99.40%         930               202    78.28%
+src/options.c                                     107                43    59.81%          20                 1    95.00%         119                33    72.27%          42                26    38.10%
+src/parser.c                                        7                 0   100.00%           2                 0   100.00%          12                 0   100.00%           4                 1    75.00%
+src/prettyprint.c                                1695               266    84.31%           4                 0   100.00%        7550               399    94.72%        1342               227    83.08%
+src/prism.c                                     17171              1804    89.49%         595                 4    99.33%       14817               430    97.10%       10197              1056    89.64%
+src/regexp.c                                     1061                96    90.95%          35                 1    97.14%        1018                57    94.40%         808                91    88.74%
+src/serialize.c                                   696                17    97.56%          18                 0   100.00%        2340               285    87.82%         795                13    98.36%
+src/static_literals.c                             392               141    64.03%          17                 0   100.00%         363                60    83.47%         287                73    74.56%
+src/stringy.c                                      24                 6    75.00%           5                 0   100.00%          26                 0   100.00%           8                 2    75.00%
+src/strncasecmp.c                                  18                 1    94.44%           2                 0   100.00%          16                 0   100.00%          12                 1    91.67%
+src/strpbrk.c                                     167                17    89.82%           9                 0   100.00%         167                 2    98.80%          92                 7    92.39%
+src/tokens.c                                      207                44    78.74%           1                 0   100.00%         348                22    93.68%         356                23    93.54%
+src/xxh3.c                                         81                16    80.25%          13                 0   100.00%         137                17    87.59%          32                 5    84.38%
+
+Files which contain no functions:
+include/prism/ast.h                                 0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/compiler/align.h                      0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/compiler/assume.h                     0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/compiler/branch.h                     0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/compiler/bswap.h                      0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/compiler/endianness.h                 0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/compiler/fallthrough.h                0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/allocator.h                  0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/assert.h                     0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/bit.h                        0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/buffer.h                     0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/encoding.h                   0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/isinf.h                      0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/oom.h                        0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/static_literals.h            0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/stringy.h                    0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/internal/strpbrk.h                    0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/node.h                                0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/options.h                             0                 0         -           0                 0         -           0                 0         -           0                 0         -
+include/prism/version.h                             0                 0         -           0                 0         -           0                 0         -           0                 0         -
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+TOTAL                                           28764              3654    87.30%        1076                25    97.68%       36135              1975    94.53%       18535              2321    87.48%
