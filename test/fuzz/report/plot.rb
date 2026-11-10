@@ -1,10 +1,13 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require "base64"
 require "cgi"
 require "fileutils"
 require "json"
 require "time"
+
+PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
 afl_dir = ARGV[0] || "./tmp/fuzz/afl"
 out_path = ARGV[1] || "./tmp/fuzz/plots/index.html"
@@ -753,12 +756,55 @@ else
   ""
 end
 
-def format_testcase_preview(path, max_bytes = 512)
-  return nil unless path && File.file?(path)
+FUZZ_OPT_VERSIONS = ["3.3", "3.4", "3.5", "4.1"].freeze
 
-  total_size = File.size(path)
-  raw = File.binread(path, max_bytes) || "".b
-  formatted = raw.bytes.map do |b|
+def decode_fuzz_header(raw)
+  return nil if raw.nil? || raw.bytesize < 4
+
+  b0, b1, b2, b3 = raw.bytes[0, 4]
+  ver = FUZZ_OPT_VERSIONS[b2 & 0x03]
+  start_line = [b3].pack("C").unpack1("c")
+  scopes = (b2 >> 2) & 0x03
+  fwd = (b2 >> 4) & 0x0f
+
+  flags = ["v#{ver}"]
+  flags << "line=#{start_line}" if start_line != 1
+  flags << "scopes=#{scopes}" if scopes > 0
+  flags << "fwd=0x#{fwd.to_s(16)}" if fwd > 0
+  flags << "freeze" if (b0 & 1) != 0
+  flags << "partial" if (b0 & 2) != 0
+  flags << "comments" if (b0 & 4) != 0
+  flags << "enc_lock" if (b0 & 8) != 0
+  flags << "frozen_lit" if (b0 & 16) != 0 && (b0 & 32) != 0
+  cmd = []
+  cmd << "-a" if (b1 & 0x01) != 0
+  cmd << "-e" if (b1 & 0x02) != 0
+  cmd << "-l" if (b1 & 0x04) != 0
+  cmd << "-n" if (b1 & 0x08) != 0
+  cmd << "-p" if (b1 & 0x10) != 0
+  cmd << "-x" if (b1 & 0x20) != 0
+  flags << cmd.join if cmd.any?
+  flags << "main" if (b1 & 0x40) != 0
+  flags.join(", ")
+end
+
+def build_prism_loupe_url(ruby_bytes)
+  return nil if ruby_bytes.nil? || ruby_bytes.empty?
+
+  b64 = Base64.strict_encode64(ruby_bytes)
+  "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(b64)}"
+end
+
+def parse_testcase_file(path, max_preview_bytes = 512)
+  return { preview: nil, opts_desc: nil, loupe_url: nil } unless path && File.file?(path)
+
+  raw = File.binread(path) || "".b
+  opts_desc = decode_fuzz_header(raw)
+  ruby_bytes = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
+  loupe_url = build_prism_loupe_url(ruby_bytes)
+
+  slice = ruby_bytes.bytesize > max_preview_bytes ? ruby_bytes.byteslice(0, max_preview_bytes) : ruby_bytes
+  formatted = slice.bytes.map do |b|
     case b
     when 0x0A then "\n"
     when 0x09 then "\t"
@@ -766,10 +812,15 @@ def format_testcase_preview(path, max_bytes = 512)
     else format("\\x%02X", b)
     end
   end.join
-  formatted << "\n... (#{total_size - max_bytes} more bytes)" if total_size > max_bytes
-  formatted
+  formatted << "\n... (#{ruby_bytes.bytesize - max_preview_bytes} more bytes)" if ruby_bytes.bytesize > max_preview_bytes
+
+  {
+    preview: formatted,
+    opts_desc: opts_desc,
+    loupe_url: loupe_url
+  }
 rescue StandardError
-  nil
+  { preview: nil, opts_desc: nil, loupe_url: nil }
 end
 
 def describe_afl_step_op(base, kind)
@@ -802,15 +853,23 @@ def describe_afl_step_op(base, kind)
 end
 
 def hydrate_chain_steps(chain)
-  chain.map do |s|
+  hydrated = chain.map do |s|
     p = s[:path]
     sz = (p && File.file?(p)) ? File.size(p) : nil
+    parsed = parse_testcase_file(p)
     s.merge(
       size: sz,
       op_desc: describe_afl_step_op(s[:base].to_s, s[:kind].to_s),
-      preview: format_testcase_preview(p)
+      preview: parsed[:preview],
+      opts_desc: parsed[:opts_desc],
+      loupe_url: parsed[:loupe_url]
     )
   end
+  # If Step 0 is a virtual root node (corpus or grammar) and Step 1 is its imported seed copy, share Step 1's Loupe link
+  if hydrated.size >= 2 && hydrated[0][:loupe_url].nil? && hydrated[1][:loupe_url]
+    hydrated[0][:loupe_url] = hydrated[1][:loupe_url]
+  end
+  hydrated
 end
 
 def analyze_fleet_lineage(afl_dir)
@@ -1009,7 +1068,13 @@ def render_evolution_chain_steps(chain, color_by_name)
                else
                  "evo-step"
                end
+    opts_badge = s[:opts_desc] ? %(<span class="sched-pill" title="4-byte fuzz_options_t header (stripped for Prism Loupe)">opts: #{CGI.escapeHTML(s[:opts_desc])}</span>) : ""
     size_badge = s[:size] ? %(<span class="evo-size">#{format_int(s[:size])} B</span>) : ""
+    loupe_btn = if s[:loupe_url]
+                  %(<a class="cov-link" href="#{CGI.escapeHTML(s[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate this step's Ruby parse in Prism Loupe (4-byte fuzz header stripped)">Animate in Prism Loupe &nearr;</a>)
+                else
+                  ""
+                end
     preview_block = if s[:preview]
                       %(<pre class="evo-preview">#{CGI.escapeHTML(s[:preview])}</pre>)
                     else
@@ -1022,7 +1087,11 @@ def render_evolution_chain_steps(chain, color_by_name)
           <span class="hop-pill"><span class="legend-dot" style="background:#{color}"></span>#{CGI.escapeHTML(w)}</span>
           <code class="evo-fname">#{CGI.escapeHTML(s[:base].to_s)}</code>
           <span class="evo-op">#{s[:op_desc]}</span>
-          #{size_badge}
+          #{opts_badge}
+          <span style="margin-left:auto;display:inline-flex;align-items:center;gap:10px;">
+            #{size_badge}
+            #{loupe_btn}
+          </span>
         </div>
         #{preview_block}
       </div>
@@ -1048,6 +1117,12 @@ def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix
     row_tags << "grammar" if p[:root_origin] == "grammar"
     row_tags << "multihop" if p[:fuzzer_hop_count] >= 2
     row_tags << "singlehop" if p[:fuzzer_hop_count] < 2
+    crash_step = (p[:sample_chain] || []).last || {}
+    loupe_cell = if crash_step[:loupe_url]
+                   %(<a class="cov-link" href="#{CGI.escapeHTML(crash_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate representative crash in Prism Loupe">Prism Loupe &nearr;</a>)
+                 else
+                   "<span class=\"muted\">&mdash;</span>"
+                 end
 
     <<~ROW
       <tr class="clickable-row lineage-row" data-lineage-Prefix="#{id_prefix}" data-lineage-tags="#{row_tags.join(' ')}" onclick="toggleHunkDrawer('#{drawer_id}')">
@@ -1068,9 +1143,10 @@ def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix
         <td class="num">#{format_int(p[:roots].size)}</td>
         <td class="num">#{p[:max_steps]} steps</td>
         <td><code>#{CGI.escapeHTML(top_root.to_s)}</code> <span class="muted">(#{format_int(top_root_cnt)})</span></td>
+        <td class="num">#{loupe_cell}</td>
       </tr>
       <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
-        <td colspan="6" class="hunk-drawer-cell">
+        <td colspan="7" class="hunk-drawer-cell">
           <div class="origin-hunk-title">
             <span>Representative Testcase Evolution: #{render_pathway_pills(p[:hops], color_by_name)}</span>
             <span class="muted">#{format_int(p[:count])} crashes from #{format_int(p[:parents].size)} parent queue items (#{format_int(p[:roots].size)} root seeds)</span>
@@ -1116,6 +1192,7 @@ def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix
             <th class="num">Root Seeds</th>
             <th class="num">Max Depth</th>
             <th>Top Root Seed (Crashes)</th>
+            <th class="num">Parse Animator</th>
           </tr>
         </thead>
         <tbody id="#{id_prefix}-tbody">
@@ -1142,8 +1219,16 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
 
   seed_rows_html = g_crashes.each_with_index.map do |g, idx|
     drawer_id = "gram-seed-crash-#{idx}"
+    first_step = g[:sample_chain].first || {}
     last_step = g[:sample_chain].last || {}
     parent_step = g[:sample_chain][-2] || {}
+    loupe_links = []
+    if first_step[:loupe_url]
+      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(first_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate original grammar seed in Prism Loupe">Seed &nearr;</a>)
+    end
+    if last_step[:loupe_url]
+      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(last_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate mutated crash input in Prism Loupe">Crash &nearr;</a>)
+    end
     <<~ROW
       <tr class="clickable-row" onclick="toggleHunkDrawer('#{drawer_id}')">
         <td>
@@ -1155,9 +1240,10 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
         <td class="num">#{format_int(g[:parents].size)}</td>
         <td><code>#{CGI.escapeHTML(parent_step[:base].to_s)}</code></td>
         <td><code>#{CGI.escapeHTML(last_step[:base].to_s)}</code></td>
+        <td class="num" style="white-space:nowrap;">#{loupe_links.join(" &bull; ")}</td>
       </tr>
       <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
-        <td colspan="6" class="hunk-drawer-cell">
+        <td colspan="7" class="hunk-drawer-cell">
           <div class="origin-hunk-title">
             <span>Grammar Seed <code>#{CGI.escapeHTML(g[:seed])}</code> &rarr; Crash Evolution</span>
             <span class="muted">#{format_int(g[:count])} crashes</span>
@@ -1179,6 +1265,7 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
                             <th class="num">Queue Intermediates</th>
                             <th>Imported Queue Entry</th>
                             <th>Sample Crash File</th>
+                            <th class="num">Prism Loupe</th>
                           </tr>
                         </thead>
                         <tbody>
