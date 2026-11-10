@@ -8,6 +8,15 @@ require "time"
 
 afl_dir = ARGV[0] || "./tmp/fuzz/afl"
 out_path = ARGV[1] || "./tmp/fuzz/plots/index.html"
+cov_json_path = ARGV[2] || "./tmp/fuzz/coverage/coverage.json"
+
+coverage_data = if File.exist?(cov_json_path)
+                  begin
+                    JSON.parse(File.read(cov_json_path))
+                  rescue StandardError
+                    nil
+                  end
+                end
 
 PLOT_COLUMNS = %i[
   relative_time
@@ -848,9 +857,262 @@ end
 
 overview_charts = overview_chart_list.join("\n")
 
+cov_by_origin = {}
+combined_cov = nil
+corpus_cov = nil
+if coverage_data
+  combined_cov = coverage_data["combined"]
+  (coverage_data["origins"] || []).each do |o|
+    cov_by_origin[o["name"]] = o
+  end
+  corpus_cov = cov_by_origin["corpus"]
+end
+
+def highlight_branch_spans(code_str, branches)
+  return CGI.escapeHTML(code_str) if branches.nil? || branches.empty?
+
+  spans = branches.map do |b|
+    c1 = b["col_start"].to_i
+    c2 = b["col_end"].to_i
+    next nil unless c1 > 0 && c2 > c1 && (c1 - 1) < code_str.length
+    [c1 - 1, [c2 - 1, code_str.length].min, b["taken"].to_s]
+  end.compact.uniq.sort_by { |s, e, _| [s, -e] }
+
+  return CGI.escapeHTML(code_str) if spans.empty?
+
+  # Merge or drop overlapping spans
+  merged = []
+  spans.each do |s, e, taken|
+    if merged.empty? || s >= merged.last[1]
+      merged << [s, e, taken]
+    end
+  end
+
+  out = +""
+  cursor = 0
+  merged.each do |s, e, taken|
+    out << CGI.escapeHTML(code_str[cursor...s]) if s > cursor
+    cls = taken == "False" ? "hunk-br-span hunk-br-false" : "hunk-br-span hunk-br-true"
+    out << %(<mark class="#{cls}">#{CGI.escapeHTML(code_str[s...e])}</mark>)
+    cursor = e
+  end
+  out << CGI.escapeHTML(code_str[cursor..]) if cursor < code_str.length
+  out
+end
+
+def render_exclusive_hunks_block(origin_name, origin_color, fname, hunks, show_origin_header: false, tab_link: false)
+  return "" if hunks.nil? || hunks.empty?
+
+  file_base_href = "../coverage/workers/#{origin_name}/report/coverage/#{fname}.html"
+  hunks_html = hunks.map do |h|
+    s_ln = h["start_line"]
+    e_ln = h["end_line"]
+    anchor_ln = h["anchor_line"] || s_ln
+    fn_label = h["function"] ? "in <code>#{CGI.escapeHTML(h['function'])}()</code>" : ""
+    deep_href = "#{file_base_href}#L#{anchor_ln}"
+
+    lines_html = (h["lines"] || []).map do |row|
+      ln = row["line"]
+      kind = row["kind"]
+      row_cls = case kind
+                when "both", "line" then "hunk-line-excl"
+                when "branch"       then "hunk-branch-excl"
+                else                     "hunk-context"
+                end
+      tags = []
+      tags << %(<span class="hunk-tag hunk-tag-line">LINE #{format_int(row["line_count"].to_i)}x</span>) if row["line_count"]
+      br_list = row["branches"] || []
+      if br_list.any?
+        br_list.each do |b|
+          taken = b["taken"].to_s
+          cnt = format_int(b["count"].to_i)
+          other_lbl = taken == "True" ? "False" : "True"
+          other_info = b["other_count"] ? " (#{other_lbl} branch taken #{format_int(b['other_count'].to_i)}x across fleet)" : ""
+          expr = b["expr"].to_s
+          mdef = b["macro_def"].to_s
+          tag_cls = taken == "False" ? "hunk-tag hunk-tag-branch-false" : "hunk-tag hunk-tag-branch"
+
+          label_prefix = if b["macro"] && !mdef.empty? && mdef != expr
+                           "#{mdef} &rarr; "
+                         elsif br_list.size > 1 && !expr.empty?
+                           "#{expr} &rarr; "
+                         else
+                           "BR &rarr; "
+                         end
+          tip = if b["macro"] && !mdef.empty?
+                  "Macro #{expr} expanded to: #{mdef} -> #{taken} (#{cnt}x)#{other_info}"
+                elsif !expr.empty?
+                  "Condition: #{expr} -> #{taken} (#{cnt}x)#{other_info}"
+                else
+                  "Branch #{taken} taken #{cnt}x#{other_info}"
+                end
+          tags << %(<span class="#{tag_cls}" title="#{CGI.escapeHTML(tip)}">#{label_prefix}#{CGI.escapeHTML(taken)} (#{cnt}x)</span>)
+        end
+      elsif row["branch_hits"].to_i > 0
+        tags << %(<span class="hunk-tag hunk-tag-branch">+#{row["branch_hits"]} BR (#{format_int(row["branch_count"].to_i)}x)</span>)
+      end
+      code_html = highlight_branch_spans(row["code"].to_s, br_list)
+      <<~LINE
+        <div class="hunk-code-row #{row_cls}">
+          <a class="hunk-ln" href="#{CGI.escapeHTML("#{file_base_href}#L#{ln}")}" target="_blank" rel="noopener">#{ln}</a>
+          <span class="hunk-badges">#{tags.join}</span>
+          <pre class="hunk-src">#{code_html}</pre>
+        </div>
+      LINE
+    end.join
+
+    <<~HUNK
+      <div class="hunk-box">
+        <div class="hunk-head">
+          <span>Lines #{s_ln}&ndash;#{e_ln} #{fn_label}</span>
+          <a class="cov-link" href="#{CGI.escapeHTML(deep_href)}" target="_blank" rel="noopener">Open in llvm-cov (#L#{anchor_ln}) &nearr;</a>
+        </div>
+        <div class="hunk-body">
+          #{lines_html}
+        </div>
+      </div>
+    HUNK
+  end.join("\n")
+
+  if show_origin_header
+    tab_btn = tab_link ? %(<button class="hunk-tab-btn" onclick="selectTab('#{CGI.escapeHTML(origin_name)}')">View #{CGI.escapeHTML(origin_name)} Telemetry &rarr;</button>) : ""
+    <<~WRAP
+      <div class="origin-hunk-group" data-origin="#{CGI.escapeHTML(origin_name)}">
+        <div class="origin-hunk-title">
+          <span><span class="legend-dot" style="background:#{origin_color}"></span> <strong>#{CGI.escapeHTML(origin_name)}</strong> exclusive coverage in <code>#{CGI.escapeHTML(fname)}</code></span>
+          <div style="display:flex;gap:10px;align-items:center;">
+            #{tab_btn}
+            <a class="cov-link" href="#{CGI.escapeHTML(file_base_href)}" target="_blank" rel="noopener">Full File HTML &nearr;</a>
+          </div>
+        </div>
+        #{hunks_html}
+      </div>
+    WRAP
+  else
+    hunks_html
+  end
+end
+
+def render_worker_cov_files_table(origin_cov, color)
+  return "" unless origin_cov && origin_cov["has_coverage"]
+
+  files = origin_cov["files"] || []
+  return "" if files.empty?
+  origin_name = origin_cov["name"].to_s
+
+  # Sort files with exclusive coverage first, then by gain vs corpus, then by filename
+  sorted_files = files.sort_by do |f|
+    ex_l = f.dig("exclusive", "lines", "covered").to_i
+    ex_b = f.dig("exclusive", "branches", "covered").to_i
+    vc_l = f.dig("vs_corpus", "lines", "covered").to_i
+    [-(ex_l * 100 + ex_b), -vc_l, f["filename"].to_s]
+  end
+
+  has_any_hunks = false
+  rows_html = sorted_files.each_with_index.map do |f, idx|
+    fname = f["filename"].to_s
+    sum = f["summary"] || {}
+    l = sum["lines"] || {}
+    b = sum["branches"] || {}
+    r = sum["regions"] || {}
+    fn = sum["functions"] || {}
+    next if l["count"].to_i.zero? && fn["count"].to_i.zero?
+
+    vc_l = f.dig("vs_corpus", "lines", "covered").to_i
+    vc_b = f.dig("vs_corpus", "branches", "covered").to_i
+    ex_l = f.dig("exclusive", "lines", "covered").to_i
+    ex_b = f.dig("exclusive", "branches", "covered").to_i
+    ex_r = f.dig("exclusive", "regions", "covered").to_i
+    hunks = f["exclusive_hunks"] || []
+    drawer_id = "w-hunk-#{origin_name.gsub(/[^a-zA-Z0-9_-]/, '_')}-#{idx}"
+
+    vc_str = if vc_l > 0 || vc_b > 0
+               "<span class=\"cov-gain\">+#{format_int(vc_l)}L / +#{format_int(vc_b)}B</span>"
+             else
+               "<span class=\"muted\">&mdash;</span>"
+             end
+
+    ex_str = if hunks.any?
+               has_any_hunks = true
+               "<button class=\"badge badge-success clickable-pill\" onclick=\"toggleHunkDrawer('#{drawer_id}')\" title=\"Click to view exclusive lines &amp; branches\">&#9662; +#{format_int(ex_l)}L / +#{format_int(ex_b)}B</button>"
+             elsif ex_l > 0 || ex_b > 0 || ex_r > 0
+               "<span class=\"badge badge-success\">+#{format_int(ex_l)}L / +#{format_int(ex_b)}B</span>"
+             else
+               "<span class=\"muted\">0</span>"
+             end
+
+    l_pct = l["percent"].to_f
+    b_pct = b["percent"].to_f
+    first_anchor = hunks.first ? "#L#{hunks.first['anchor_line']}" : ""
+    file_html_href = "../coverage/workers/#{origin_name}/report/coverage/#{fname}.html#{first_anchor}"
+
+    drawer_row = if hunks.any?
+                   <<~DRAWER
+                     <tr id="#{drawer_id}" class="hunk-drawer-row" data-worker-hunks="#{CGI.escapeHTML(origin_name)}" style="display:table-row;">
+                       <td colspan="7" class="hunk-drawer-cell">
+                         #{render_exclusive_hunks_block(origin_name, color, fname, hunks)}
+                       </td>
+                     </tr>
+                   DRAWER
+                 else
+                   ""
+                 end
+
+    <<~ROW
+      <tr>
+        <td><a class="cov-link" href="#{CGI.escapeHTML(file_html_href)}" target="_blank" rel="noopener"><code>#{CGI.escapeHTML(fname)}</code> &nearr;</a></td>
+        <td class="num">
+          <strong>#{format("%.2f%%", l_pct)}</strong>
+          <span class="muted">(#{format_int(l["covered"].to_i)}/#{format_int(l["count"].to_i)})</span>
+        </td>
+        <td class="num">
+          #{b["count"].to_i > 0 ? "#{format('%.2f%%', b_pct)} <span class=\"muted\">(#{format_int(b['covered'].to_i)}/#{format_int(b['count'].to_i)})</span>" : "<span class=\"muted\">&mdash;</span>"}
+        </td>
+        <td class="num">#{format("%.2f%%", r["percent"].to_f)}</td>
+        <td class="num">#{format("%.2f%%", fn["percent"].to_f)}</td>
+        <td class="num">#{vc_str}</td>
+        <td class="num">#{ex_str}</td>
+      </tr>
+      #{drawer_row}
+    ROW
+  end.compact.join("\n")
+
+  toggle_all_btn = has_any_hunks ? %(<button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, '#{CGI.escapeHTML(origin_name)}')">Collapse Exclusive Code Hunks</button>) : ""
+  report_link = origin_cov["report_rel_path"] ? %(<a class="cov-btn" href="#{CGI.escapeHTML(origin_cov['report_rel_path'])}" target="_blank" rel="noopener">Open #{CGI.escapeHTML(origin_name)} llvm-cov HTML &nearr;</a>) : ""
+
+  <<~HTML
+    <div class="table-card" style="margin-top: 18px;">
+      <div class="table-card-header">
+        <div>
+          <h3><span class="legend-dot" style="background:#{color}"></span> Source Coverage by File (Originated by <code>#{CGI.escapeHTML(origin_name)}</code>)</h3>
+          <p class="chart-sub">Standalone coverage from <strong>#{format_int(origin_cov["input_count"].to_i)}</strong> originated inputs. Exclusive source lines (emerald) and branches (sky blue) are shown inline below each file.</p>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">#{toggle_all_btn} #{report_link}</div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>File</th>
+            <th class="num">Line Coverage</th>
+            <th class="num">Branch Coverage</th>
+            <th class="num">Region %</th>
+            <th class="num">Function %</th>
+            <th class="num">Gain vs. Corpus</th>
+            <th class="num">Exclusive to #{CGI.escapeHTML(origin_cov["name"])}</th>
+          </tr>
+        </thead>
+        <tbody>
+          #{rows_html}
+        </tbody>
+      </table>
+    </div>
+  HTML
+end
+
 # Fleet summary table rows (AFL++ fuzzers only; generators rendered in their own table below)
 summary_rows_html = afl_fuzzers.map do |f|
   ps = peer_sync_by_name[f[:name]]
+  oc = cov_by_origin[f[:name]]
   edges_str = f[:total_edges] > 0 ? "#{format_int(f[:edges_found])} / #{format_int(f[:total_edges])}" : format_int(f[:edges_found])
   crash_cls = f[:saved_crashes] > 0 ? "badge-danger" : "badge-muted"
   hang_cls = f[:saved_hangs] > 0 ? "badge-warn" : "badge-muted"
@@ -860,6 +1122,19 @@ summary_rows_html = afl_fuzzers.map do |f|
   else
     main_sync_cell = "<span class=\"muted\">hub</span>"
     main_yield_cell = "<span class=\"muted\">&mdash;</span>"
+  end
+  if oc && oc["has_coverage"]
+    l_pct = oc.dig("totals", "lines", "percent").to_f
+    b_pct = oc.dig("totals", "branches", "percent").to_f
+    ex_l = oc.dig("exclusive", "lines", "covered").to_i
+    ex_b = oc.dig("exclusive", "branches", "covered").to_i
+    src_cov_cell = "<strong>#{format('%.2f%%', l_pct)}</strong> <span class=\"muted\">(#{format('%.1f%%', b_pct)} B)</span>"
+    excl_cell = (ex_l > 0 || ex_b > 0) ? "<span class=\"badge badge-success\">+#{ex_l}L / +#{ex_b}B</span>" : "<span class=\"muted\">0</span>"
+    rep_cell = oc["report_rel_path"] ? %(<a class="cov-link" href="#{CGI.escapeHTML(oc['report_rel_path'])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">HTML &nearr;</a>) : "<span class=\"muted\">&mdash;</span>"
+  else
+    src_cov_cell = "<span class=\"muted\">&mdash;</span>"
+    excl_cell = "<span class=\"muted\">&mdash;</span>"
+    rep_cell = "<span class=\"muted\">&mdash;</span>"
   end
   <<~HTML
     <tr class="clickable-row" onclick="selectTab('#{CGI.escapeHTML(f[:name])}')">
@@ -873,6 +1148,8 @@ summary_rows_html = afl_fuzzers.map do |f|
       <td class="num">#{format_compact(f[:execs_done])}</td>
       <td class="num"><strong>#{format("%.2f%%", f[:bitmap_cvg])}</strong></td>
       <td class="num">#{edges_str}</td>
+      <td class="num">#{src_cov_cell}</td>
+      <td class="num">#{excl_cell}</td>
       <td class="num">#{format_int(f[:corpus_count])}</td>
       <td class="num">#{format_int(f[:corpus_found])}</td>
       <td class="num">#{format_int(f[:corpus_imported])}</td>
@@ -881,6 +1158,7 @@ summary_rows_html = afl_fuzzers.map do |f|
       <td class="num">#{format_int(f[:pending_favs])} / #{format_int(f[:pending_total])}</td>
       <td class="num"><span class="badge #{crash_cls}">#{f[:saved_crashes]}</span></td>
       <td class="num"><span class="badge #{hang_cls}">#{f[:saved_hangs]}</span></td>
+      <td class="num">#{rep_cell}</td>
     </tr>
   HTML
 end.join("\n")
@@ -888,11 +1166,25 @@ end.join("\n")
 generator_table_html = if gen_fuzzers.any?
   gen_rows = gen_fuzzers.map do |gf|
     ps = peer_sync_by_name[gf[:name]]
+    oc = cov_by_origin[gf[:name]]
     yield_cell = if ps
                    "<strong>+#{format_int(ps[:imported_by_main])}</strong> / #{format_int(ps[:tested_by_main])} <span class=\"muted\">(#{format('%.1f%%', ps[:yield_pct])} into #{CGI.escapeHTML(ps[:intake_name])})</span>"
                  else
                    "<span class=\"muted\">&mdash;</span>"
                  end
+    if oc && oc["has_coverage"]
+      l_pct = oc.dig("totals", "lines", "percent").to_f
+      vc_l = oc.dig("vs_corpus", "lines", "covered").to_i
+      ex_l = oc.dig("exclusive", "lines", "covered").to_i
+      ex_b = oc.dig("exclusive", "branches", "covered").to_i
+      src_cov_cell = "<strong>#{format('%.2f%%', l_pct)}</strong> <span class=\"muted\">(+#{format_int(vc_l)}L vs corpus)</span>"
+      excl_cell = (ex_l > 0 || ex_b > 0) ? "<span class=\"badge badge-success\">+#{ex_l}L / +#{ex_b}B</span>" : "<span class=\"muted\">0</span>"
+      rep_cell = oc["report_rel_path"] ? %(<a class="cov-link" href="#{CGI.escapeHTML(oc['report_rel_path'])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">HTML &nearr;</a>) : "<span class=\"muted\">&mdash;</span>"
+    else
+      src_cov_cell = "<span class=\"muted\">&mdash;</span>"
+      excl_cell = "<span class=\"muted\">&mdash;</span>"
+      rep_cell = "<span class=\"muted\">&mdash;</span>"
+    end
     <<~ROW
       <tr class="clickable-row" onclick="selectTab('#{CGI.escapeHTML(gf[:name])}')">
         <td>
@@ -908,6 +1200,9 @@ generator_table_html = if gen_fuzzers.any?
         <td class="num">#{format_int(gf[:files_pruned])}</td>
         <td class="num">#{format_int(gf[:duplicates_skipped])}</td>
         <td class="num">#{yield_cell}</td>
+        <td class="num">#{src_cov_cell}</td>
+        <td class="num">#{excl_cell}</td>
+        <td class="num">#{rep_cell}</td>
       </tr>
     ROW
   end.join("\n")
@@ -927,6 +1222,9 @@ generator_table_html = if gen_fuzzers.any?
             <th class="num">Pruned</th>
             <th class="num">Duplicates</th>
             <th class="num">Foreign Sync Yield (-F)</th>
+            <th class="num">Src Line %</th>
+            <th class="num">Exclusive</th>
+            <th class="num">Report</th>
           </tr>
         </thead>
         <tbody>
@@ -941,7 +1239,349 @@ end
 
 # Per-fuzzer tab buttons and panels
 tab_buttons_html = +%(<button class="tab-btn active" data-tab="overview" onclick="selectTab('overview')">Fleet Overview (#{fuzzers.size})</button>\n)
+if combined_cov
+  comb_line_pct = combined_cov.dig("totals", "lines", "percent").to_f
+  tab_buttons_html << <<~HTML
+    <button class="tab-btn" data-tab="coverage" onclick="selectTab('coverage')">
+      <span class="legend-dot" style="background:#34d399"></span>
+      Source Coverage (#{format("%.2f%%", comb_line_pct)})
+    </button>
+  HTML
+end
 tab_panels_html = +""
+
+if combined_cov
+  ct = combined_cov["totals"] || {}
+  cl = ct["lines"] || {}
+  cb = ct["branches"] || {}
+  cr = ct["regions"] || {}
+  cf = ct["functions"] || {}
+
+  corp_lines = corpus_cov&.dig("totals", "lines", "covered").to_i
+  corp_branches = corpus_cov&.dig("totals", "branches", "covered").to_i
+  gain_lines_over_corpus = corp_lines > 0 ? [cl["covered"].to_i - corp_lines, 0].max : 0
+  gain_branches_over_corpus = corp_branches > 0 ? [cb["covered"].to_i - corp_branches, 0].max : 0
+
+  origins_list = coverage_data["origins"] || []
+  total_excl_lines = origins_list.sum { |o| o.dig("exclusive", "lines", "covered").to_i }
+  total_excl_branches = origins_list.sum { |o| o.dig("exclusive", "branches", "covered").to_i }
+
+  # Build visual comparison bars for combined + each origin
+  bar_entries = [
+    {
+      name: "combined (all origins)",
+      tab: nil,
+      color: "#34d399",
+      role_label: "Combined Campaign",
+      inputs: combined_cov["input_count"].to_i,
+      lines_pct: cl["percent"].to_f,
+      lines_cov: cl["covered"].to_i,
+      lines_tot: cl["count"].to_i,
+      branches_pct: cb["percent"].to_f,
+      branches_cov: cb["covered"].to_i,
+      branches_tot: cb["count"].to_i,
+      regions_pct: cr["percent"].to_f,
+      functions_pct: cf["percent"].to_f,
+      vs_corpus_l: gain_lines_over_corpus,
+      vs_corpus_b: gain_branches_over_corpus,
+      excl_l: nil,
+      excl_b: nil,
+      excl_r: nil,
+      report_path: combined_cov["report_rel_path"],
+      summary_path: combined_cov["summary_rel_path"]
+    }
+  ]
+
+  origins_list.each do |o|
+    oname = o["name"]
+    ot = o["totals"] || {}
+    ol = ot["lines"] || {}
+    ob = ot["branches"] || {}
+    or_ = ot["regions"] || {}
+    of = ot["functions"] || {}
+    role_lbl = case o["kind"]
+               when "corpus" then "Initial Seed Corpus"
+               when "generator" then "Grammar Seed Generator"
+               else "AFL++ Fuzzer Worker"
+               end
+    bar_entries << {
+      name: oname,
+      tab: color_by_name.key?(oname) ? oname : nil,
+      color: color_by_name[oname] || (oname == "corpus" ? "#fbbf24" : "#9ca3af"),
+      role_label: role_lbl,
+      inputs: o["input_count"].to_i,
+      lines_pct: ol["percent"].to_f,
+      lines_cov: ol["covered"].to_i,
+      lines_tot: ol["count"].to_i,
+      branches_pct: ob["percent"].to_f,
+      branches_cov: ob["covered"].to_i,
+      branches_tot: ob["count"].to_i,
+      regions_pct: or_["percent"].to_f,
+      functions_pct: of["percent"].to_f,
+      vs_corpus_l: o.dig("vs_corpus", "lines", "covered"),
+      vs_corpus_b: o.dig("vs_corpus", "branches", "covered"),
+      excl_l: o.dig("exclusive", "lines", "covered").to_i,
+      excl_b: o.dig("exclusive", "branches", "covered").to_i,
+      excl_r: o.dig("exclusive", "regions", "covered").to_i,
+      report_path: o["report_rel_path"],
+      summary_path: o["summary_rel_path"]
+    }
+  end
+
+  cov_origins_table_rows = bar_entries.map do |e|
+    row_click = e[:tab] ? %(class="clickable-row" onclick="selectTab('#{CGI.escapeHTML(e[:tab])}')") : ""
+    vc_cell = if e[:name] == "corpus"
+                "<span class=\"muted\">baseline</span>"
+              elsif e[:vs_corpus_l].to_i > 0 || e[:vs_corpus_b].to_i > 0
+                "<span class=\"cov-gain\">+#{format_int(e[:vs_corpus_l].to_i)}L / +#{format_int(e[:vs_corpus_b].to_i)}B</span>"
+              else
+                "<span class=\"muted\">&mdash;</span>"
+              end
+    ex_cell = if e[:excl_l].nil?
+                "<span class=\"muted\">union</span>"
+              elsif e[:excl_l] > 0 || e[:excl_b] > 0 || e[:excl_r].to_i > 0
+                "<span class=\"badge badge-success\">+#{format_int(e[:excl_l])}L / +#{format_int(e[:excl_b])}B / +#{format_int(e[:excl_r].to_i)}R</span>"
+              else
+                "<span class=\"muted\">0</span>"
+              end
+    links = []
+    links << %(<a class="cov-link" href="#{CGI.escapeHTML(e[:report_path])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">HTML &nearr;</a>) if e[:report_path]
+    links << %(<a class="cov-link muted" href="#{CGI.escapeHTML(e[:summary_path])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Txt &nearr;</a>) if e[:summary_path]
+    <<~ROW
+      <tr #{row_click}>
+        <td>
+          <span class="legend-dot" style="background:#{e[:color]}"></span>
+          <strong>#{CGI.escapeHTML(e[:name])}</strong>
+        </td>
+        <td><span class="sched-pill">#{CGI.escapeHTML(e[:role_label])}</span></td>
+        <td class="num">#{format_int(e[:inputs])}</td>
+        <td class="num" style="min-width: 210px;">
+          <div><strong>#{format("%.2f%%", e[:lines_pct])}</strong> <span class="muted">(#{format_int(e[:lines_cov])} / #{format_int(e[:lines_tot])})</span></div>
+          <div class="sync-bar" style="height: 6px; margin-top: 4px;">
+            <div class="sync-seg" style="width:#{e[:lines_pct].round(2)}%;background:#{e[:color]}"></div>
+          </div>
+        </td>
+        <td class="num" style="min-width: 210px;">
+          <div><strong>#{format("%.2f%%", e[:branches_pct])}</strong> <span class="muted">(#{format_int(e[:branches_cov])} / #{format_int(e[:branches_tot])})</span></div>
+          <div class="sync-bar" style="height: 6px; margin-top: 4px;">
+            <div class="sync-seg" style="width:#{e[:branches_pct].round(2)}%;background:#38bdf8"></div>
+          </div>
+        </td>
+        <td class="num">#{format("%.2f%%", e[:regions_pct])}</td>
+        <td class="num">#{format("%.2f%%", e[:functions_pct])}</td>
+        <td class="num">#{vc_cell}</td>
+        <td class="num">#{ex_cell}</td>
+        <td class="num">#{links.join(" &bull; ")}</td>
+      </tr>
+    ROW
+  end.join("\n")
+
+  # Per-file coverage matrix across combined, corpus, grammar, and exclusive contributors
+  corpus_file_map = (corpus_cov&.dig("files") || []).to_h { |f| [f["filename"], f] }
+  grammar_file_map = (cov_by_origin.dig("grammar", "files") || []).to_h { |f| [f["filename"], f] }
+
+  excl_by_file = Hash.new { |h, k| h[k] = [] }
+  origins_list.each do |o|
+    oname = o["name"]
+    (o["files"] || []).each do |f|
+      el = f.dig("exclusive", "lines", "covered").to_i
+      eb = f.dig("exclusive", "branches", "covered").to_i
+      hunks = f["exclusive_hunks"] || []
+      if el > 0 || eb > 0 || hunks.any?
+        excl_by_file[f["filename"]] << {
+          name: oname,
+          lines: el,
+          branches: eb,
+          hunks: hunks,
+          color: color_by_name[oname] || "#fbbf24"
+        }
+      end
+    end
+  end
+
+  file_matrix_rows = (combined_cov["files"] || []).each_with_index.map do |cf_entry, f_idx|
+    fname = cf_entry["filename"].to_s
+    cs = cf_entry["summary"] || {}
+    fl = cs["lines"] || {}
+    fb = cs["branches"] || {}
+    ff = cs["functions"] || {}
+    next if fl["count"].to_i.zero? && ff["count"].to_i.zero?
+
+    corp_f = corpus_file_map[fname]
+    corp_l_cov = corp_f&.dig("summary", "lines", "covered").to_i
+    corp_l_pct = corp_f&.dig("summary", "lines", "percent").to_f
+    camp_gain_l = corp_f ? [fl["covered"].to_i - corp_l_cov, 0].max : 0
+
+    gram_f = grammar_file_map[fname]
+    gram_l_pct = gram_f&.dig("summary", "lines", "percent").to_f
+    gram_vc_l = gram_f&.dig("vs_corpus", "lines", "covered").to_i
+
+    missed_l = fl["count"].to_i - fl["covered"].to_i
+    missed_b = fb["count"].to_i - fb["covered"].to_i
+    sorted_excl = excl_by_file[fname].sort_by { |x| -(x[:lines] * 100 + x[:branches]) }
+    drawer_id = "cov-file-hunks-#{f_idx}"
+
+    excl_badges = sorted_excl.map do |x|
+      parts = []
+      parts << "+#{x[:lines]}L" if x[:lines] > 0
+      parts << "+#{x[:branches]}B" if x[:branches] > 0
+      first_anchor = x[:hunks].first ? "#L#{x[:hunks].first['anchor_line']}" : ""
+      worker_file_href = "../coverage/workers/#{x[:name]}/report/coverage/#{fname}.html#{first_anchor}"
+      toggle_js = x[:hunks].any? ? %(onclick="toggleFileOriginHunks('#{drawer_id}', '#{CGI.escapeHTML(x[:name])}')") : (color_by_name.key?(x[:name]) ? %(onclick="selectTab('#{CGI.escapeHTML(x[:name])}')") : "")
+      caret = x[:hunks].any? ? "&#9662; " : ""
+      %(<span class="excl-pill clickable-pill" #{toggle_js} title="Click to inspect exclusive code lines/branches from #{CGI.escapeHTML(x[:name])}"><span class="legend-dot" style="background:#{x[:color]}"></span>#{caret}#{CGI.escapeHTML(x[:name])}: #{parts.join('/')} <a class="cov-link" href="#{CGI.escapeHTML(worker_file_href)}" target="_blank" rel="noopener" title="Open #{CGI.escapeHTML(fname)} in #{CGI.escapeHTML(x[:name])} llvm-cov report" onclick="event.stopPropagation()">&nearr;</a></span>)
+    end.join(" ")
+
+    hunk_groups_html = sorted_excl.select { |x| x[:hunks].any? }.map do |x|
+      render_exclusive_hunks_block(
+        x[:name],
+        x[:color],
+        fname,
+        x[:hunks],
+        show_origin_header: true,
+        tab_link: color_by_name.key?(x[:name])
+      )
+    end.join("\n")
+
+    drawer_row = if !hunk_groups_html.empty?
+                   <<~DRAWER
+                     <tr id="#{drawer_id}" class="hunk-drawer-row" data-worker-hunks="__matrix__" style="display:none;">
+                       <td colspan="8" class="hunk-drawer-cell">
+                         #{hunk_groups_html}
+                       </td>
+                     </tr>
+                   DRAWER
+                 else
+                   ""
+                 end
+
+    comb_file_href = "../coverage/report/coverage/#{fname}.html"
+    <<~ROW
+      <tr>
+        <td><a class="cov-link" href="#{CGI.escapeHTML(comb_file_href)}" target="_blank" rel="noopener"><code>#{CGI.escapeHTML(fname)}</code> &nearr;</a></td>
+        <td class="num">
+          <strong>#{format("%.2f%%", fl["percent"].to_f)}</strong>
+          <span class="muted">(#{format_int(fl["covered"].to_i)}/#{format_int(fl["count"].to_i)})</span>
+        </td>
+        <td class="num">#{missed_l > 0 ? "<span class=\"text-warn\">#{format_int(missed_l)}</span>" : "<span class=\"muted\">0</span>"}</td>
+        <td class="num">
+          #{fb["count"].to_i > 0 ? "<strong>#{format('%.2f%%', fb['percent'].to_f)}</strong> <span class=\"muted\">(#{format_int(fb['covered'].to_i)}/#{format_int(fb['count'].to_i)})</span>" : "<span class=\"muted\">&mdash;</span>"}
+        </td>
+        <td class="num">#{missed_b > 0 ? "<span class=\"text-warn\">#{format_int(missed_b)}</span>" : "<span class=\"muted\">0</span>"}</td>
+        <td class="num">
+          #{corp_f ? "#{format('%.2f%%', corp_l_pct)} #{camp_gain_l > 0 ? "<span class=\"cov-gain\">(+#{format_int(camp_gain_l)}L)</span>" : ''}" : "<span class=\"muted\">&mdash;</span>"}
+        </td>
+        <td class="num">
+          #{gram_f ? "#{format('%.2f%%', gram_l_pct)} #{gram_vc_l > 0 ? "<span class=\"cov-gain\">(+#{format_int(gram_vc_l)}L)</span>" : ''}" : "<span class=\"muted\">&mdash;</span>"}
+        </td>
+        <td>#{excl_badges.empty? ? "<span class=\"muted\">&mdash;</span>" : excl_badges}</td>
+      </tr>
+      #{drawer_row}
+    ROW
+  end.compact.join("\n")
+
+  tab_panels_html << <<~HTML
+    <section id="tab-coverage" class="tab-panel">
+      <div class="fuzzer-banner">
+        <div>
+          <h2><span class="legend-dot" style="background:#34d399"></span> Source Coverage Breakdown (By Worker &amp; Combined)</h2>
+          <p class="cmd-line">Partitioned across <strong>#{origins_list.size}</strong> origins (<strong>#{format_int(combined_cov["input_count"].to_i)}</strong> unique inputs) and merged via <code>llvm-profdata</code> &bull; Collected: #{CGI.escapeHTML(coverage_data["generated_at"].to_s)}</p>
+        </div>
+        <div class="fuzzer-meta">
+          <a class="cov-btn" href="#{CGI.escapeHTML(combined_cov["report_rel_path"].to_s)}" target="_blank" rel="noopener">Open Combined llvm-cov HTML Report &nearr;</a>
+          <a class="cov-btn cov-btn-secondary" href="#{CGI.escapeHTML(combined_cov["summary_rel_path"].to_s)}" target="_blank" rel="noopener">Text Summary &nearr;</a>
+          <a class="cov-btn cov-btn-secondary" href="#{CGI.escapeHTML(combined_cov["lcov_rel_path"].to_s)}" target="_blank" rel="noopener">LCOV (IDE Gutters) &nearr;</a>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Combined Line Coverage</div>
+          <div class="kpi-value">#{format("%.2f%%", cl["percent"].to_f)}</div>
+          <div class="kpi-sub">#{format_int(cl["covered"].to_i)} / #{format_int(cl["count"].to_i)} lines (+#{format_int(gain_lines_over_corpus)} vs corpus)</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Combined Branch Coverage</div>
+          <div class="kpi-value">#{format("%.2f%%", cb["percent"].to_f)}</div>
+          <div class="kpi-sub">#{format_int(cb["covered"].to_i)} / #{format_int(cb["count"].to_i)} branches (+#{format_int(gain_branches_over_corpus)} vs corpus)</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Combined Region Coverage</div>
+          <div class="kpi-value">#{format("%.2f%%", cr["percent"].to_f)}</div>
+          <div class="kpi-sub">#{format_int(cr["covered"].to_i)} / #{format_int(cr["count"].to_i)} regions (#{format_int(cr["count"].to_i - cr["covered"].to_i)} missed)</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Combined Function Coverage</div>
+          <div class="kpi-value">#{format("%.2f%%", cf["percent"].to_f)}</div>
+          <div class="kpi-sub">#{format_int(cf["covered"].to_i)} / #{format_int(cf["count"].to_i)} functions (#{format_int(cf["count"].to_i - cf["covered"].to_i)} missed)</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Exclusive Worker Coverage</div>
+          <div class="kpi-value">+#{format_int(total_excl_lines)}L / +#{format_int(total_excl_branches)}B</div>
+          <div class="kpi-sub">lines &amp; branches uniquely held by a single origin</div>
+        </div>
+      </div>
+
+      <div class="table-card" style="margin-bottom: 22px;">
+        <div class="table-card-header">
+          <div>
+            <h3>Coverage by Origin (Self-Originated Inputs vs. Combined Union)</h3>
+            <p class="chart-sub">Each worker is evaluated on the inputs it originated before merging into the combined profile. <strong>Gain vs. Corpus</strong> measures <code>merge(corpus, worker) - corpus</code>; <strong>Exclusive</strong> measures <code>combined - merge(all_other_origins)</code>. Click any worker row to open its telemetry tab.</p>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Origin</th>
+              <th>Role</th>
+              <th class="num">Originated Inputs</th>
+              <th class="num">Lines Covered</th>
+              <th class="num">Branches Covered</th>
+              <th class="num">Regions %</th>
+              <th class="num">Functions %</th>
+              <th class="num">Gain vs. Corpus</th>
+              <th class="num">Exclusive (Lines / Branches / Regions)</th>
+              <th class="num">llvm-cov Report</th>
+            </tr>
+          </thead>
+          <tbody>
+            #{cov_origins_table_rows}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-card">
+        <div class="table-card-header">
+          <div>
+            <h3>Per-File Coverage &amp; Exclusive Worker Contributions</h3>
+            <p class="chart-sub">Combined coverage per source file alongside initial corpus baseline, grammar generator coverage, and workers holding exclusive lines/branches (click any exclusive pill or row to inspect exact C source code)</p>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="cov-btn" onclick="toggleAllHunks(this, 'covfile-hunks-')">Expand All Exclusive Hunks</button>
+            <a class="cov-btn" href="#{CGI.escapeHTML(combined_cov["report_rel_path"].to_s)}" target="_blank" rel="noopener">Browse Annotated Source (HTML) &nearr;</a>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Source File</th>
+              <th class="num">Combined Lines</th>
+              <th class="num">Missed L</th>
+              <th class="num">Combined Branches</th>
+              <th class="num">Missed B</th>
+              <th class="num">Initial Corpus (+Campaign Gain)</th>
+              <th class="num">Grammar (+vs Corpus)</th>
+              <th>Origins with Exclusive Coverage in File</th>
+            </tr>
+          </thead>
+          <tbody>
+            #{file_matrix_rows}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  HTML
+end
 
 fuzzers.each do |f|
   name = f[:name]
@@ -1018,6 +1658,31 @@ fuzzers.each do |f|
       )
     ].join("\n")
 
+    oc = cov_by_origin[name]
+    gen_cov_btn = (oc && oc["report_rel_path"]) ? %(<a class="cov-btn" href="#{CGI.escapeHTML(oc['report_rel_path'])}" target="_blank" rel="noopener">Worker llvm-cov HTML &nearr;</a>) : ""
+    gen_cov_kpis = if oc && oc["has_coverage"]
+                     ol = oc.dig("totals", "lines") || {}
+                     ob = oc.dig("totals", "branches") || {}
+                     vc_l = oc.dig("vs_corpus", "lines", "covered").to_i
+                     vc_b = oc.dig("vs_corpus", "branches", "covered").to_i
+                     ex_l = oc.dig("exclusive", "lines", "covered").to_i
+                     ex_b = oc.dig("exclusive", "branches", "covered").to_i
+                     <<~COV_KPI
+                       <div class="kpi-card">
+                         <div class="kpi-label">Source Coverage (Seeds)</div>
+                         <div class="kpi-value">#{format("%.2f%%", ol["percent"].to_f)}</div>
+                         <div class="kpi-sub">#{format_int(ol["covered"].to_i)} lines &bull; #{format("%.2f%%", ob["percent"].to_f)} branches (+#{format_int(vc_l)}L / +#{format_int(vc_b)}B vs corpus)</div>
+                       </div>
+                       <div class="kpi-card">
+                         <div class="kpi-label">Exclusive to #{safe_name}</div>
+                         <div class="kpi-value">+#{format_int(ex_l)}L / +#{format_int(ex_b)}B</div>
+                         <div class="kpi-sub">lines &amp; branches not hit by any other origin</div>
+                       </div>
+                     COV_KPI
+                   else
+                     ""
+                   end
+
     tab_panels_html << <<~HTML
       <section id="tab-#{safe_name}" class="tab-panel">
         <div class="fuzzer-banner">
@@ -1029,6 +1694,7 @@ fuzzers.each do |f|
             <span class="sched-pill">Role: Seed Generator (#{CGI.escapeHTML(f[:sched])})</span>
             <span class="sched-pill">Runtime: #{format_duration(f[:run_time])}</span>
             <span class="sched-pill">Samples: #{format_int(f[:sample_count])}</span>
+            #{gen_cov_btn}
           </div>
         </div>
 
@@ -1059,11 +1725,14 @@ fuzzers.each do |f|
             else
               ""
             end}
+          #{gen_cov_kpis}
         </div>
 
         <div class="charts-grid">
           #{gen_charts}
         </div>
+
+        #{render_worker_cov_files_table(oc, f[:color])}
       </section>
     HTML
     next
@@ -1165,6 +1834,31 @@ fuzzers.each do |f|
   ].join("\n")
 
   cmd_line = f[:stats]["command_line"] || ""
+  oc = cov_by_origin[name]
+  worker_cov_btn = (oc && oc["report_rel_path"]) ? %(<a class="cov-btn" href="#{CGI.escapeHTML(oc['report_rel_path'])}" target="_blank" rel="noopener">Worker llvm-cov HTML &nearr;</a>) : ""
+  worker_cov_kpis = if oc && oc["has_coverage"]
+                      ol = oc.dig("totals", "lines") || {}
+                      ob = oc.dig("totals", "branches") || {}
+                      vc_l = oc.dig("vs_corpus", "lines", "covered").to_i
+                      vc_b = oc.dig("vs_corpus", "branches", "covered").to_i
+                      ex_l = oc.dig("exclusive", "lines", "covered").to_i
+                      ex_b = oc.dig("exclusive", "branches", "covered").to_i
+                      <<~COV_KPI
+                        <div class="kpi-card">
+                          <div class="kpi-label">Source Coverage (Originated)</div>
+                          <div class="kpi-value">#{format("%.2f%%", ol["percent"].to_f)}</div>
+                          <div class="kpi-sub">#{format_int(ol["covered"].to_i)} lines &bull; #{format("%.2f%%", ob["percent"].to_f)} branches (+#{format_int(vc_l)}L / +#{format_int(vc_b)}B vs corpus)</div>
+                        </div>
+                        <div class="kpi-card">
+                          <div class="kpi-label">Exclusive to #{safe_name}</div>
+                          <div class="kpi-value">+#{format_int(ex_l)}L / +#{format_int(ex_b)}B</div>
+                          <div class="kpi-sub">lines &amp; branches not hit by any other origin</div>
+                        </div>
+                      COV_KPI
+                    else
+                      ""
+                    end
+
   tab_panels_html << <<~HTML
     <section id="tab-#{safe_name}" class="tab-panel">
       <div class="fuzzer-banner">
@@ -1176,15 +1870,17 @@ fuzzers.each do |f|
           <span class="sched-pill">Schedule: #{CGI.escapeHTML(f[:sched])}</span>
           <span class="sched-pill">Stability: #{CGI.escapeHTML(f[:stability])}</span>
           <span class="sched-pill">Samples: #{format_int(f[:sample_count])}</span>
+          #{worker_cov_btn}
         </div>
       </div>
 
       <div class="kpi-grid">
         <div class="kpi-card">
-          <div class="kpi-label">Coverage</div>
+          <div class="kpi-label">AFL++ Map Coverage</div>
           <div class="kpi-value">#{format("%.2f%%", f[:bitmap_cvg])}</div>
           <div class="kpi-sub">#{format_int(f[:edges_found])}#{f[:total_edges] > 0 ? " / #{format_int(f[:total_edges])}" : ""} edges</div>
         </div>
+        #{worker_cov_kpis}
         <div class="kpi-card">
           <div class="kpi-label">Throughput</div>
           <div class="kpi-value">#{format_int(f[:execs_per_sec].round)}/s</div>
@@ -1231,6 +1927,8 @@ fuzzers.each do |f|
       <div class="charts-grid">
         #{fuzzer_charts}
       </div>
+
+      #{render_worker_cov_files_table(oc, f[:color])}
     </section>
   HTML
 end
@@ -1594,6 +2292,119 @@ html = <<~HTML
       .badge-muted { background: #1f2937; color: #9ca3af; }
       .badge-danger { background: rgba(251, 113, 133, 0.2); color: var(--danger); }
       .badge-warn { background: rgba(251, 191, 36, 0.2); color: var(--warn); }
+      .badge-success { background: rgba(52, 211, 153, 0.18); color: var(--success); }
+      .text-warn { color: var(--warn); font-weight: 600; }
+      .cov-gain { color: var(--success); font-weight: 600; font-size: 0.8rem; }
+      .cov-link {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 600;
+        font-size: 0.78rem;
+      }
+      .cov-link:hover { text-decoration: underline; }
+      .cov-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(96, 165, 250, 0.16);
+        border: 1px solid rgba(96, 165, 250, 0.4);
+        color: var(--accent);
+        padding: 5px 12px;
+        border-radius: 7px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        text-decoration: none;
+        transition: all 0.15s ease;
+      }
+      .cov-btn:hover {
+        background: rgba(96, 165, 250, 0.28);
+        color: #fff;
+      }
+      .cov-btn-secondary {
+        background: rgba(255, 255, 255, 0.05);
+        border-color: var(--panel-border);
+        color: var(--text);
+      }
+      .cov-btn-secondary:hover {
+        background: rgba(255, 255, 255, 0.12);
+      }
+      .table-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 14px 16px 10px 16px;
+        border-bottom: 1px solid var(--panel-border);
+      }
+      .table-card-header h3 {
+        margin: 0;
+        font-size: 0.98rem;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .cov-bars-head {
+        display: grid;
+        grid-template-columns: 220px 1fr 150px 150px 90px;
+        gap: 14px;
+        padding: 6px 8px;
+        color: var(--muted);
+        font-size: 0.74rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        border-bottom: 1px solid var(--panel-border);
+      }
+      .cov-bar-row {
+        display: grid;
+        grid-template-columns: 220px 1fr 150px 150px 90px;
+        gap: 14px;
+        align-items: center;
+        padding: 8px;
+        border-bottom: 1px solid rgba(31, 41, 55, 0.6);
+        font-size: 0.82rem;
+        border-radius: 6px;
+      }
+      .cov-bar-row:last-child { border-bottom: none; }
+      .cov-dual-bars {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .cov-bar-line {
+        display: grid;
+        grid-template-columns: 62px 1fr 155px;
+        gap: 10px;
+        align-items: center;
+      }
+      .cov-bar-tag {
+        color: var(--muted);
+        font-size: 0.74rem;
+      }
+      .cov-bar-pct {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        font-size: 0.78rem;
+      }
+      .excl-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--panel-border);
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 0.74rem;
+        margin: 1px 2px;
+        font-variant-numeric: tabular-nums;
+      }
+      .clickable-pill { cursor: pointer; }
+      .clickable-pill:hover {
+        background: rgba(255, 255, 255, 0.12);
+        border-color: var(--accent);
+      }
       .fuzzer-banner {
         display: flex;
         justify-content: space-between;
@@ -1694,6 +2505,165 @@ html = <<~HTML
       .sync-pct { color: var(--muted); font-size: 0.76rem; margin-left: 4px; }
       .sync-imported { font-weight: 700; color: #34d399; }
       .sync-secondary { color: var(--muted); font-size: 0.78rem; margin-left: 3px; }
+      .hunk-drawer-row {
+        background: #080d16;
+      }
+      .hunk-drawer-cell {
+        padding: 12px 16px 16px 26px !important;
+        border-bottom: 1px solid var(--panel-border);
+      }
+      .origin-hunk-group {
+        margin-bottom: 14px;
+      }
+      .origin-hunk-group:last-child {
+        margin-bottom: 0;
+      }
+      .origin-hunk-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.8rem;
+        margin-bottom: 6px;
+        padding-bottom: 4px;
+        border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
+      }
+      .hunk-tab-btn {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--panel-border);
+        color: var(--text);
+        border-radius: 5px;
+        padding: 2px 8px;
+        font-size: 0.72rem;
+        cursor: pointer;
+        margin-left: auto;
+      }
+      .hunk-tab-btn:hover {
+        border-color: var(--accent);
+        background: rgba(56, 189, 248, 0.12);
+      }
+      .hunk-box {
+        background: #0b0f19;
+        border: 1px solid #1f2937;
+        border-radius: 7px;
+        margin-bottom: 10px;
+        overflow: hidden;
+      }
+      .hunk-box:last-child {
+        margin-bottom: 0;
+      }
+      .hunk-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 6px 10px;
+        background: #131c2e;
+        border-bottom: 1px solid #1f2937;
+        font-size: 0.76rem;
+      }
+      .hunk-fn {
+        color: #f8fafc;
+        font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+      }
+      .hunk-range {
+        color: var(--muted);
+        margin-left: 8px;
+        font-variant-numeric: tabular-nums;
+      }
+      .hunk-jump {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 600;
+        font-size: 0.74rem;
+      }
+      .hunk-jump:hover {
+        text-decoration: underline;
+      }
+      .hunk-body {
+        display: flex;
+        flex-direction: column;
+        font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+        font-size: 0.75rem;
+        line-height: 1.45;
+        overflow-x: auto;
+      }
+      .hunk-code-row {
+        display: grid;
+        grid-template-columns: 54px auto 1fr;
+        gap: 8px;
+        align-items: baseline;
+        padding: 1px 10px;
+        white-space: pre;
+      }
+      .hunk-context {
+        color: #64748b;
+      }
+      .hunk-line-excl {
+        background: rgba(16, 185, 129, 0.14);
+        border-left: 3px solid #10b981;
+        padding-left: 7px;
+        color: #ecfdf5;
+      }
+      .hunk-branch-excl {
+        background: rgba(56, 189, 248, 0.12);
+        border-left: 3px solid #38bdf8;
+        padding-left: 7px;
+        color: #f0f9ff;
+      }
+      .hunk-ln {
+        text-align: right;
+        color: #64748b;
+        text-decoration: none;
+        user-select: none;
+        font-variant-numeric: tabular-nums;
+      }
+      .hunk-ln:hover {
+        color: var(--accent);
+        text-decoration: underline;
+      }
+      .hunk-badges {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+      }
+      .hunk-tag {
+        display: inline-block;
+        padding: 0 5px;
+        border-radius: 3px;
+        font-size: 0.66rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+      .hunk-tag-line {
+        background: #065f46;
+        color: #a7f3d0;
+        border: 1px solid #10b981;
+      }
+      .hunk-tag-branch {
+        background: #075985;
+        color: #bae6fd;
+        border: 1px solid #38bdf8;
+      }
+      .hunk-tag-branch-false {
+        background: #78350f;
+        color: #fde68a;
+        border: 1px solid #f59e0b;
+      }
+      .hunk-br-span {
+        background: rgba(56, 189, 248, 0.25);
+        color: #fff;
+        border-bottom: 2px solid #38bdf8;
+        border-radius: 2px;
+        padding: 0 2px;
+      }
+      .hunk-br-false {
+        background: rgba(245, 158, 11, 0.22);
+        border-bottom-color: #f59e0b;
+      }
+      .hunk-src {
+        overflow-x: visible;
+      }
     </style>
   </head>
   <body>
@@ -1703,6 +2673,11 @@ html = <<~HTML
           <h1>Prism AFL++ Fuzzing Telemetry</h1>
           <span class="header-sub">Source: <code>#{CGI.escapeHTML(afl_dir)}</code> &bull; Runtime: #{format_duration(fleet_max_runtime)} &bull; Generated: #{Time.now.strftime("%Y-%m-%d %H:%M:%S")}</span>
         </div>
+        #{if combined_cov && combined_cov["report_rel_path"]
+            %(<div class="fuzzer-meta"><a class="cov-btn" href="#{CGI.escapeHTML(combined_cov['report_rel_path'])}" target="_blank" rel="noopener">Combined llvm-cov HTML &nearr;</a></div>)
+          else
+            ""
+          end}
       </div>
       <nav class="tabs-bar">
         #{tab_buttons_html}
@@ -1727,6 +2702,19 @@ html = <<~HTML
             <div class="kpi-value">#{format("%.2f%%", main_fuzzer[:bitmap_cvg])}</div>
             <div class="kpi-sub">#{format_int(main_fuzzer[:edges_found])} / #{format_int(main_fuzzer[:total_edges])} edges</div>
           </div>
+          #{if combined_cov
+              cl_tot = combined_cov.dig("totals", "lines") || {}
+              cb_tot = combined_cov.dig("totals", "branches") || {}
+              <<~COV_KPI
+                <div class="kpi-card clickable-row" onclick="selectTab('coverage')">
+                  <div class="kpi-label">Source Coverage (LLVM)</div>
+                  <div class="kpi-value">#{format("%.2f%%", cl_tot["percent"].to_f)}</div>
+                  <div class="kpi-sub">#{format_int(cl_tot["covered"].to_i)} lines &bull; #{format("%.2f%%", cb_tot["percent"].to_f)} branches</div>
+                </div>
+              COV_KPI
+            else
+              ""
+            end}
           <div class="kpi-card">
             <div class="kpi-label">Max Queue Size</div>
             <div class="kpi-value">#{format_int(fleet_max_corpus)}</div>
@@ -1769,6 +2757,8 @@ html = <<~HTML
                 <th class="num">Total Execs</th>
                 <th class="num">Map %</th>
                 <th class="num">Edges</th>
+                <th class="num">Src Line %</th>
+                <th class="num">Exclusive</th>
                 <th class="num">Corpus</th>
                 <th class="num">Local Finds</th>
                 <th class="num">Synced</th>
@@ -1777,6 +2767,7 @@ html = <<~HTML
                 <th class="num">Pending (Fav/All)</th>
                 <th class="num">Crashes</th>
                 <th class="num">Hangs</th>
+                <th class="num">Report</th>
               </tr>
             </thead>
             <tbody>
@@ -1792,15 +2783,18 @@ html = <<~HTML
     </main>
 
     <script>
-      function selectTab(name) {
+      function selectTab(name, push = true) {
+        if (!document.getElementById('tab-' + name)) return;
         document.querySelectorAll('.tab-btn').forEach(btn => {
           btn.classList.toggle('active', btn.dataset.tab === name);
         });
         document.querySelectorAll('.tab-panel').forEach(panel => {
           panel.classList.toggle('active', panel.id === 'tab-' + name);
         });
-        if (history.replaceState) {
-          history.replaceState(null, null, '#' + encodeURIComponent(name));
+        const targetHash = '#' + encodeURIComponent(name);
+        if (push && window.location.hash !== targetHash && history.pushState) {
+          history.pushState({ tab: name }, '', targetHash);
+          window.scrollTo({ top: 0, behavior: 'instant' });
         }
       }
 
@@ -1961,12 +2955,65 @@ html = <<~HTML
         });
       });
 
-      window.addEventListener('DOMContentLoaded', () => {
-        const hash = decodeURIComponent(window.location.hash.replace(/^#/, ''));
-        if (hash && document.getElementById('tab-' + hash)) {
-          selectTab(hash);
+      function applyHashTab() {
+        const hash = decodeURIComponent(window.location.hash.replace(/^#/, '')) || 'overview';
+        if (document.getElementById('tab-' + hash)) {
+          selectTab(hash, false);
         }
-      });
+      }
+
+      function toggleHunkDrawer(id) {
+        const row = document.getElementById(id);
+        if (!row) return;
+        const isHidden = row.style.display === 'none' || !row.style.display;
+        row.style.display = isHidden ? 'table-row' : 'none';
+        if (isHidden) {
+          row.querySelectorAll('.origin-hunk-group').forEach(g => { g.style.display = 'block'; });
+        }
+        const caret = document.getElementById('caret-' + id);
+        if (caret) caret.innerHTML = isHidden ? '&#9662;' : '&#9656;';
+      }
+
+      function toggleAllHunks(btn, prefix) {
+        const rows = Array.from(document.querySelectorAll('.hunk-drawer-row')).filter(r => r.id && r.id.startsWith(prefix));
+        const anyHidden = rows.some(r => r.style.display === 'none' || !r.style.display);
+        rows.forEach(row => {
+          row.style.display = anyHidden ? 'table-row' : 'none';
+          if (anyHidden) {
+            row.querySelectorAll('.origin-hunk-group').forEach(g => { g.style.display = 'block'; });
+          }
+          const caret = document.getElementById('caret-' + row.id);
+          if (caret) caret.innerHTML = anyHidden ? '&#9662;' : '&#9656;';
+        });
+        if (btn) {
+          btn.textContent = anyHidden ? 'Collapse All Exclusive Hunks' : 'Expand All Exclusive Hunks';
+        }
+      }
+
+      function toggleFileOriginHunks(drawerId, originName) {
+        const row = document.getElementById(drawerId);
+        if (!row) return;
+        const groups = Array.from(row.querySelectorAll('.origin-hunk-group'));
+        const isRowHidden = row.style.display === 'none' || !row.style.display;
+        const targetGroup = groups.find(g => g.dataset.origin === originName);
+        const onlyTargetShown = !isRowHidden && groups.every(g => (g.dataset.origin === originName) ? (g.style.display !== 'none') : (g.style.display === 'none'));
+        if (onlyTargetShown) {
+          row.style.display = 'none';
+          const caret = document.getElementById('caret-' + drawerId);
+          if (caret) caret.innerHTML = '&#9656;';
+        } else {
+          row.style.display = 'table-row';
+          groups.forEach(g => {
+            g.style.display = (g.dataset.origin === originName) ? 'block' : 'none';
+          });
+          const caret = document.getElementById('caret-' + drawerId);
+          if (caret) caret.innerHTML = '&#9662;';
+        }
+      }
+
+      window.addEventListener('popstate', applyHashTab);
+      window.addEventListener('hashchange', applyHashTab);
+      window.addEventListener('DOMContentLoaded', applyHashTab);
     </script>
   </body>
   </html>

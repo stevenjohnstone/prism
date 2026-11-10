@@ -153,21 +153,24 @@ Inside the `tmux` session:
 
 ### Telemetry Plots and Source Coverage
 
-- **Interactive telemetry plots** (coverage growth, throughput, corpus size, and cross-worker queue sync breakdowns):
+- **Unified telemetry & coverage report** (coverage growth, throughput, corpus size, cross-worker queue sync breakdowns, plus per-worker and combined LLVM source coverage):
   ```bash
   make fuzz-plot
   open tmp/fuzz/plots/index.html
   ```
-- **Source-level coverage** (computed across all reachable library functions over the deduplicated corpus in `tmp/fuzz/afl`):
+  `make fuzz-plot` automatically runs `test/fuzz/report/coverage.sh` if `tmp/fuzz/coverage/coverage.json` is missing or older than the queues in `tmp/fuzz/afl` (set `FUZZ_SKIP_COVERAGE=1` to skip coverage collection).
+- **Standalone coverage collection** (partitions inputs across `corpus`, `grammar`, and each fuzzer worker, evaluates each origin's standalone/marginal/exclusive coverage, and merges their profiles into the combined report):
   ```bash
   make fuzz-coverage
   ```
-  `make fuzz-coverage` prints a per-file coverage table to the terminal and writes four artifacts to `tmp/fuzz/coverage/`:
+  `make fuzz-coverage` prints the combined per-file coverage table to the terminal, updates `tmp/fuzz/plots/index.html`, and writes:
   - `tmp/fuzz/coverage/lcov.info` — workspace-relative LCOV line, function, and branch coverage for IDE integration:
     - **VS Code / Cursor / Antigravity**: Install [Coverage Gutters](https://marketplace.visualstudio.com/items?itemName=ryanluker.vscode-coverage-gutters) and run *Coverage Gutters: Display Coverage* (or *Watch*) to highlight covered/uncovered lines and branches inline in the editor.
     - **CLion**: Use *Run -> Show Coverage Data...* (`Cmd+Option+F6` / `Ctrl+Alt+F6`) and select `tmp/fuzz/coverage/lcov.info`.
     - **Neovim**: Point [`nvim-coverage`](https://github.com/andythigpen/nvim-coverage) (`lcov_file`) at `tmp/fuzz/coverage/lcov.info`.
-  - `tmp/fuzz/coverage/report/index.html` — standalone HTML report with line and branch counts (`open tmp/fuzz/coverage/report/index.html`).
+  - `tmp/fuzz/coverage/report/index.html` — combined annotated HTML source report (`open tmp/fuzz/coverage/report/index.html`).
+  - `tmp/fuzz/coverage/workers/<origin>/report/index.html` — per-origin annotated HTML source reports (`corpus`, `grammar`, `main`, `ldet`, `msan`, `main-2..N`).
+  - `tmp/fuzz/coverage/coverage.json` — structured JSON breakdown of combined and per-origin coverage, gains over `corpus`, and exclusive leave-one-out contributions.
   - `tmp/fuzz/coverage/coverage.profdata` — merged LLVM profile data for custom `llvm-cov` queries.
   - `tmp/fuzz/coverage/summary.txt` — saved copy of the terminal summary table.
 

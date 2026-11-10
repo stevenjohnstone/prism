@@ -137,13 +137,32 @@ fuzz-attach:
 fuzz-stop:
 	$(Q) docker stop $(FUZZ_CONTAINER_NAME)
 
+define FUZZ_RUN_COVERAGE
+@if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
+	docker exec -e FUZZ_FLAGS="$(FUZZ_FLAGS)" $(FUZZ_CONTAINER_NAME) ./test/fuzz/report/coverage.sh; \
+else \
+	docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh; \
+fi
+endef
+
 fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "collecting coverage"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh
+	$(FUZZ_RUN_COVERAGE)
+	$(Q) ruby ./test/fuzz/report/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html $(FUZZ_COVERAGE_DIR)/coverage.json
 
-fuzz-plot:
+fuzz-plot: fuzz-docker-build fuzz-gen-templates
+	@if [ -z "$(FUZZ_SKIP_COVERAGE)" ] && [ -d "$(FUZZ_AFL_DIR)" ]; then \
+		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
+			echo "collecting coverage (set FUZZ_SKIP_COVERAGE=1 to skip)"; \
+			if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
+				docker exec -e FUZZ_FLAGS="$(FUZZ_FLAGS)" $(FUZZ_CONTAINER_NAME) ./test/fuzz/report/coverage.sh; \
+			else \
+				docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh; \
+			fi; \
+		fi; \
+	fi
 	$(ECHO) "generating AFL++ plots"
-	$(Q) ruby ./test/fuzz/report/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html
+	$(Q) ruby ./test/fuzz/report/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html $(FUZZ_COVERAGE_DIR)/coverage.json
 
 fuzz-test: fuzz-docker-build
 	$(ECHO) "testing AFL++ instrumentation patch"
