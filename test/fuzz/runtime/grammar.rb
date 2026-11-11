@@ -39,6 +39,85 @@ STRING_FRAGMENTS = [
   'interp_#{["inner", "nested"].first}'
 ].freeze
 
+WORD_LIST_FRAGMENTS = %w[alpha beta gamma delta foo_bar item_1].freeze
+
+# Valid Onigmo / Prism regexp fragments (no unescaped `/` or `"` so they are valid
+# inside both `/.../` and `%r"..."`, and compatible with `/`, `/i`, `/m`, `/x`, `/o`, `/u`).
+REGEXP_VALID_FRAGMENTS = [
+  # Named captures (<name> and 'name'), backrefs, and subexp calls
+  '(?<foo>\w+)(?:\s+(?\'bar\'\d+))?\k<foo>',
+  '(?<tok>[a-z]+)|\g<tok>',
+  # Groups: non-capturing, lookahead, lookbehind, atomic, absence, conditional
+  '(?:foo|bar)+(?=baz)(?!qux)',
+  '(?<=^|\s)(?>\w+)(?<!_)(?~end)',
+  '(a)(?(1)b|c)',
+  '(?<k>x)(?(<k>)y|z)',
+  # Inline group option toggles (both standalone `(?imx)`/`(?x-i)`/`(?i-x)` and scoped `(?imx:...)`)
+  "(?x-i)foo # ext comment\n(?i-x)bar",
+  "(?iix:foo # scoped ext\n)+(?imxdau-imx:bar)+",
+  '(?-x:a b c)',
+  # Inline comments (including escaped `\)` paren and UTF-8 multibyte text) and extended `#` comments
+  '(?#simple comment)foo(?#escaped \) paren)bar',
+  '(?#コメント)abc',
+  "foo # comment with newline\nbar",
+  'foo # trailing comment without newline',
+  # Range quantifiers `{n}`, `{n,}`, `{n,m}`, `{,m}` (single & multi-digit) + backtracked `{...}` forms
+  'a{12}b{10,}c{2,15}d{,12}',
+  'a{foo}b{2x}c{,x}d{2,3x}e{2,',
+  # POSIX bracket classes, negated POSIX classes, nested character set intersections, backtracked `[[:`
+  '[[:alpha:]][[:digit:]][[:xdigit:]][[:^space:]][[:^cntrl:]]',
+  '[a-z&&[^aeiou]][[a-f][0-9]]',
+  '[[:unclosed_posix]',
+  # All 3 Onigmo property escape tiers: POSIX, Script, and Unicode-only + non-brace `\p`
+  '\p{Alpha}\p{ASCII}\p{Blank}\p{Cntrl}\p{Print}\p{Punct}\p{Upper}\p{Word}\p{XDigit}\P{Space}\p{^Digit}',
+  '\p{Han}\p{Greek}\p{Latin}\p{Hiragana}\p{^Katakana}\p{Cyrillic}',
+  '\p{Lu}\P{Nd}\p{^Assigned}\pa',
+  # Unicode escapes (`\uNNNN` and `\u{...}` >= 0x80 with whitespace), valid UTF-8 `\x` groups, meta/control
+  '\u3042\u00e9\u{ 3042 3044 0041 }',
+  '\xE3\x81\x82a\xC3\xA9',
+  '\M-a\C-b\cc\M-\C-d\C-\M-e\M-\cf\c\M-g',
+  # Non-ASCII UTF-8 literals (both outside and inside character sets)
+  '(?:あいう|λ)+[あ-ん]'
+].freeze
+
+# Intentionally malformed / encoding-conflict regexp fragments sampled by the raw
+# grammar evolver and post-pass mutator to cover diagnostic & recovery paths in src/regexp.c.
+REGEXP_ERROR_FRAGMENTS = [
+  '(?<>empty_name)',
+  '[]empty_char_class',
+  '(?z:undef_opt)',
+  '(?-d:non_removable_opt)',
+  '(?-z:invalid_remove_opt)',
+  '(?i-i+i:re_add_removed)',
+  '(+repeat_target)',
+  ')unmatched_at_start',
+  'a)unmatched_close',
+  '(unmatched_open',
+  '(?#unclosed_comment',
+  '(?<unclosed_group',
+  '(?\'unclosed_sq_group',
+  '(?(unclosed_cond',
+  '(?i',
+  '(?-x',
+  '(?',
+  '\Ma\Cb',
+  '\uD800',
+  '\u{110000}',
+  '\u{1234567}',
+  '\u{1234',
+  '\u{}',
+  '\u{xyz}',
+  '\u12',
+  '\u',
+  '\xFF',
+  '\u{3042}\x80',
+  '\x80\u{3042}'
+].freeze
+
+REGEXP_SAFE_MODIFIERS = ["", "i", "m", "x", "o", "u", "imx", "iu", "mx"].freeze
+REGEXP_ALL_MODIFIERS = (REGEXP_SAFE_MODIFIERS + ["n", "e", "s", "ne", "nu"]).freeze
+MAGIC_ENCODINGS = %w[us-ascii ascii-8bit euc-jp windows-31j iso-8859-1 utf-8].freeze
+
 def parse_kv_file(path)
   return {} unless File.exist?(path)
 
@@ -192,21 +271,171 @@ def build_guarded_evaluators(in_flight_io)
   [fitness, validator, parse_fn]
 end
 
-# Build terminal generators with fixed matching delimiters (`"` for tSTRING_END)
-# and unary +/- operators (`+` / `-` rather than method names `+@` / `-@`).
+# Build terminal generators with matching string/regexp delimiters, unary +/-
+# operators (`+` / `-` rather than method names `+@` / `-@`), and a delimiter stack
+# so `tSTRING_CONTENT` emits regexp syntax inside regexps, clean words inside
+# `%w`/`%i` word lists, and string fragments inside strings.
 # Note: in CRuby's parse.y, tQWORDS_BEG/tQSYMBOLS_BEG are the non-interpolating
 # %w/%i forms, while tWORDS_BEG/tSYMBOLS_BEG are the interpolating %W/%I forms.
-def build_ruby_terminals(rng)
+def build_ruby_terminals(rng, allow_invalid: false)
+  delim_stack = []
+  reset_delims = -> { delim_stack.clear }
+
   terminals = Lrama::Fuzz::RubyTerminals.build(random: rng)
-  terminals["tWORDS_BEG"] = '%W"'
-  terminals["tQWORDS_BEG"] = '%w"'
-  terminals["tSYMBOLS_BEG"] = '%I"'
-  terminals["tQSYMBOLS_BEG"] = '%i"'
-  terminals["tXSTRING_BEG"] = '%x"'
+  terminals["tSTRING_BEG"] = -> { delim_stack << [:string, '"']; '"' }
+  terminals["tXSTRING_BEG"] = -> { delim_stack << [:string, '"']; '%x"' }
+  terminals["tWORDS_BEG"] = -> { delim_stack << [:words, '"']; '%W"' }
+  terminals["tQWORDS_BEG"] = -> { delim_stack << [:words, '"']; '%w"' }
+  terminals["tSYMBOLS_BEG"] = -> { delim_stack << [:words, '"']; '%I"' }
+  terminals["tQSYMBOLS_BEG"] = -> { delim_stack << [:words, '"']; '%i"' }
+  terminals["tSTRING_END"] = lambda do
+    top_kind = delim_stack.last&.first
+    delim_stack.pop if top_kind == :string || top_kind == :words
+    '"'
+  end
+  terminals["tSTRING_DBEG"] = -> { delim_stack << [:interp, "}"]; '#{' }
+  terminals["tSTRING_DEND"] = lambda do
+    delim_stack.pop if delim_stack.last&.first == :interp
+    "}"
+  end
+  terminals["tREGEXP_BEG"] = lambda do
+    if rng.rand < 0.85
+      delim_stack << [:regexp, "/"]
+      "/"
+    else
+      delim_stack << [:regexp, '"']
+      '%r"'
+    end
+  end
+  terminals["tREGEXP_END"] = lambda do
+    idx = delim_stack.rindex { |k, _| k == :regexp }
+    close_delim = if idx
+                    _, d = delim_stack[idx]
+                    delim_stack.slice!(idx..-1)
+                    d
+                  else
+                    "/"
+                  end
+    mods = (allow_invalid && rng.rand < 0.25) ? REGEXP_ALL_MODIFIERS : REGEXP_SAFE_MODIFIERS
+    "#{close_delim}#{mods.sample(random: rng)}"
+  end
   terminals["tUPLUS"] = "+"
   terminals["tUMINUS"] = "-"
-  terminals["tSTRING_CONTENT"] = -> { STRING_FRAGMENTS.sample(random: rng) }
-  terminals
+  terminals["tSTRING_CONTENT"] = lambda do
+    case delim_stack.last&.first
+    when :regexp
+      if allow_invalid && rng.rand < 0.18
+        REGEXP_ERROR_FRAGMENTS.sample(random: rng)
+      else
+        REGEXP_VALID_FRAGMENTS.sample(random: rng)
+      end
+    when :words
+      WORD_LIST_FRAGMENTS.sample(random: rng)
+    else
+      STRING_FRAGMENTS.sample(random: rng)
+    end
+  end
+  [terminals, reset_delims]
+end
+
+# Extend lrama-fuzz's Ruby::Composer so composed programs also exercise regexp
+# literals (including inside `case ... in /.../` and `case ... when /.../`),
+# `=~` / `!~` calls, and LHS named-capture `MatchWriteNode` variable introduction
+# (both plain `/(?<x>...)/ =~ str` and interpolated `/(?<x>...)#{v}/x =~ str`).
+class PrismComposer < Lrama::Fuzz::Ruby::Composer
+  PRISM_TEMPLATES = (Lrama::Fuzz::Ruby::Composer::TEMPLATES + %i[regexp_match]).freeze
+  PRISM_NESTED_TEMPLATES = (Lrama::Fuzz::Ruby::Composer::NESTED_TEMPLATES + %i[regexp_match]).freeze
+
+  private
+
+  def pick_template(pool = PRISM_TEMPLATES)
+    pool = PRISM_NESTED_TEMPLATES if pool.equal?(Lrama::Fuzz::Ruby::Composer::NESTED_TEMPLATES)
+    super(pool)
+  end
+
+  def nested_fragment
+    @nesting += 1
+    send(PRISM_NESTED_TEMPLATES.sample(random: @random))
+  ensure
+    @nesting -= 1
+  end
+
+  def literal_expr
+    return regexp_literal if @random.rand < 0.22
+    super
+  end
+
+  def rich_expr
+    r = @random.rand
+    if r < 0.12
+      regexp_match
+    elsif r < 0.20
+      op = @random.rand < 0.5 ? "=~" : "!~"
+      "#{simple_expr} #{op} #{regexp_literal}"
+    else
+      super
+    end
+  end
+
+  def regexp_literal
+    body = REGEXP_VALID_FRAGMENTS.sample(random: @random)
+    flags = REGEXP_SAFE_MODIFIERS.sample(random: @random)
+    if @random.rand < 0.8
+      "/#{body}/#{flags}"
+    else
+      "%r\"#{body}\"#{flags}"
+    end
+  end
+
+  def regexp_match
+    rhs = @defined_vars.empty? ? %("#{WORDS.sample(random: @random)}") : known_var
+    if @random.rand < 0.55
+      cap1 = define_var
+      cap2 = define_var
+      inner = REGEXP_VALID_FRAGMENTS.sample(random: @random)
+      flags = REGEXP_SAFE_MODIFIERS.sample(random: @random)
+      "/(?<#{cap1}>[[:alpha:]]+)(?'#{cap2}'\\d*)#{inner}/#{flags} =~ #{rhs}"
+    else
+      interp_expr = @defined_vars.empty? ? literal_expr : known_var
+      cap1 = define_var
+      cap2 = define_var
+      flags = %w[x ix mx u].sample(random: @random)
+      "/(?<#{cap1}>\\p{Alpha}+)\#{#{interp_expr}}(?'#{cap2}'[0-9]{1,3}) # ext\n/#{flags} =~ #{rhs}"
+    end
+  end
+end
+
+# Emit an encoding / multibyte regexp variant to exercise parser->encoding_changed
+# paths in src/regexp.c (US-ASCII, ASCII-8BIT, EUC-JP, Windows-31J, ISO-8859-1, UTF-8).
+def inject_encoding_variant(code, rng)
+  enc = MAGIC_ENCODINGS.sample(random: rng)
+  extra = case rng.rand(6)
+          when 0
+            # Valid EUC-JP / SJIS / UTF-8 / single-byte raw multibyte (with ASCII prefix) under /n, /e, /s, /u
+            mod = %w[n e s u].sample(random: rng)
+            raw_seq = ["abc\xA4\xA2".b, "abc\x82\xA0".b, "abc\xE3\x81\x82".b, "abc\xFF".b].sample(random: rng)
+            "/#{raw_seq}/#{mod}".b
+          when 1
+            # Multibyte inline comment `(?#...)` slow path + invalid multibyte inside `[...]`
+            raw_seq = ["\xA4\xA2\\)ok".b, "\xFF".b].sample(random: rng)
+            "/(?##{raw_seq})[#{raw_seq}]/".b
+          when 2
+            # Property escape tier mismatches (/n rejects Script+Unicode; /e,/s reject Unicode-only)
+            prop = %w[\p{Hiragana} \p{Lu} \p{Alpha} \p{^Katakana}].sample(random: rng)
+            mod = %w[n e s u].sample(random: rng)
+            "/#{prop}/#{mod}".b
+          when 3
+            # Unicode & hex escapes (mixed and standalone) across encoding modifiers
+            seq = ['\u{3042}', '\u{3042}\x80', '\x80\u{3042}', '\xE3\x81\x82', '\x82\xA0', '\xFE'].sample(random: rng)
+            mod = ["", "n", "e", "s", "u"].sample(random: rng)
+            "/#{seq}/#{mod}".b
+          when 4
+            "/#{REGEXP_ERROR_FRAGMENTS.sample(random: rng)}/".b
+          else
+            "".b
+          end
+  prefix = "# encoding: #{enc}\n".b
+  extra.empty? ? (prefix + code.b) : (prefix + code.b + "\n".b + extra + "\n".b)
 end
 
 # Collect double-quoted StringNode and InterpolatedStringNode spans from a Prism AST.
@@ -323,17 +552,34 @@ def build_evolvers(grammar, rng, fitness, validator)
   avoid = Lrama::Fuzz::Ruby::AVOID_SYMBOLS + Set["dsym", "END_OF_INPUT"]
 
   comp_rng = Random.new(rng.rand(2**32))
+  comp_terminals, comp_reset_delims = build_ruby_terminals(comp_rng, allow_invalid: false)
   comp_gen = Lrama::Fuzz::Generator.new(
     grammar,
-    terminals: build_ruby_terminals(comp_rng),
+    terminals: comp_terminals,
     classifier: classifier,
     avoid_symbols: avoid,
     max_depth: rng.rand(8..12),
     random: comp_rng
   )
   # Filter avoided rules upfront in pick_rule so once all non-avoided rules of a
-  # non-terminal are covered, `uncovered` does not fall back to avoided rules.
+  # non-terminal are covered, `uncovered` does not fall back to avoided rules,
+  # and clear the delimiter stack at the start of every derivation.
   comp_gen.singleton_class.prepend(Module.new do
+    define_method(:generate) do |**kwargs|
+      comp_reset_delims.call
+      super(**kwargs)
+    end
+
+    define_method(:generate_from) do |*args|
+      comp_reset_delims.call
+      super(*args)
+    end
+
+    define_method(:generate_targeted) do
+      comp_reset_delims.call
+      super()
+    end
+
     def pick_rule(rules)
       super(filter_avoided(rules))
     end
@@ -341,7 +587,7 @@ def build_evolvers(grammar, rng, fitness, validator)
   composed_evolver = Lrama::Fuzz::ComposedEvolver.new(
     comp_gen,
     fitness: fitness,
-    composer_class: Lrama::Fuzz::Ruby::Composer,
+    composer_class: PrismComposer,
     validator: validator,
     population_size: POPULATION_SIZE,
     genome_length: 300,
@@ -350,9 +596,10 @@ def build_evolvers(grammar, rng, fitness, validator)
   )
 
   gram_rng = Random.new(rng.rand(2**32))
+  gram_terminals, gram_reset_delims = build_ruby_terminals(gram_rng, allow_invalid: true)
   grammar_evolver = Lrama::Fuzz::Evolver.new(
     grammar,
-    terminals: build_ruby_terminals(gram_rng),
+    terminals: gram_terminals,
     fitness: fitness,
     classifier: classifier,
     avoid_symbols: avoid,
@@ -362,6 +609,12 @@ def build_evolvers(grammar, rng, fitness, validator)
     mutation_rate: 0.05 + rng.rand * 0.10,
     random: gram_rng
   )
+  grammar_evolver.singleton_class.prepend(Module.new do
+    define_method(:generate_from_genome) do |genome|
+      gram_reset_delims.call
+      super(genome)
+    end
+  end)
 
   [composed_evolver, grammar_evolver]
 end
@@ -539,6 +792,12 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
         if heredoc_code
           emit_candidate.call(heredoc_code, validator.call(heredoc_code))
         end
+      end
+
+      # Emit magic `# encoding:` + multibyte/modifier regexp variants on ~18% of candidates.
+      if master_rng.rand < 0.18
+        enc_code = inject_encoding_variant(code, master_rng)
+        emit_candidate.call(enc_code, validator.call(enc_code))
       end
     end
   end
