@@ -24,8 +24,6 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 }
 #endif
 
-static size_t allocated = 0;
-
 #ifndef FUZZ_MAX_ALLOCATED
 #define FUZZ_MAX_ALLOCATED 128
 #endif
@@ -39,16 +37,28 @@ static size_t allocated = 0;
 #define FUZZ_STR(x) FUZZ_STR_HELPER(x)
 
 #ifdef PRISM_XALLOCATOR
+typedef union {
+    size_t size;
+    long double ld;
+    void *ptr;
+    long long ll;
+    unsigned char pad[16];
+} fuzz_max_align_t;
+
+#define FUZZ_ALLOC_HEADER_SIZE sizeof(fuzz_max_align_t)
+
+static size_t allocated = 0;
+
 __attribute__((noinline))
 void *fuzz_malloc(size_t s) {
     assert(s <= FUZZ_MAX_ALLOCATED_BYTES && allocated <= FUZZ_MAX_ALLOCATED_BYTES - s);
-    void *ptr = malloc(s + sizeof(size_t));
+    void *ptr = malloc(s + FUZZ_ALLOC_HEADER_SIZE);
     if (ptr == NULL) {
         return NULL;
     }
     memcpy(ptr, (void *)&s, sizeof(size_t));
     allocated += s;
-    return (char *)ptr + sizeof(size_t);
+    return (char *)ptr + FUZZ_ALLOC_HEADER_SIZE;
 }
 
 __attribute__((noinline))
@@ -57,9 +67,21 @@ void fuzz_free(void *ptr) {
         return;
     }
     size_t s;
-    memcpy((void *)&s, (char *)ptr - sizeof(size_t), sizeof(size_t));
+    memcpy((void *)&s, (char *)ptr - FUZZ_ALLOC_HEADER_SIZE, sizeof(size_t));
     allocated -= s;
-    free((char *)ptr - sizeof(size_t));
+    free((char *)ptr - FUZZ_ALLOC_HEADER_SIZE);
+}
+
+__attribute__((noinline))
+void fuzz_free_sized(void *ptr, size_t expected_size) {
+    if (ptr == NULL) {
+        assert(expected_size == 0);
+        return;
+    }
+    size_t stored_size;
+    memcpy((void *)&stored_size, (char *)ptr - FUZZ_ALLOC_HEADER_SIZE, sizeof(size_t));
+    assert(stored_size == expected_size);
+    fuzz_free(ptr);
 }
 
 __attribute__((noinline))
@@ -82,18 +104,30 @@ void *fuzz_realloc(void *ptr, size_t s) {
         fuzz_free(ptr);
         return NULL;
     }
-    char *raw_ptr = (char *)ptr - sizeof(size_t);
+    char *raw_ptr = (char *)ptr - FUZZ_ALLOC_HEADER_SIZE;
     size_t old_size;
     memcpy((void *)&old_size, raw_ptr, sizeof(size_t));
     assert(s <= FUZZ_MAX_ALLOCATED_BYTES && allocated - old_size <= FUZZ_MAX_ALLOCATED_BYTES - s);
 
-    char *new_raw_ptr = realloc(raw_ptr, s + sizeof(size_t));
+    char *new_raw_ptr = realloc(raw_ptr, s + FUZZ_ALLOC_HEADER_SIZE);
     if (new_raw_ptr == NULL) {
         return NULL;
     }
     memcpy(new_raw_ptr, (void *)&s, sizeof(size_t));
     allocated = allocated - old_size + s;
-    return new_raw_ptr + sizeof(size_t);
+    return new_raw_ptr + FUZZ_ALLOC_HEADER_SIZE;
+}
+
+__attribute__((noinline))
+void *fuzz_realloc_sized(void *ptr, size_t new_size, size_t expected_old_size) {
+    if (ptr == NULL) {
+        assert(expected_old_size == 0);
+        return fuzz_malloc(new_size);
+    }
+    size_t stored_size;
+    memcpy((void *)&stored_size, (char *)ptr - FUZZ_ALLOC_HEADER_SIZE, sizeof(size_t));
+    assert(stored_size == expected_old_size);
+    return fuzz_realloc(ptr, new_size);
 }
 
 #endif
@@ -125,6 +159,8 @@ LLVMFuzzerTestOneInput(const char *data, size_t size) {
     __msan_unpoison(data, size);
 #endif
     harness((const uint8_t *) data, size);
+#ifdef PRISM_XALLOCATOR
     assert(allocated == 0);
+#endif
     return 0;
 }
