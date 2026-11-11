@@ -10,7 +10,7 @@ require "tmpdir"
 
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
-OUTPUT_DIR = "tmp/fuzz/afl"
+OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze
 TESTCASES_DIR = "tmp/fuzz/triage"
 TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
 MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
@@ -218,10 +218,10 @@ def minimize(crash, reason, minimized_input, executable, sig_lines)
       tmin_input = File.exist?(tmpfile) ? tmpfile : crash
       # afl-tmin runs the target via the AFL++ forkserver, which exits via
       # _exit(0) without running LSAN's atexit leak check (and LSAN does not
-      # raise a crash signal by default). Use fuzz.ldet for afl-tmin on memory
+      # raise a crash signal by default). Use fuzz.ijon for afl-tmin on memory
       # leaks so assert(allocated == 0) aborts directly inside
       # LLVMFuzzerTestOneInput.
-      tmin_executable = reason == "memory-leak" ? "./build/fuzz.ldet" : executable
+      tmin_executable = reason == "memory-leak" ? "./build/fuzz.ijon" : executable
       run_afl_tmin(false, tmin_input, minimized_input, tmin_executable)
       FileUtils.cp(tmin_input, minimized_input) unless File.exist?(minimized_input)
     end
@@ -242,8 +242,8 @@ def process_crash(crash_dir, crash, executable, harness_code, semaphore)
   end
 
   reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
-  if executable.end_with?("ldet", "native")
-    # fuzz.ldet and fuzz.native are built without sanitizers (and SAND workers
+  if executable.end_with?("ijon", "native")
+    # fuzz.ijon and fuzz.native are built without sanitizers (and SAND workers
     # record fuzz.native in cmdline while running fuzz.sand under -w), so try
     # ./build/fuzz (ASAN/UBSAN) first for sanitizer crashes and assertions so
     # they deduplicate with main; next try ./build/fuzz.lsan for memory leaks;
@@ -356,7 +356,7 @@ end
 harness_code = extract_harness_code("./build/fuzz")
 pool = Concurrent::FixedThreadPool.new([Concurrent.processor_count / 2, 1].max)
 semaphore = Mutex.new
-Dir.glob(File.join(OUTPUT_DIR, "**/{crashes*,hangs*}")) do |crash_dir|
+OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each do |crash_dir|
   cmdline_file = File.join(crash_dir, "../cmdline")
   next unless File.exist?(cmdline_file)
 

@@ -63,7 +63,7 @@ Everything needed to build the fuzzers, run a campaign, and triage crashes is se
    ```bash
    make fuzz-triage
    ```
-   Triage runs every crash and hang from `tmp/fuzz/afl/` against the sanitizer binaries, deduplicates them by backtrace signature, minimizes the triggering input, and writes standalone reproducers into `tmp/fuzz/triage/`.
+   Triage runs every crash and hang from `tmp/fuzz/afl/` and `tmp/fuzz/afl-ijon/` against the sanitizer binaries, deduplicates them by backtrace signature, minimizes the triggering input, and writes standalone reproducers into `tmp/fuzz/triage/`.
 
 ### Where to Find Crashes and How to Reproduce
 
@@ -158,16 +158,16 @@ Inside the `tmux` session:
   make fuzz-plot
   open tmp/fuzz/plots/index.html
   ```
-  `make fuzz-plot` automatically runs `test/fuzz/report/coverage.sh` if `tmp/fuzz/coverage/coverage.json` is missing or older than the queues in `tmp/fuzz/afl` (set `FUZZ_SKIP_COVERAGE=1` to skip coverage collection).
+  `make fuzz-plot` automatically runs `test/fuzz/report/coverage.sh` if `tmp/fuzz/coverage/coverage.json` is missing or older than the queues in `tmp/fuzz/afl` or `tmp/fuzz/afl-ijon` (set `FUZZ_SKIP_COVERAGE=1` to skip coverage collection).
 
   The generated dashboard (`tmp/fuzz/plots/index.html`) includes:
   - **Fleet Overview & Peer Sync Telemetry**: Interactive time-series charts for coverage growth, throughput, corpus size, and pending queue items, plus a cross-worker sync yield breakdown showing how each worker's queue discoveries are tested and imported by peers.
-  - **Crash Lineage & Multi-Worker Evolution (`Origin → ... → Crash Discoverer`)**: Because AFL++ preserves every queue item in `tmp/fuzz/afl/<worker>/queue/` (including unmutated copies of `-F` grammar seeds imported into `ldet/queue/` before `grammar.rb` prunes the temporary staging file), `test/fuzz/report/plot.rb` walks backwards from every saved crash/hang file through local mutation pointers (`src:NNNNNN`) and cross-worker sync pointers (`sync:<peer>,src:NNNNNN`) all the way to the root seed (`corpus` vs. `grammar`):
-    - Breaks down all crashes by their full multi-worker evolutionary pathway (e.g., `★ grammar → ldet` or `corpus → main → main-7 → ldet → msan`).
+  - **Crash Lineage & Multi-Worker Evolution (`Origin → ... → Crash Discoverer`)**: Because AFL++ preserves every queue item across `tmp/fuzz/afl/<worker>/queue/` and `tmp/fuzz/afl-ijon/ijon/queue/` (including unmutated copies of `-F` grammar seeds imported into `ijon/queue/` before `grammar.rb` prunes the temporary staging file), `test/fuzz/report/plot.rb` walks backwards from every saved crash/hang file through local mutation pointers (`src:NNNNNN`), foreign sync pointers (`sync:ijon_0,src:id:NNNNNN`), and peer sync pointers (`sync:<peer>,src:NNNNNN`) all the way to the root seed (`corpus` vs. `grammar`):
+    - Breaks down all crashes by their full multi-worker evolutionary pathway (e.g., `★ grammar → ijon → main` or `corpus → main → main-7 → main → msan`).
     - Clicking any pathway (or any crash-producing seed on the `#grammar` tab) expands an inline **Step-by-Step Testcase Evolution** chain showing `Step 0 (Root Seed)` → intermediate queue mutations/syncs (`op:flip2`, `op:havoc`, decoded 4-byte `opts:` header, byte size) → final `Crash`, with the formatted Ruby snippet at each step.
     - Every step in the evolution chain (as well as every triaged `testcase.c`) includes an **Animate in [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) ↗** link (`?code=<base64>`, with the 4-byte options header stripped) so you can watch Prism's lexer mode stack, parser context stack, recursive-descent call stack, and line offsets animate step by step for the root seed, any intermediate mutation, or the crashing testcase.
-    - On the `#grammar` tab, tracks fleet-wide queue propagation (`grammar → ldet → main-* / msan`) and lists every `lrama-fuzz` seed that produced a crash alongside direct Prism Loupe links for both the generated seed and the crash.
-  - **Per-Origin LLVM Source Coverage & Exclusive Code Hunks**: Partitions all campaign inputs by root origin (`corpus`, `grammar`, `main`, `ldet`, `msan`, `main-2..N`) and computes three metrics per origin:
+    - On the `#grammar` tab, tracks fleet-wide queue propagation (`grammar → ijon → main → main-* / msan`) and lists every `lrama-fuzz` seed that produced a crash alongside direct Prism Loupe links for both the generated seed and the crash.
+  - **Per-Origin LLVM Source Coverage & Exclusive Code Hunks**: Partitions all campaign inputs by root origin (`corpus`, `grammar`, `main`, `ijon`, `msan`, `main-2..N`) and computes three metrics per origin:
     1. **Standalone coverage**: lines/branches covered by that origin's inputs alone.
     2. **Gain vs. Corpus**: marginal lines/branches added when merged with the initial seed corpus (`merge(corpus, origin) - corpus`).
     3. **Exclusive coverage (`combined - merge(all_other_origins)`)**: lines and branches uniquely covered *only* by that worker/generator.
@@ -182,14 +182,14 @@ Inside the `tmux` session:
     - **CLion**: Use *Run -> Show Coverage Data...* (`Cmd+Option+F6` / `Ctrl+Alt+F6`) and select `tmp/fuzz/coverage/lcov.info`.
     - **Neovim**: Point [`nvim-coverage`](https://github.com/andythigpen/nvim-coverage) (`lcov_file`) at `tmp/fuzz/coverage/lcov.info`.
   - `tmp/fuzz/coverage/report/index.html` — combined annotated HTML source report (`open tmp/fuzz/coverage/report/index.html`).
-  - `tmp/fuzz/coverage/workers/<origin>/report/index.html` — per-origin annotated HTML source reports (`corpus`, `grammar`, `main`, `ldet`, `msan`, `main-2..N`), post-processed to highlight exclusive lines/branches inline and add a `next exclusive to <origin> (E)` keyboard shortcut (`E`).
+  - `tmp/fuzz/coverage/workers/<origin>/report/index.html` — per-origin annotated HTML source reports (`corpus`, `grammar`, `main`, `ijon`, `msan`, `main-2..N`), post-processed to highlight exclusive lines/branches inline and add a `next exclusive to <origin> (E)` keyboard shortcut (`E`).
   - `tmp/fuzz/coverage/coverage.json` — structured JSON breakdown of combined and per-origin coverage, gains over `corpus`, and exclusive leave-one-out source hunks and branch outcomes.
   - `tmp/fuzz/coverage/coverage.profdata` — merged LLVM profile data for custom `llvm-cov` queries.
   - `tmp/fuzz/coverage/summary.txt` — saved copy of the terminal summary table.
 
 ### Cleaning Up
 
-To delete the current campaign data (`tmp/fuzz/afl`, `tmp/fuzz/corpus`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs in `tmp/fuzz/triage`:
+To delete the current campaign data (`tmp/fuzz/afl`, `tmp/fuzz/afl-ijon`, `tmp/fuzz/corpus`, `tmp/fuzz/seeds`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs in `tmp/fuzz/triage`:
 
 ```bash
 make fuzz-clean
@@ -228,26 +228,51 @@ After `pm_parse()` returns, `harness_parse()` checks two invariants on every run
 
 Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json` on every fuzzing iteration would slow down parser exploration and pollute the coverage bitmap with output-formatter edges. We split the build into two modes:
 
-- **Fast parse-only binaries** (`build/fuzz`, `build/fuzz.native`, `build/fuzz.ldet`, `build/fuzz.sand`, `build/fuzz.cmplog`): Compiled with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`. They only run `pm_parse` and the AST/line-offset invariant checks.
+- **Fast parse-only binaries** (`build/fuzz`, `build/fuzz.native`, `build/fuzz.ijon`, `build/fuzz.sand`, `build/fuzz.cmplog`): Compiled with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`. They only run `pm_parse` and the AST/line-offset invariant checks.
 - **Slow full-pipeline binaries** (`build/fuzz.msan`, `build/fuzz.lsan`, `build/fuzz.coverage`, and the `test/fuzz/debug/build*.sh` scripts): Compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (plain and color), `pm_prettyprint`, and `pm_dump_json` on every input. Because these serializers and printers read every AST node, token, error, and line offset, running them under MemorySanitizer (`fuzz.msan`) catches uninitialized fields anywhere in the parse tree.
 
-### Worker Fleet Architecture
+### Worker Fleet Architecture and Sync Topology
 
-`test/fuzz/runtime/run.sh` launches `FUZZ_WORKERS` workers that coordinate through `tmp/fuzz/afl`:
+`test/fuzz/runtime/run.sh` launches `FUZZ_WORKERS` workers across two single-master AFL++ sync directories (`tmp/fuzz/afl-ijon` and `tmp/fuzz/afl`):
 
-1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN worker (`-M main`) with CmpLog enabled, seeded with the full minimized fixture corpus.
-2. **`grammar`** (`test/fuzz/runtime/grammar.rb`): Structure-aware Ruby seed generator powered by [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz), continuously feeding `ldet` via foreign sync.
-3. **`msan`** (`build/fuzz.msan`): Runs the full `-DSLOW` pipeline under MemorySanitizer to catch uninitialized memory reads and out-of-bounds reads across parsing, serialization, pretty-printing, and JSON dumping.
-4. **`ldet`** (`build/fuzz.ldet`): Fast native worker (`-M ldet -F /tmp/afl-tmpdir/grammar/seeds`) with custom leak detection and IJON state-guided instrumentation enabled, acting as the intake filter for grammar-generated seeds and sharing IJON/CFG discoveries with `main`, `msan`, and secondary workers.
-5. **`main-2 .. main-N`** (`build/fuzz.native` + `-w ./build/fuzz.sand`): Secondary workers running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase`). They execute mutations at native speed without sanitizer overhead, and only forward inputs that discover new coverage to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`). Secondary workers cycle through different AFL++ power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), mutation modes (MOpt `-L 0`, `-P explore/exploit`, `-Z`), and disjoint shards of the initial seed corpus.
+```
+/tmp/afl-tmpdir/grammar/seeds     tmp/fuzz/afl-ijon             tmp/fuzz/afl
+┌───────────────────────────┐    ┌──────────────────┐         ┌──────────────────┐
+│ grammar (lrama-fuzz)      ├───►│ -M ijon          ├────────►│ -M main          │
+│ ~500 Ruby seeds/s + USR2  │ -F │ (fuzz.ijon)      │   -F    │ (ASAN+UBSAN +    │
+└───────────────────────────┘    └──────────────────┘         │  fuzz.cmplog)    │
+                                                              └────────▲─────────┘
+                                                                       │ peer sync
+                                                                       │ (-M / -S)
+                                                       ┌───────────────┴───────────────┐
+                                                       ▼                               ▼
+                                              ┌──────────────────┐           ┌──────────────────┐
+                                              │ -S msan          │           │ -S main-2 .. N   │
+                                              │ (fuzz.msan SLOW) │           │ (fuzz.native +   │
+                                              └──────────────────┘           │  -w fuzz.sand)   │
+                                                                             └──────────────────┘
+```
+
+ AFL++ restricts `-F` (foreign testcase import) to `-M` master instances, and inside `sync_fuzzers()` a `-M` node scans every peer queue in its `-o` sync directory *before* calling `read_foreign_testcases()`. Keeping two separate single-master sync roots avoids multi-master contention:
+
+- In `tmp/fuzz/afl-ijon`, `-M ijon` has **no** peer queues to scan, so every foreign sync goes straight to `/tmp/afl-tmpdir/grammar/seeds` at native speed (~45k execs/s) and filters generated Ruby snippets by both CFG edges and IJON parser/lexer state transitions.
+- In `tmp/fuzz/afl`, `-M main` is the sole master: it imports `ijon`'s curated queue via `-F tmp/fuzz/afl-ijon/.foreign/ijon` and exchanges queue discoveries bidirectionally with `-S msan` and `-S main-2..N`. Secondary workers only sync from `main` rather than scanning two masters. (When `FUZZ_WORKERS < 4`, `ijon` is omitted and `main` ingests `/tmp/afl-tmpdir/grammar/seeds` directly via `-F`.)
+
+The workers are:
+
+1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN master (`-M main -o tmp/fuzz/afl`) with CmpLog enabled, seeded with the full minimized fixture corpus and pulling filtered discoveries from `ijon` via `-F`.
+2. **`grammar`** (`test/fuzz/runtime/grammar.rb`): Structure-aware Ruby seed generator powered by [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz), writing candidate seeds to `/tmp/afl-tmpdir/grammar/seeds` and nudging `ijon` via `SIGUSR2`.
+3. **`msan`** (`build/fuzz.msan`): Secondary worker (`-S msan`) running the full `-DSLOW` pipeline under MemorySanitizer to catch uninitialized memory reads and out-of-bounds reads across parsing, serialization, pretty-printing, and JSON dumping.
+4. **`ijon`** (`build/fuzz.ijon`): Isolated native master (`-M ijon -o tmp/fuzz/afl-ijon -F /tmp/afl-tmpdir/grammar/seeds`) with custom leak detection and IJON state-guided instrumentation enabled, acting as a high-throughput state-space filter for grammar seeds and exploring mutations with `-p explore` before `main` imports its winners.
+5. **`main-2 .. main-N`** (`build/fuzz.native` + `-w ./build/fuzz.sand`): Secondary workers (`-S main-2..N`) running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase`). They execute mutations at native speed without sanitizer overhead, and only forward inputs that discover new coverage to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`). Secondary workers cycle through different AFL++ power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), mutation modes (MOpt `-L 0`, `-P explore/exploit`, `-Z`), and disjoint shards of the initial seed corpus.
 
 ### Fast Leak Detection (`PRISM_XALLOCATOR`)
 
 Enabling LeakSanitizer (LSAN) or ASAN per-allocation redzones on every fuzzing execution significantly reduces throughput on inputs that allocate deep ASTs.
 
-For `build/fuzz.native` and `build/fuzz.ldet`, we compile without sanitizers and enable Prism's custom allocator hook (`-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`). `test/fuzz/harness/include/prism_xallocator.h` routes `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` to wrappers in `test/fuzz/harness/fuzz.c` that prepend an 8-byte size header to each allocation and maintain a running `allocated` byte counter. At the end of `LLVMFuzzerTestOneInput`, `assert(allocated == 0)` immediately aborts if any memory was leaked during the parse, with near-zero runtime overhead. Wrappers also enforce a per-input cumulative allocation cap (`FUZZ_MAX_ALLOCATED_BYTES`, 128 MiB) to catch exponential memory-blowup bugs early.
+For `build/fuzz.native` and `build/fuzz.ijon`, we compile without sanitizers and enable Prism's custom allocator hook (`-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`). `test/fuzz/harness/include/prism_xallocator.h` routes `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` to wrappers in `test/fuzz/harness/fuzz.c` that prepend an 8-byte size header to each allocation and maintain a running `allocated` byte counter. At the end of `LLVMFuzzerTestOneInput`, `assert(allocated == 0)` immediately aborts if any memory was leaked during the parse, with near-zero runtime overhead. Wrappers also enforce a per-input cumulative allocation cap (`FUZZ_MAX_ALLOCATED_BYTES`, 128 MiB) to catch exponential memory-blowup bugs early.
 
-When `make fuzz-triage` processes a leak crash from `fuzz.ldet` or `fuzz.native`, it re-runs the input against `build/fuzz.lsan` so the generated `testcase.c` includes a full LeakSanitizer allocation backtrace.
+When `make fuzz-triage` processes a leak crash from `fuzz.ijon` or `fuzz.native`, it re-runs the input against `build/fuzz.lsan` so the generated `testcase.c` includes a full LeakSanitizer allocation backtrace.
 
 ### Sanitizer-Free Coverage Instrumentation (`test/fuzz/patches/aflplusplus.patch`)
 
@@ -261,7 +286,7 @@ See [`test/fuzz/patches/aflplusplus.md`](../test/fuzz/patches/aflplusplus.md) fo
 
 Byte-level mutations struggle to discover bugs that require syntactically rich Ruby constructs (such as nested heredocs, pattern matching, or endless method definitions inside blocks).
 
-The `grammar` worker runs `test/fuzz/runtime/grammar.rb`, which uses [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz) (`ComposedEvolver` and `Evolver`) derived directly from CRuby's `parse.y` grammar to evolve structurally rich valid and near-valid Ruby programs (including multi-heredoc and nested-heredoc rewrites). Each unique snippet is prefixed with the 4-byte options header, written atomically to `/tmp/afl-tmpdir/grammar/seeds` on `tmpfs`, imported into `ldet` via AFL++'s `-F` foreign sync whenever it discovers new CFG edges or IJON parser/lexer state transitions, and automatically pruned from `tmpfs` once scanned. Because `ldet` writes an unmutated copy of each imported seed to `tmp/fuzz/afl/ldet/queue/id:NNNNNN,sync:seeds_0,src:<sha1>`, the original generated seed remains preserved in `ldet/queue/` even after `tmpfs` pruning, allowing `make fuzz-plot` to trace downstream queue entries and crashes all the way back to the exact `lrama-fuzz` seed.
+The `grammar` worker runs `test/fuzz/runtime/grammar.rb`, which uses [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz) (`ComposedEvolver` and `Evolver`) derived directly from CRuby's `parse.y` grammar to evolve structurally rich valid and near-valid Ruby programs (including multi-heredoc and nested-heredoc rewrites). Each unique snippet is prefixed with the 4-byte options header, written atomically to `/tmp/afl-tmpdir/grammar/seeds` on `tmpfs`, imported into `ijon` via AFL++'s `-F` foreign sync whenever it discovers new CFG edges or IJON parser/lexer state transitions (`grammar.rb` sends `SIGUSR2` to `ijon` to trigger immediate syncs), and automatically pruned from `tmpfs` once scanned. On container shutdown, `run.sh` persists up to 5,000 unread pending seeds to `tmp/fuzz/seeds` so post-run `make fuzz-coverage` and subsequent resumed runs retain unimported seeds. Because `ijon` writes an unmutated copy of each imported seed to `tmp/fuzz/afl-ijon/ijon/queue/id:NNNNNN,sync:seeds_0,src:<sha1>`, the original generated seed remains preserved in `ijon/queue/` even after `tmpfs` pruning, allowing `make fuzz-plot` to trace downstream queue entries and crashes across `grammar → ijon → main → secondaries` all the way back to the exact `lrama-fuzz` seed.
 
 ### CmpLog and `pm_strncasecmp`
 
@@ -273,7 +298,7 @@ Prism normally uses its own `pm_strncasecmp` implementation (`src/strncasecmp.c`
 
 Many parser and lexer bugs in Prism depend on combinations of state stacks and bitflags (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack`, `accepts_block_stack`, and `current_scope->parameters`) that pass through shared helper functions and therefore produce no new CFG edges on their own.
 
-`build/fuzz.ldet` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s 64 KB IJON bitmap region for:
+`build/fuzz.ijon` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s 64 KB IJON bitmap region for:
 
 1. Lexer mode stack transitions (top 4 modes in `parser->lex_modes`, including balanced delimiter nesting and heredoc quote/indent flags).
 2. Parser context stack transitions (current and parent `pm_context_t` plus the enclosing `current_context->mask`).
@@ -281,13 +306,13 @@ Many parser and lexer bugs in Prism depend on combinations of state stacks and b
 4. Scope parameter, `closed`, and `shareable_constant` flags across the current and parent `pm_scope_t`.
 5. Syntax error recovery transitions (`error_list.size`, `recovering`) and non-trivial `PM_TOKEN_EOF` states.
 
-When `ldet` reaches a novel state combination and saves the input to `ldet/queue/`, `main` and `msan` automatically test that input under ASAN/UBSAN/MSAN during queue sync.
+When `ijon` reaches a novel state combination and saves the input to `tmp/fuzz/afl-ijon/ijon/queue/`, `main` imports interesting entries via `-F tmp/fuzz/afl-ijon/.foreign/ijon` under ASAN+UBSAN and redistributes them to `msan` and `main-2..N` via peer sync.
 
 ### Compile-Time Prism Tunings for Fuzzing
 
 `test/fuzz/Makefile` sets several preprocessor flags when building the fuzz binaries:
 
-- **Per-allocation arena redzones (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, `src/arena.c` bump-allocates AST nodes and strings out of 8 KB blocks, which hides intra-block buffer overflows from AddressSanitizer and MemorySanitizer. Sanitizer builds (`fuzz`, `fuzz.sand`, `fuzz.msan`, `fuzz.lsan`) set `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` returns the exact requested size and every `pm_arena_alloc` call gets its own `xmalloc` heap block surrounded by ASAN/MSAN redzones. Non-sanitized builds (`fuzz.native`, `fuzz.ldet`, `fuzz.cmplog`, `fuzz.coverage`) keep the default 8 KB blocks so the normal arena growth and bump-allocation paths are also tested at full speed.
+- **Per-allocation arena redzones (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, `src/arena.c` bump-allocates AST nodes and strings out of 8 KB blocks, which hides intra-block buffer overflows from AddressSanitizer and MemorySanitizer. Sanitizer builds (`fuzz`, `fuzz.sand`, `fuzz.msan`, `fuzz.lsan`) set `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` returns the exact requested size and every `pm_arena_alloc` call gets its own `xmalloc` heap block surrounded by ASAN/MSAN redzones. Non-sanitized builds (`fuzz.native`, `fuzz.ijon`, `fuzz.cmplog`, `fuzz.coverage`) keep the default 8 KB blocks so the normal arena growth and bump-allocation paths are also tested at full speed.
 - **Reachable bignum divide-and-conquer (`-DPM_INTEGER_DIVIDE_THRESHOLD=8`)**: By default, `src/integer.c` only switches from schoolbook decimal parsing to divide-and-conquer parsing (and Karatsuba multiplication in `src/bignum.c`) above 224 chunks (2,017 digits), which cannot be reached within `FUZZ_MAX_INPUT_SIZE` (1,024 bytes). Lowering the threshold to 8 chunks (72 digits) exercises both schoolbook (20–72 digits) and divide-and-conquer / Karatsuba (73–1,020 digits) within the 1 KB input limit.
 - **Reachable recursion depth limit (`-DPRISM_DEPTH_MAXIMUM=128`)**: Lowering `PRISM_DEPTH_MAXIMUM` from `10000` to `128` makes `PM_ERR_NESTING_TOO_DEEP` error-recovery paths in `parse_expression` and `parse_pattern` reachable within 1 KB inputs and prevents deeply nested expressions from causing quadratic indentation buffer growth in `pm_prettyprint`.
 - **Write-only ASAN (`-mllvm -asan-instrument-reads=0`)**: `build/fuzz` and `build/fuzz.sand` disable ASAN read instrumentation so they only trap on illegal writes, UBSAN errors, and assertion failures, leaving out-of-bounds and uninitialized reads to `build/fuzz.msan`.

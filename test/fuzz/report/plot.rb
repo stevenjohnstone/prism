@@ -71,8 +71,27 @@ end
 
 def normalize_sync_source(src)
   return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
+  return "ijon" if src =~ /\Aijon(?:_\d+)?\z/
 
   src
+end
+
+def worker_root_dirs(afl_dir)
+  [afl_dir, "#{afl_dir}-ijon"].select { |d| Dir.exist?(d) }
+end
+
+def discover_fuzzer_dirs(afl_dir)
+  by_name = {}
+  worker_root_dirs(afl_dir).each do |root|
+    Dir.glob(File.join(root, "*")).sort.each do |d|
+      name = File.basename(d)
+      next if name.start_with?(".") || !File.directory?(d)
+      next unless File.exist?(File.join(d, "fuzzer_stats")) || File.exist?(File.join(d, "plot_data"))
+
+      by_name[name] ||= d
+    end
+  end
+  by_name
 end
 
 def parse_generator_plot_data(path)
@@ -161,19 +180,19 @@ def parse_queue_origins(queue_dir)
   max_src_by_source = Hash.new(0)
 
   Dir.children(queue_dir).each do |fname|
-    next unless fname.start_with?("id:")
+    id = fname[/\Aid:(\d+),/, 1]&.to_i
+    next unless id
 
-    id = fname[3, 6].to_i
     max_id = id if id > max_id
-    if fname =~ /,sync:([^,]+)/
+    if fname =~ /\Aid:\d+,sync:([^,]+)/
       src_name = normalize_sync_source(Regexp.last_match(1))
       item_kind[id] = :sync
       item_source[id] = src_name
-      if fname =~ /,src:(\d{6})(?:[,+]|$)/
+      if fname =~ /\Aid:\d+,sync:[^,]+,src:(?:id:)?(\d+)(?:[,+]|$)/
         src_end = Regexp.last_match(1).to_i + 1
         max_src_by_source[src_name] = src_end if src_end > max_src_by_source[src_name]
       end
-    elsif fname.include?(",orig:")
+    elsif fname =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:/
       item_kind[id] = :seed
     else
       item_kind[id] = :local
@@ -234,7 +253,7 @@ def lookup_prefix(prefix_arr, count)
 end
 
 def sort_fuzzer_names(names)
-  priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ldet" => 3 }
+  priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ijon" => 3 }
   names.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]
@@ -472,19 +491,15 @@ unless Dir.exist?(afl_dir)
   exit 1
 end
 
-fuzzer_dirs = Dir.glob(File.join(afl_dir, "*")).select do |d|
-  File.directory?(d) && !File.basename(d).start_with?(".") &&
-    (File.exist?(File.join(d, "fuzzer_stats")) || File.exist?(File.join(d, "plot_data")))
-end
-
-fuzzer_names = sort_fuzzer_names(fuzzer_dirs.map { |d| File.basename(d) })
+fuzzer_dir_by_name = discover_fuzzer_dirs(afl_dir)
+fuzzer_names = sort_fuzzer_names(fuzzer_dir_by_name.keys)
 if fuzzer_names.empty?
   warn "No fuzzer directories with fuzzer_stats or plot_data found in #{afl_dir}"
   exit 1
 end
 
 fuzzers = fuzzer_names.each_with_index.map do |name, idx|
-  dir = File.join(afl_dir, name)
+  dir = fuzzer_dir_by_name[name]
   stats = parse_fuzzer_stats(File.join(dir, "fuzzer_stats"))
   is_generator = stats["fuzzer_role"] == "generator"
   raw_plot = if is_generator
@@ -553,6 +568,7 @@ fuzzers = fuzzer_names.each_with_index.map do |name, idx|
 
   {
     name: name,
+    dir: dir,
     role: is_generator ? :generator : :fuzzer,
     color: PALETTE[idx % PALETTE.size],
     sched: sched,
@@ -618,7 +634,7 @@ fuzzers.each do |f|
   if f[:role] == :generator
     intake_fuzzer = afl_fuzzers.max_by { |af| lookup_prefix(af[:origins][:by_source][peer_name] || [], af[:corpus_count]) }
     if intake_fuzzer.nil? || lookup_prefix(intake_fuzzer[:origins][:by_source][peer_name] || [], intake_fuzzer[:corpus_count]).zero?
-      intake_fuzzer = afl_fuzzers.find { |af| af[:name] == "ldet" } || main_fuzzer
+      intake_fuzzer = afl_fuzzers.find { |af| af[:name] == "ijon" } || main_fuzzer
     end
     peer_total = f[:files_created]
     imported_count = lookup_prefix(intake_fuzzer[:origins][:by_source][peer_name] || [], intake_fuzzer[:corpus_count])
@@ -648,6 +664,23 @@ fuzzers.each do |f|
   peer_total = f[:corpus_count]
   watermark = main_synced_cursors[peer_name] || 0
   in_flight = main_max_src[peer_name] || 0
+  if !main_synced_cursors.key?(peer_name) && in_flight > 0
+    # Foreign-synced fuzzer (-F, e.g. ijon -> main): main scanned every peer queue file
+    # whose mtime was <= the mtime of the highest imported peer item during that -F pass.
+    qdir = File.join(f[:dir], "queue")
+    last_imp_prefix = format("id:%06d", in_flight - 1)
+    if Dir.exist?(qdir)
+      qfiles = Dir.children(qdir).select { |fn| fn.start_with?("id:") }
+      imp_fn = qfiles.find { |fn| fn.start_with?(last_imp_prefix) }
+      if imp_fn
+        imp_mtime = File.mtime(File.join(qdir, imp_fn)).to_i rescue 0
+        if imp_mtime > 0
+          scanned = qfiles.count { |fn| (File.mtime(File.join(qdir, fn)).to_i rescue (imp_mtime + 1)) <= imp_mtime }
+          watermark = [watermark, scanned].max
+        end
+      end
+    end
+  end
   cursor = [[watermark, in_flight].max, peer_total].min
 
   # Items in peer's queue[0...cursor] that originally came from `main` (sync:main) are skipped by `main` without running
@@ -828,13 +861,27 @@ def describe_afl_step_op(base, kind)
   return "Grammar Generated Seed (lrama-fuzz)" if kind == "seed"
 
   parts = []
-  if base =~ /,sync:([^,]+),src:([^,+]+)/
-    src_w = normalize_sync_source($1)
-    parts << (src_w == "grammar" ? "Foreign Sync (-F) from grammar (#{$2})" : "Peer Sync from #{src_w} (id:#{$2})")
-  elsif base =~ /,orig:([^,]+)/
+  is_sync = false
+  if base =~ /\Aid:\d+(?:,sig:\d+)?,sync:([^,]+),src:(?:id:)?([^,+]+)/
+    is_sync = true
+    raw_src = $1
+    src_w = normalize_sync_source(raw_src)
+    is_foreign = raw_src != src_w || src_w == "grammar"
+    parts << if src_w == "grammar"
+               "Foreign Sync (-F) from grammar (#{$2})"
+             elsif is_foreign
+               "Foreign Sync (-F) from #{src_w} (id:#{$2})"
+             else
+               "Peer Sync from #{src_w} (id:#{$2})"
+             end
+  elsif base =~ /\Aid:\d+(?:,sig:\d+)?,src:(\d+)\+(\d+)/
+    parts << "Splice (id:#{$1} + id:#{$2})"
+  elsif base =~ /\Aid:\d+(?:,sig:\d+)?,src:lrama-fuzz\b/
+    parts << "Grammar Evolution (lrama-fuzz)"
+  elsif base =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:([^,]+)/
     parts << "Initial Seed (#{$1})"
   end
-  if base =~ /,op:([^,]+)/
+  if !is_sync && base =~ /,op:([^,]+)/
     op = $1
     rep = base[/,rep:(\d+)/, 1]
     pos = base[/,pos:(\d+)/, 1]
@@ -844,7 +891,7 @@ def describe_afl_step_op(base, kind)
     parts << "Mutate: #{detail}"
   end
   parts << "+cov" if base.include?(",+cov")
-  if base =~ /,sig:(\d+)/
+  if base =~ /\Aid:\d+,sig:(\d+),/
     parts << "CRASH (sig:#{$1})"
   elsif kind == "hangs"
     parts << "HANG"
@@ -878,14 +925,34 @@ end
 def analyze_fleet_lineage(afl_dir)
   fuzz_root = File.dirname(afl_dir)
   corpus_dir = File.join(fuzz_root, "corpus")
-  seeds_dir = File.join(fuzz_root, "seeds")
+  seeds_dirs = ["/tmp/afl-tmpdir/grammar/seeds", File.join(fuzz_root, "seeds")].select { |d| Dir.exist?(d) }
+  seed_by_prefix = {}
+  seeds_dirs.each do |sd|
+    Dir.children(sd).each do |sf|
+      next if sf.start_with?(".")
+      full = File.join(sd, sf)
+      next unless File.file?(full)
+      seed_by_prefix[sf] ||= full
+      seed_by_prefix[sf[0, 20]] ||= full if sf.length > 20
+    end
+  rescue StandardError
+    nil
+  end
+  roots = worker_root_dirs(afl_dir)
 
   q_index = {}
-  Dir.glob(File.join(afl_dir, "*/queue/id:*")).each do |p|
+  roots.flat_map { |r| Dir.glob(File.join(r, "*/queue/id:*")) }.each do |p|
     next unless File.file?(p)
     w = File.basename(File.dirname(File.dirname(p)))
     id = File.basename(p)[/\Aid:(\d+)/, 1]
-    q_index[[w, id]] = p if id
+    q_index[[w, id.to_i]] = p if id
+  end
+
+  rank_parent_chain = lambda do |ch|
+    return [-1, 0, 0] if ch.nil? || ch.empty?
+    is_grammar = ch.first[:worker] == "grammar" ? 1 : 0
+    distinct_workers = ch.map { |s| s[:worker] }.uniq.size
+    [is_grammar, distinct_workers, ch.size]
   end
 
   memo = {}
@@ -899,19 +966,29 @@ def analyze_fleet_lineage(afl_dir)
     kind = File.basename(File.dirname(path))
     step = { path: path, worker: w, kind: kind, base: base, id: base[/\Aid:(\d+)/, 1] }
 
-    chain = if base =~ /,sync:seeds(?:_\d+)?,src:([^,]+)/ || base =~ /,sync:grammar,src:([^,]+)/ || base =~ /,orig:(seed_[^,]+)/
+    chain = if base =~ /\Aid:\d+(?:,sig:\d+)?,sync:seeds(?:_\d+)?,src:([^,+]+)/ ||
+               base =~ /\Aid:\d+(?:,sig:\d+)?,sync:grammar(?:_\d+)?,src:([^,+]+)/ ||
+               base =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:(seed_[^,]+)/
               seed_id = $1
-              seed_file = File.join(seeds_dir, seed_id)
-              root_path = File.file?(seed_file) ? seed_file : path
+              root_path = seed_by_prefix[seed_id] || path
               [{ path: root_path, worker: "grammar", kind: "seed", base: seed_id, id: seed_id }, step]
-            elsif base =~ /,sync:([^,]+),src:(\d+)/
+            elsif base =~ /\Aid:\d+(?:,sig:\d+)?,sync:([^,]+),src:(?:id:)?(\d+)/
               peer = normalize_sync_source($1)
-              parent = q_index[[peer, $2]]
-              parent ? (trace_chain.call(parent, seen) + [step]) : [{ path: path, worker: peer, kind: "sync_root", base: "id:#{$2}", id: $2 }, step]
-            elsif base =~ /,src:(\d+)/
-              parent = q_index[[w, $1]]
-              parent ? (trace_chain.call(parent, seen) + [step]) : [step]
-            elsif base =~ /,orig:([^,]+)/
+              src_id = $2
+              parent = q_index[[peer, src_id.to_i]]
+              parent ? (trace_chain.call(parent, seen) + [step]) : [{ path: path, worker: peer, kind: "sync_root", base: "id:#{src_id}", id: src_id }, step]
+            elsif base =~ /\Aid:\d+(?:,sig:\d+)?,src:(\d+)(?:\+(\d+))?/
+              p1 = q_index[[w, $1.to_i]]
+              p2 = $2 ? q_index[[w, $2.to_i]] : nil
+              ch1 = p1 ? trace_chain.call(p1, seen) : nil
+              ch2 = p2 ? trace_chain.call(p2, seen) : nil
+              best = if ch1 && ch2
+                       (rank_parent_chain.call(ch2) <=> rank_parent_chain.call(ch1)) > 0 ? ch2 : ch1
+                     else
+                       ch1 || ch2
+                     end
+              best && !best.empty? ? (best + [step]) : [step]
+            elsif base =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:([^,]+)/
               orig_name = $1
               corpus_file = File.join(corpus_dir, orig_name)
               root_path = File.file?(corpus_file) ? corpus_file : path
@@ -942,7 +1019,7 @@ def analyze_fleet_lineage(afl_dir)
   end
 
   # 2. Crash & hang lineage across all workers
-  crash_files = Dir.glob(File.join(afl_dir, "*/{crashes,hangs}/id:*")).select do |p|
+  crash_files = roots.flat_map { |r| Dir.glob(File.join(r, "*/{crashes,hangs}/id:*")) }.select do |p|
     File.file?(p) && !p.end_with?(".bt", ".min", ".md")
   end.sort
 
@@ -1892,6 +1969,7 @@ if combined_cov
       tab: nil,
       color: "#34d399",
       role_label: "Combined Campaign",
+      has_cov: true,
       inputs: combined_cov["input_count"].to_i,
       lines_pct: cl["percent"].to_f,
       lines_cov: cl["covered"].to_i,
@@ -1928,6 +2006,7 @@ if combined_cov
       tab: color_by_name.key?(oname) ? oname : nil,
       color: color_by_name[oname] || (oname == "corpus" ? "#fbbf24" : "#9ca3af"),
       role_label: role_lbl,
+      has_cov: o["has_coverage"] != false,
       inputs: o["input_count"].to_i,
       lines_pct: ol["percent"].to_f,
       lines_cov: ol["covered"].to_i,
@@ -1966,6 +2045,29 @@ if combined_cov
     links = []
     links << %(<a class="cov-link" href="#{CGI.escapeHTML(e[:report_path])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">HTML &nearr;</a>) if e[:report_path]
     links << %(<a class="cov-link muted" href="#{CGI.escapeHTML(e[:summary_path])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Txt &nearr;</a>) if e[:summary_path]
+    lines_cell = if e[:has_cov]
+                   <<~CELL
+                     <div><strong>#{format("%.2f%%", e[:lines_pct])}</strong> <span class="muted">(#{format_int(e[:lines_cov])} / #{format_int(e[:lines_tot])})</span></div>
+                     <div class="sync-bar" style="height: 6px; margin-top: 4px;">
+                       <div class="sync-seg" style="width:#{e[:lines_pct].round(2)}%;background:#{e[:color]}"></div>
+                     </div>
+                   CELL
+                 else
+                   "<span class=\"muted\">&mdash;</span>"
+                 end
+    branches_cell = if e[:has_cov]
+                      <<~CELL
+                        <div><strong>#{format("%.2f%%", e[:branches_pct])}</strong> <span class="muted">(#{format_int(e[:branches_cov])} / #{format_int(e[:branches_tot])})</span></div>
+                        <div class="sync-bar" style="height: 6px; margin-top: 4px;">
+                          <div class="sync-seg" style="width:#{e[:branches_pct].round(2)}%;background:#38bdf8"></div>
+                        </div>
+                      CELL
+                    else
+                      "<span class=\"muted\">&mdash;</span>"
+                    end
+    regions_cell = e[:has_cov] ? format("%.2f%%", e[:regions_pct]) : "<span class=\"muted\">&mdash;</span>"
+    functions_cell = e[:has_cov] ? format("%.2f%%", e[:functions_pct]) : "<span class=\"muted\">&mdash;</span>"
+    ex_cell = "<span class=\"muted\">&mdash;</span>" unless e[:has_cov]
     <<~ROW
       <tr #{row_click}>
         <td>
@@ -1974,20 +2076,10 @@ if combined_cov
         </td>
         <td><span class="sched-pill">#{CGI.escapeHTML(e[:role_label])}</span></td>
         <td class="num">#{format_int(e[:inputs])}</td>
-        <td class="num" style="min-width: 210px;">
-          <div><strong>#{format("%.2f%%", e[:lines_pct])}</strong> <span class="muted">(#{format_int(e[:lines_cov])} / #{format_int(e[:lines_tot])})</span></div>
-          <div class="sync-bar" style="height: 6px; margin-top: 4px;">
-            <div class="sync-seg" style="width:#{e[:lines_pct].round(2)}%;background:#{e[:color]}"></div>
-          </div>
-        </td>
-        <td class="num" style="min-width: 210px;">
-          <div><strong>#{format("%.2f%%", e[:branches_pct])}</strong> <span class="muted">(#{format_int(e[:branches_cov])} / #{format_int(e[:branches_tot])})</span></div>
-          <div class="sync-bar" style="height: 6px; margin-top: 4px;">
-            <div class="sync-seg" style="width:#{e[:branches_pct].round(2)}%;background:#38bdf8"></div>
-          </div>
-        </td>
-        <td class="num">#{format("%.2f%%", e[:regions_pct])}</td>
-        <td class="num">#{format("%.2f%%", e[:functions_pct])}</td>
+        <td class="num" style="min-width: 210px;">#{lines_cell}</td>
+        <td class="num" style="min-width: 210px;">#{branches_cell}</td>
+        <td class="num">#{regions_cell}</td>
+        <td class="num">#{functions_cell}</td>
         <td class="num">#{vc_cell}</td>
         <td class="num">#{ex_cell}</td>
         <td class="num">#{links.join(" &bull; ")}</td>

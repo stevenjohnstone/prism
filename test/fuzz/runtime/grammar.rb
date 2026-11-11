@@ -125,6 +125,18 @@ rescue StandardError
   [0, 0]
 end
 
+# Nudge the isolated ijon master via SIGUSR2 (AFL++'s handle_syncreq -> sync_requested = 1)
+# so it imports newly generated foreign seeds promptly without waiting for AFL_SYNC_TIME.
+def notify_intake_sync(afl_dir)
+  ijon_stats_path = File.join("#{afl_dir}-ijon", "ijon", "fuzzer_stats")
+  return unless File.exist?(ijon_stats_path)
+
+  pid = parse_kv_file(ijon_stats_path)["fuzzer_pid"].to_i
+  Process.kill("USR2", pid) if pid > 0
+rescue StandardError
+  # ignore if ijon is not running yet or already exited
+end
+
 # Iterative AST node count to avoid SystemStackError on deeply nested trees.
 def count_prism_nodes(root)
   count = 0
@@ -471,9 +483,11 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
   end
 
   master_rng = Random.new
+  initial_sync_notified = false
 
   emit_candidate = lambda do |code, is_valid|
     while pending_files >= MAX_PENDING_SEEDS
+      notify_intake_sync(afl_dir)
       pending_files, newly_pruned = prune_synced_seeds(queue_dir)
       files_pruned += newly_pruned
       last_prune_time = Time.now.to_f
@@ -493,6 +507,10 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
         files_invalid += 1
       end
       last_find_ts = Time.now.to_i
+      if !initial_sync_notified && pending_files >= 200
+        notify_intake_sync(afl_dir)
+        initial_sync_notified = true
+      end
     else
       duplicates_skipped += 1
     end
@@ -501,6 +519,7 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
     if (now - last_prune_time) >= PRUNE_INTERVAL_SEC
       pending_files, newly_pruned = prune_synced_seeds(queue_dir)
       files_pruned += newly_pruned
+      notify_intake_sync(afl_dir) if pending_files > 0
       last_prune_time = now
     end
 

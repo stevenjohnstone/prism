@@ -1,6 +1,8 @@
 FUZZ_DIR = $(CURDIR)/tmp/fuzz
 FUZZ_AFL_DIR = $(FUZZ_DIR)/afl
+FUZZ_AFL_IJON_DIR = $(FUZZ_DIR)/afl-ijon
 FUZZ_CORPUS_DIR = $(FUZZ_DIR)/corpus
+FUZZ_SEEDS_DIR = $(FUZZ_DIR)/seeds
 FUZZ_COVERAGE_DIR = $(FUZZ_DIR)/coverage
 FUZZ_PLOTS_DIR = $(FUZZ_DIR)/plots
 FUZZ_TRIAGE_DIR = $(FUZZ_DIR)/triage
@@ -12,8 +14,8 @@ FUZZ_HARD_RSS_LIMIT := $(shell echo $$(( $(FUZZ_MAX_ALLOCATED) * 16 )))
 # Set PM_ARENA_INITIAL_SIZE=0 on sanitizer builds so each arena allocation gets
 # its own exact-sized xmalloc block with ASAN/MSAN heap redzones around it
 # instead of packing into 8 KB blocks, while still freeing all blocks via
-# pm_arena_cleanup. Non-sanitized builds (fuzz.ldet, fuzz.coverage) use the
-# default 8 KB arena blocks for higher throughput and full arena coverage.
+# pm_arena_cleanup. Non-sanitized builds (fuzz.ijon, fuzz.native, fuzz.coverage)
+# use the default 8 KB arena blocks for higher throughput and full arena coverage.
 FUZZ_SANITIZER_FLAGS := -DPM_ARENA_INITIAL_SIZE=0
 # Set PM_INTEGER_DIVIDE_THRESHOLD=8 (72 decimal digits instead of the default
 # 224 chunks / 2,017 digits) so divide-and-conquer decimal parsing and base-2^32
@@ -68,10 +70,10 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/harn
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
 	$(ECHO) "building with LSAN (SLOW)"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
-	$(ECHO) "building with custom leak detector (IJON)"
-	# Enable IJON state tracking (AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON) on fuzz.ldet
-	# for the ldet worker.
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_IJON=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -DPRISM_FUZZ_IJON -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ldet $(FUZZ_SOURCES)
+	$(ECHO) "building with IJON state tracking and custom leak detector"
+	# Enable IJON state tracking (AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON) on fuzz.ijon
+	# for the ijon worker.
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_IJON=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -DPRISM_FUZZ_IJON -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ijon $(FUZZ_SOURCES)
 	$(ECHO) "building native leak detector for SAND workers"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.native $(FUZZ_SOURCES)
 	$(ECHO) "building main fuzz binary"
@@ -121,7 +123,7 @@ fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make fuzz-build"
 	$(ECHO) "starting AFL++ run"
 	$(Q) $(MAKEDIRS) $(FUZZ_AFL_DIR)
-	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "./test/fuzz/runtime/run.sh"
+	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "exec ./test/fuzz/runtime/run.sh"
 ifneq ($(FUZZ_DAEMON),)
 	$(ECHO) "Fuzzer daemon started in container '$(FUZZ_CONTAINER_NAME)'."
 	$(ECHO) "Attach to tmux with: make fuzz-attach (or: docker exec -it $(FUZZ_CONTAINER_NAME) tmux -2 attach-session -t fuzzer)"
@@ -152,7 +154,7 @@ fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 
 fuzz-plot: fuzz-docker-build fuzz-gen-templates
 	@if [ -z "$(FUZZ_SKIP_COVERAGE)" ] && [ -d "$(FUZZ_AFL_DIR)" ]; then \
-		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
+		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
 			echo "collecting coverage (set FUZZ_SKIP_COVERAGE=1 to skip)"; \
 			if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
 				docker exec -e FUZZ_FLAGS="$(FUZZ_FLAGS)" $(FUZZ_CONTAINER_NAME) ./test/fuzz/report/coverage.sh; \
@@ -175,7 +177,9 @@ define FUZZ_CLEAN_CONFIRM
 	echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"; \
 	echo "This will permanently delete:"; \
 	echo "  - tmp/fuzz/afl      ($(FUZZ_FINDINGS) crash/hang findings)"; \
+	echo "  - tmp/fuzz/afl-ijon"; \
 	echo "  - tmp/fuzz/corpus"; \
+	echo "  - tmp/fuzz/seeds"; \
 	echo "  - tmp/fuzz/coverage"; \
 	echo "  - tmp/fuzz/plots"; \
 	echo ""; \
@@ -195,11 +199,11 @@ define FUZZ_CLEAN_CONFIRM
 fi
 endef
 
-fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FUZZ_AFL_IJON_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 fuzz-clean:
 	$(FUZZ_CLEAN_CONFIRM)
 	$(ECHO) "Removing fuzz data (preserving tmp/fuzz/triage)"
-	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR)
+	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR)
 	$(ECHO) "done"
 
 .PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-test
