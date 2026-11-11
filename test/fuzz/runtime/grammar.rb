@@ -118,6 +118,117 @@ REGEXP_SAFE_MODIFIERS = ["", "i", "m", "x", "o", "u", "imx", "iu", "mx"].freeze
 REGEXP_ALL_MODIFIERS = (REGEXP_SAFE_MODIFIERS + ["n", "e", "s", "ne", "nu"]).freeze
 MAGIC_ENCODINGS = %w[us-ascii ascii-8bit euc-jp windows-31j iso-8859-1 utf-8].freeze
 
+# Compact valid integer literals covering bases (2/8/10/16), prefixes, `_` separators,
+# 32/64-bit inline boundaries, and 3+ word bignum thresholds in src/integer.c.
+COMPACT_INTEGERS = [
+  "0", "0_0", "0b0", "0B0_0", "0o0", "0O0", "0_00", "0d0", "0D0", "0x0", "0X0_0",
+  "1", "42", "1_000_000",
+  "0b1010_1100_1111_0001", "0B1111_0000_1010_0101",
+  "0755", "0_755", "0o7_6_5_4_3_2_1", "0O123_456_70",
+  "0d123_456_789", "0D987_654_321",
+  "0xa1b2_c3d4", "0XFEDC_BA98_0123_4567",
+  "4294967295", "4294967296",
+  "18446744073709551615",
+  # Exact UINT64_MAX + 1 boundary (value == limit && digit > limit_digit) & > limit
+  "18446744073709551616",
+  "18446744073709551629",
+  "0d0000_18446744073709551616",
+  # Power-of-two bignums (> 64 bits -> pm_integer_parse_powof2, including cross-word 3-bit octal)
+  "0b1_10101101_01110011_11100001_00111100_10100101_11000011_11110000_10101011_1",
+  "0o7_6543210_76543210_76543210_765",
+  "0x1_0000_0000_0000_0000_0001",
+  "0xa1b2_c3d4_e5f6_7890_0123_4567_89ab_cdef_fedc_ba98",
+  # Schoolbook decimal bignums (both digits % 9 == 0 and != 0)
+  "999_999_999_999_999_999_999_999_999",
+  "12_345_678_901_234_567_890_123_456_789_012"
+].freeze
+
+RATIONAL_LITERALS = [
+  "0r", "1r", "42r",
+  "0b1011_0101r", "0o755r", "0_755r", "0d123_456r",
+  "0xa1b2_c3d4_e5f6_7890_1234_5678r",
+  "18446744073709551616r",
+  # Float rationals (pm_integer_parse_rational): zero, trailing zeros, powof5[13],
+  # bignum denominator (remaining_fives >= 13), bignum numerator, and bignum->inline shrink
+  "0.0r", "0.00_0r", "1.5r", "12.345_00r", "0.125r",
+  "0.0000000000001220703125r",
+  "0.0001220703125r",
+  "0.0000000000000003r",
+  "1.0000000000000000000000000007r",
+  "1234567890123456789012344.125r",
+  "1234567890123456789012345.000000000000000000000003r",
+  "5000000000000000000.5r"
+].freeze
+
+IMAGINARY_LITERALS = [
+  "0i", "42i", "0b1010_1100i", "0o755i", "0d999i",
+  "0xa1b2_c3d4_e5f6_7890_1234i", "18446744073709551616i",
+  "0.0i", "1.5i", "1234567890123456789012345e-50i", "1e310i",
+  "42ri", "0xa1b2_c3d4_e5f6_7890_1234ri", "1.5ri", "5000000000000000000.5ri"
+].freeze
+
+FLOAT_LITERALS = [
+  "0.0", "0.00_0", "0e0", "1_234.567_89",
+  # FLT_EVAL_METHOD fast paths (exponent in [-22, 0), [0, 22], (22, 37])
+  "123.456e-10", "123e15", "45e28",
+  # pm_double_exact (digits <= 19 and > 19, positive & negative exponents, numerator_shift < 0)
+  "9007199254740993e30",
+  "9007199254740993e-30",
+  "1234567890123456789012345e50",
+  "1234567890123456789012345000000000000000e40",
+  "1234567890123456789012345e-50",
+  "1234567890123456789012345678901234567890e-5",
+  # Subnormals, rounding ties, DBL_MAX boundary, underflow, overflow, huge exponent cap
+  "5e-324", "2.4703282292062327e-324", "2.225073858507201e-308", "1e-320",
+  "1e-400", "1e-1000000000000000000",
+  "1.7976931348623157e308", "1.7976931348623159e308",
+  "1e310", "1e+1000000000000000000"
+].freeze
+
+NUMERIC_ERROR_FRAGMENTS = %w[
+  0b 0b102 0b1__0 0b1_
+  0o 0o8 0_8 0o7__7
+  0d 0d1a 0d1__2
+  0x 0xg 0xa1b2__c3d4 0xa1b2_
+  1__2 1_ 1.2.3 1.2e 1.2e+ 1.2e1_ 1.2e__1
+].freeze
+
+# Pre-built large bignum & long-mantissa float literals exercising:
+# - pm_integer_string_divide (> 48 binary words, including zero low-split words and
+#   18x18 decimal-word schoolbook column overflow PM_BIGNUM_DECIMAL_PRODUCTS)
+# - pm_integer_parse_decimal_divide (> 224 chunks = 2,016 digits)
+# - Binary & decimal Karatsuba in src/bignum.c (balanced, unbalanced left >= 2*right,
+#   left < right swap, and multi-word ripple carry / borrow)
+# - pm_double_exact truncation past PM_DOUBLE_DIGITS (768 digits)
+LARGE_BIGNUM_LITERALS = [
+  "0x1" + ("89abcdef" * 52),
+  "0x1" + ("0" * 256) + ("fedcba98" * 32) + ("0" * 256),
+  ("987654321" * 115) + ("999999999" * 116),
+  ("999999999" * 152) + ("000000000" * 80) + ("123456789" * 74)
+].freeze
+
+LONG_FLOAT_LITERAL = ("0." + ("123456789" * 87) + "e10").freeze
+
+def sample_integer_literal(rng, allow_invalid: false)
+  return NUMERIC_ERROR_FRAGMENTS.sample(random: rng) if allow_invalid && rng.rand < 0.12
+
+  r = rng.rand
+  if r < 0.30
+    rng.rand(0..999).to_s
+  elsif r < 0.96
+    COMPACT_INTEGERS.sample(random: rng)
+  else
+    LARGE_BIGNUM_LITERALS.sample(random: rng)
+  end
+end
+
+def sample_float_literal(rng, allow_invalid: false)
+  return NUMERIC_ERROR_FRAGMENTS.sample(random: rng) if allow_invalid && rng.rand < 0.10
+  return LONG_FLOAT_LITERAL if rng.rand < 0.04
+
+  FLOAT_LITERALS.sample(random: rng)
+end
+
 def parse_kv_file(path)
   return {} unless File.exist?(path)
 
@@ -321,6 +432,10 @@ def build_ruby_terminals(rng, allow_invalid: false)
   end
   terminals["tUPLUS"] = "+"
   terminals["tUMINUS"] = "-"
+  terminals["tINTEGER"] = -> { sample_integer_literal(rng, allow_invalid: allow_invalid) }
+  terminals["tFLOAT"] = -> { sample_float_literal(rng, allow_invalid: allow_invalid) }
+  terminals["tRATIONAL"] = -> { RATIONAL_LITERALS.sample(random: rng) }
+  terminals["tIMAGINARY"] = -> { IMAGINARY_LITERALS.sample(random: rng) }
   terminals["tSTRING_CONTENT"] = lambda do
     case delim_stack.last&.first
     when :regexp
@@ -361,8 +476,45 @@ class PrismComposer < Lrama::Fuzz::Ruby::Composer
   end
 
   def literal_expr
-    return regexp_literal if @random.rand < 0.22
-    super
+    r = @random.rand
+    if r < 0.20
+      regexp_literal
+    elsif r < 0.38
+      num = case @random.rand(4)
+            when 0 then sample_integer_literal(@random, allow_invalid: false)
+            when 1 then sample_float_literal(@random, allow_invalid: false)
+            when 2 then RATIONAL_LITERALS.sample(random: @random)
+            else        IMAGINARY_LITERALS.sample(random: @random)
+            end
+      @random.rand < 0.25 ? "-#{num}" : num
+    else
+      super
+    end
+  end
+
+  # Also emit multi-key static-literal `=>` hashes (including equal & distinct
+  # bignums, negative bignums, rationals, imaginaries, floats, and `__LINE__`)
+  # so `pm_integer_compare`, `pm_bignum_compare`, `integer_hash`, and table
+  # resizing in `src/static_literals.c` are exercised.
+  STATIC_COLLISION_KEYS = [
+    "0", "-0", "1", "__LINE__", "__FILE__",
+    "0x1_0000_0000_0000_0000_0001", "18446744073709551617",
+    "-0x1_0000_0000_0000_0000_0001", "-18446744073709551617",
+    "0x1_0000_0000_0000_0000_0002", "0x1_0000_0000_0000_0000_0000_0000_0001",
+    "1.5r", "1.50r", "2.5r", "1.25r",
+    "1234567890123456789012344.125r", "1234567890123456789012345.125r",
+    "42i", "42.0i", "1.5ri", "1.50ri", "0.0", "-0.0"
+  ].freeze
+
+  def hash_literal(&value_gen)
+    return super(&value_gen) if block_given? || @random.rand < 0.55
+
+    count = @random.rand < 0.5 ? @random.rand(2..4) : @random.rand(6..9)
+    pairs = count.times.map do
+      key = STATIC_COLLISION_KEYS.sample(random: @random)
+      "#{key} => #{simple_expr}"
+    end
+    "{ #{pairs.join(', ')} }"
   end
 
   def rich_expr
