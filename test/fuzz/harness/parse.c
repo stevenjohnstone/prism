@@ -33,6 +33,7 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
 
 #ifdef PRISM_FUZZ_IJON
 extern void ijon_set(uint32_t addr, uint32_t val);
+extern void ijon_max(uint32_t addr, uint64_t val);
 extern uint32_t ijon_hashstr(uint32_t old, const char *val);
 
 static inline uint32_t fuzz_ijon_mix32(uint32_t h) {
@@ -48,7 +49,14 @@ static inline uint32_t fuzz_ijon_mix32(uint32_t h) {
     do { \
         static uint32_t loc_hash = 0; \
         if (loc_hash == 0) loc_hash = ijon_hashstr(__LINE__, __FILE__); \
-        ijon_set(loc_hash, fuzz_ijon_mix32(loc_hash ^ (uint32_t) (x)) & 0x1ffu); \
+        ijon_set(loc_hash, fuzz_ijon_mix32(loc_hash ^ (uint32_t) (x)) & 0xfffu); \
+    } while (0)
+
+#define FUZZ_IJON_MAX(x) \
+    do { \
+        static uint32_t loc_hash = 0; \
+        if (loc_hash == 0) loc_hash = ijon_hashstr(__LINE__, __FILE__); \
+        ijon_max(loc_hash, (uint64_t) (x)); \
     } while (0)
 
 typedef struct {
@@ -57,26 +65,36 @@ typedef struct {
     uint32_t prev_state_flags;
     uint32_t prev_scope_sig;
     size_t prev_error_count;
+    uint32_t max_lex_depth;
+    uint32_t max_ctx_depth;
 } fuzz_ijon_state_t;
 
 static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void *data) {
     (void) token;
     fuzz_ijon_state_t *state = (fuzz_ijon_state_t *) data;
 
-    // 1. Lexer mode stack signature (top 4 modes with delimiter-nesting / heredoc flags).
+    // 1. Lexer mode stack signature (top 4 modes with delimiter-nesting / heredoc flags) + depth.
     uint32_t lex_mode_sig = 0;
+    uint32_t top_lex_nibble = 0;
     uint32_t lex_depth = 0;
-    for (const pm_lex_mode_t *m = parser->lex_modes.current; m != NULL && lex_depth < 4; m = m->prev, lex_depth++) {
-        uint32_t sub = 0;
-        switch (m->mode) {
-            case PM_LEX_LIST:    sub = (m->as.list.nesting > 0); break;
-            case PM_LEX_REGEXP:  sub = (m->as.regexp.nesting > 0); break;
-            case PM_LEX_STRING:  sub = (m->as.string.nesting > 0); break;
-            case PM_LEX_HEREDOC: sub = (m->as.heredoc.base.indent != PM_HEREDOC_INDENT_NONE); break;
-            default: break;
+    for (const pm_lex_mode_t *m = parser->lex_modes.current; m != NULL && lex_depth < 128; m = m->prev, lex_depth++) {
+        if (lex_depth < 4) {
+            uint32_t sub = 0;
+            switch (m->mode) {
+                case PM_LEX_LIST:    sub = (m->as.list.nesting > 0); break;
+                case PM_LEX_REGEXP:  sub = (m->as.regexp.nesting > 0); break;
+                case PM_LEX_STRING:  sub = (m->as.string.nesting > 0); break;
+                case PM_LEX_HEREDOC: sub = (m->as.heredoc.base.indent != PM_HEREDOC_INDENT_NONE); break;
+                default: break;
+            }
+            uint32_t nibble = (((uint32_t) m->mode + 1u) & 0x07u) | (sub << 3);
+            if (lex_depth == 0) top_lex_nibble = nibble;
+            lex_mode_sig = (lex_mode_sig << 4) | nibble;
         }
-        uint32_t nibble = (((uint32_t) m->mode + 1u) & 0x07u) | (sub << 3);
-        lex_mode_sig = (lex_mode_sig << 4) | nibble;
+    }
+    if (lex_depth > 1 && lex_depth > state->max_lex_depth) {
+        state->max_lex_depth = lex_depth;
+        FUZZ_IJON_MAX(lex_depth);
     }
     if (parser->lex_modes.current != NULL && parser->lex_modes.current->mode == PM_LEX_HEREDOC) {
         const pm_heredoc_lex_mode_t *hd = &parser->lex_modes.current->as.heredoc.base;
@@ -88,7 +106,7 @@ static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void 
         state->prev_lex_mode_sig = lex_mode_sig;
     }
 
-    // 2. Parser context stack signature (current and parent context).
+    // 2. Parser context stack signature (current and parent context) + nesting depth.
     uint32_t cur_ctx = parser->current_context != NULL ? (uint32_t) parser->current_context->context : 0;
     uint32_t prev_ctx = (parser->current_context != NULL && parser->current_context->prev != NULL)
         ? (uint32_t) parser->current_context->prev->context
@@ -97,6 +115,14 @@ static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void 
     if (ctx_sig != state->prev_ctx_sig) {
         FUZZ_IJON_SET(ctx_sig);
         state->prev_ctx_sig = ctx_sig;
+    }
+    uint32_t ctx_depth = 0;
+    for (const pm_context_node_t *c = parser->current_context; c != NULL && ctx_depth < 128; c = c->prev) {
+        ctx_depth++;
+    }
+    if (ctx_depth > state->max_ctx_depth) {
+        state->max_ctx_depth = ctx_depth;
+        FUZZ_IJON_MAX(ctx_depth);
     }
 
     // 3. Non-CFG parser mode flags and boolean stacks.
@@ -132,7 +158,7 @@ static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void 
     size_t error_count = parser->error_list.size;
     if (error_count != state->prev_error_count || parser->recovering) {
         state->prev_error_count = error_count;
-        uint32_t rec_sig = ((uint32_t) parser->recovering << 10) | (cur_ctx << 4) | (lex_mode_sig & 0x0fu);
+        uint32_t rec_sig = ((uint32_t) parser->recovering << 10) | (cur_ctx << 4) | top_lex_nibble;
         FUZZ_IJON_SET(rec_sig);
     }
 }
@@ -140,8 +166,11 @@ static void fuzz_ijon_lex_callback(pm_parser_t *parser, pm_token_t *token, void 
 
 __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, const fuzz_options_t *opts) {
     uint8_t *source = malloc(size);
-    assert(source);
-    memcpy(source, input, size);
+    if (size > 0) {
+        assert(source != NULL);
+        memcpy(source, input, size);
+    }
+    const uint8_t *source_buf = (size == 0 && source == NULL) ? (const uint8_t *) "" : source;
 
     struct pm_options_t *options = pm_options_new();
     pm_options_line_set(options, opts->start_line);
@@ -176,13 +205,13 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
             }
             if (locals_count == 3) {
                 size_t len = size < 4 ? size : 4;
-                pm_string_init(pm_options_scope_local_mut(scope, 2), source, len);
+                pm_string_init(pm_options_scope_local_mut(scope, 2), source_buf, len);
             }
         }
     }
 
     pm_arena_t *arena = pm_arena_new();
-    pm_parser_t *parser = pm_parser_new(arena, source, size, options);
+    pm_parser_t *parser = pm_parser_new(arena, source_buf, size, options);
 #ifdef PRISM_FUZZ_IJON
     fuzz_ijon_state_t ijon_state = { 0 };
     pm_parser_lex_callback_set(parser, fuzz_ijon_lex_callback, &ijon_state);
@@ -230,7 +259,7 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 }
 
 __attribute__((noinline)) void harness(const uint8_t *input, size_t size) {
-    if (size <= 4) return;
+    if (size < 4) return;
 
     static const char * const versions[] = {
         "3.3",
