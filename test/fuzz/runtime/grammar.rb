@@ -28,6 +28,8 @@ File.write(cmdline_path, "./build/fuzz.native\n")
 
 # 4-byte options header consumed by harness() in test/fuzz/harness/parse.c
 DEFAULT_HEADER = "\x00\x00\x03\x01".b
+ATTACH_COMMENTS_HEADER = "\x04\x00\x03\x01".b
+MAIN_SCRIPT_COMMENTS_HEADER = "\x04\x40\x03\x01".b
 MAX_PENDING_SEEDS = Integer(ENV.fetch("FUZZ_GRAMMAR_MAX_PENDING", "50000"))
 MAX_SEEN_DIGESTS = 500_000
 PRUNE_INTERVAL_SEC = 10.0
@@ -455,11 +457,11 @@ end
 
 # Extend lrama-fuzz's Ruby::Composer so composed programs also exercise regexp
 # literals (including inside `case ... in /.../` and `case ... when /.../`),
-# `=~` / `!~` calls, and LHS named-capture `MatchWriteNode` variable introduction
-# (both plain `/(?<x>...)/ =~ str` and interpolated `/(?<x>...)#{v}/x =~ str`).
+# `=~` / `!~` calls, LHS named-capture `MatchWriteNode` variable introduction,
+# multi-base/bignum numeric literals, and structural/embdoc/heredoc comments.
 class PrismComposer < Lrama::Fuzz::Ruby::Composer
-  PRISM_TEMPLATES = (Lrama::Fuzz::Ruby::Composer::TEMPLATES + %i[regexp_match]).freeze
-  PRISM_NESTED_TEMPLATES = (Lrama::Fuzz::Ruby::Composer::NESTED_TEMPLATES + %i[regexp_match]).freeze
+  PRISM_TEMPLATES = (Lrama::Fuzz::Ruby::Composer::TEMPLATES + %i[regexp_match commented_block]).freeze
+  PRISM_NESTED_TEMPLATES = (Lrama::Fuzz::Ruby::Composer::NESTED_TEMPLATES + %i[regexp_match commented_block]).freeze
 
   private
 
@@ -555,6 +557,100 @@ class PrismComposer < Lrama::Fuzz::Ruby::Composer
       "/(?<#{cap1}>\\p{Alpha}+)\#{#{interp_expr}}(?'#{cap2}'[0-9]{1,3}) # ext\n/#{flags} =~ #{rhs}"
     end
   end
+
+  # Structural comment & embdoc patterns exercising `src/comments.c`:
+  # - leading/trailing body comments (`pm_comments_blank_before` / `pm_comments_blank_after`)
+  # - column-0 `=begin ... =end` embdocs adjacent to `StatementsNode` (when `@nesting == 0`)
+  # - same-line trailing comments and distance tie-breaking
+  # - chained `rescue` trailing comments (`while (rescue->subsequent != NULL)`)
+  # - out-of-order comment offsets via heredoc interpolation + opener-line comment (`pm_comments_sort`)
+  # - wide (> 64 child) node stacks (`pm_comments_push` stack growth)
+  def commented_block
+    case @random.rand(@nesting == 0 ? 4 : 3)
+    when 0
+      v1 = define_var
+      v2 = define_var
+      <<~RUBY.chomp
+        # leading block comment
+        begin
+          # leading body comment
+          #{v1} = #{simple_expr} # inline statement comment
+          #{v2} = #{simple_expr}
+          # trailing body comment
+        rescue RuntimeError
+          #{v1} = 1
+        rescue ArgumentError
+          #{v2} = 2
+          # trailing chained-rescue comment
+        ensure
+          # ensure body comment
+          #{v1}
+        end # trailing end comment
+      RUBY
+    when 1
+      v = define_var
+      inner = simple_expr
+      <<~RUBY.chomp
+        #{v} = <<~HC + "" # opener-line comment after heredoc
+          \#{#{inner} # comment inside heredoc interpolation
+          }
+        HC
+      RUBY
+    when 2
+      v = define_var
+      items = Array.new(66) { |i| i.even? ? "#{i}" : "\"w#{i}\"" }.join(", ")
+      "# before wide array\n#{v} = [#{items}] # after wide array"
+    else
+      m = IDENTIFIERS.sample(random: @random)
+      v = define_var
+      "# top comment\ndef #{m}\n=begin\nembdoc before statements\n=end\n  #{v} = #{simple_expr} # inline\n=begin\nembdoc after statements\n=end\nend # after def"
+    end
+  end
+end
+
+MAGIC_COMMENT_PREAMBLES = [
+  "# frozen_string_literal: true\n",
+  "# frozen_string_literal: false\n",
+  "# frozen_string_literal: invalid_bool\n",
+  "# warn_indent: true\n",
+  "# warn_indent: false\n",
+  "# warn_indent: invalid_bool\n",
+  "# shareable_constant_value: none\n",
+  "# shareable_constant_value: literal\n",
+  "# shareable_constant_value: experimental_everything\n",
+  "# shareable_constant_value: experimental_copy\n",
+  "# shareable_constant_value: invalid_mode\n",
+  "# -*- coding: utf-8; frozen-string-literal: \"true\"; warn-indent: true -*-\n",
+  "# -*- encoding: ascii-8bit; shareable_constant_value: none -*-\n",
+  "# -*- unclosed emacs marker: true\n",
+  "# vim: set fileencoding=utf-8 :\n",
+  "# custom header coding = utf-8\n",
+  "# custom header coding: unknown_encoding_xyz\n",
+  "#!/usr/bin/env ruby\n# coding: utf-8\n",
+  "#!/usr/bin/env ruby\r\n# frozen_string_literal: true\n",
+  "#!/bin/sh\necho wrapper\n#!/usr/bin/env ruby\n# warn_indent: true\n"
+].freeze
+
+COMMENT_SUFFIXES = [
+  "\n# trailing comment with newline\n",
+  "\n# trailing EOF comment without newline",
+  "\n# frozen_string_literal: true\n",
+  "\n_scv = 1 # shareable_constant_value: literal\n",
+  "\n=begin\nembedded doc line 1\n=endnot_end_yet\n=end\n",
+  "\n=begin label\nembedded doc with trailing =end text\n=end extra info\n",
+  "\n=begin\nembedded doc at EOF without newline\n=end",
+  "\n=begin\nunterminated embdoc for error recovery\n",
+  "\n=begin"
+].freeze
+
+# Prepend magic/shebang comments and append inline/embdoc/EOF comments.
+# Returns [mutated_code, main_script_flag].
+def inject_comments_variant(code, rng)
+  preamble = MAGIC_COMMENT_PREAMBLES.sample(random: rng)
+  suffix = COMMENT_SUFFIXES.sample(random: rng)
+  has_shebang = preamble.start_with?("#!")
+  out = preamble.b + code.b + suffix.b
+  [out, has_shebang]
 end
 
 # Emit an encoding / multibyte regexp variant to exercise parser->encoding_changed
@@ -890,7 +986,7 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
   master_rng = Random.new
   initial_sync_notified = false
 
-  emit_candidate = lambda do |code, is_valid|
+  emit_candidate = lambda do |code, is_valid, header: nil|
     while pending_files >= MAX_PENDING_SEEDS
       notify_intake_sync(afl_dir)
       pending_files, newly_pruned = prune_synced_seeds(queue_dir)
@@ -902,8 +998,9 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
       sleep(0.5)
     end
 
+    seed_header = header || (master_rng.rand < 0.5 ? ATTACH_COMMENTS_HEADER : DEFAULT_HEADER)
     attempts_done += 1
-    if write_atomic_seed(queue_dir, staging_dir, DEFAULT_HEADER, code, seen_digests)
+    if write_atomic_seed(queue_dir, staging_dir, seed_header, code, seen_digests)
       files_created += 1
       pending_files += 1
       if is_valid
@@ -949,7 +1046,14 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
       # Emit magic `# encoding:` + multibyte/modifier regexp variants on ~18% of candidates.
       if master_rng.rand < 0.18
         enc_code = inject_encoding_variant(code, master_rng)
-        emit_candidate.call(enc_code, validator.call(enc_code))
+        emit_candidate.call(enc_code, validator.call(enc_code), header: ATTACH_COMMENTS_HEADER)
+      end
+
+      # Emit magic/shebang/embdoc/inline comment variants with attach_comments enabled on ~25% of candidates.
+      if master_rng.rand < 0.25
+        comment_code, is_main_script = inject_comments_variant(code, master_rng)
+        hdr = is_main_script ? MAIN_SCRIPT_COMMENTS_HEADER : ATTACH_COMMENTS_HEADER
+        emit_candidate.call(comment_code, validator.call(comment_code), header: hdr)
       end
     end
   end
