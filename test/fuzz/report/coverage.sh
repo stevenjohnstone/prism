@@ -5,17 +5,54 @@ if [ -n "$LLVM_VERSION" ] && [ -d "/usr/lib/llvm-${LLVM_VERSION}/bin" ]; then
 fi
 
 REPO_ROOT="$(pwd)"
-mkdir -p build
+mkdir -p build tmp/fuzz
+
+WORK_DIR=$(mktemp -d)
+ORIGINS_DIR="$WORK_DIR/origins"
+ORIGINS_META="$WORK_DIR/origins.json"
+COVERAGE_TMP_BIN="build/.fuzz.coverage.tmp.$$"
+FINAL_COVERAGE_DIR="tmp/fuzz/coverage"
+COVERAGE_DIR="tmp/fuzz/.coverage.tmp.$$"
+OLD_COVERAGE_DIR="tmp/fuzz/.coverage.old.$$"
+
+cleanup_coverage() {
+  local rc=$?
+  if [ ! -e "$FINAL_COVERAGE_DIR" ] && [ -d "$OLD_COVERAGE_DIR" ]; then
+    mv "$OLD_COVERAGE_DIR" "$FINAL_COVERAGE_DIR" 2>/dev/null || true
+  fi
+  rm -rf "$WORK_DIR" "$COVERAGE_TMP_BIN" "$COVERAGE_DIR" "$OLD_COVERAGE_DIR"
+  exit "$rc"
+}
+trap cleanup_coverage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Verify that a coverage binary is non-empty, runnable on /dev/null, and emits
+# profile data (rejecting 0-byte truncated files and un-instrumented binaries).
+smoke_check_coverage_bin() {
+  local bin="$1"
+  local smoke_prof="$WORK_DIR/smoke.profraw"
+  rm -f "$smoke_prof"
+  if [ -s "$bin" ] && LLVM_PROFILE_FILE="$smoke_prof" "$bin" /dev/null >/dev/null 2>&1 && [ -s "$smoke_prof" ]; then
+    rm -f "$smoke_prof"
+    return 0
+  fi
+  rm -f "$smoke_prof"
+  return 1
+}
 
 read -r -a extra_flags <<< "$FUZZ_FLAGS"
 FLAGS_STAMP="build/.fuzz.coverage.flags"
 NEED_BUILD=0
 
-if [ ! -x build/fuzz.coverage ] || [ ! -f "$FLAGS_STAMP" ]; then
+if [ ! -f "$FLAGS_STAMP" ]; then
   NEED_BUILD=1
 elif [ "$(cat "$FLAGS_STAMP" 2>/dev/null)" != "$FUZZ_FLAGS" ]; then
   NEED_BUILD=1
-elif [ -n "$(find src include test/fuzz/harness -type f -newer build/fuzz.coverage -print -quit 2>/dev/null)" ]; then
+elif [ ! -s build/fuzz.coverage ] || [ -n "$(find src include test/fuzz/harness -type f -newer build/fuzz.coverage -print -quit 2>/dev/null)" ]; then
+  NEED_BUILD=1
+elif ! smoke_check_coverage_bin ./build/fuzz.coverage; then
+  echo "Existing build/fuzz.coverage failed smoke check; rebuilding..."
   NEED_BUILD=1
 fi
 
@@ -25,30 +62,38 @@ if [ "$NEED_BUILD" -eq 1 ]; then
     src_files+=("$file")
   done < <(find src -name '*.c' -print0)
 
+  reach_bin="$WORK_DIR/fuzz.reach"
+  keeplist="$WORK_DIR/keeplist"
+
   echo "Building reachability binary..."
   clang -O0 -Iinclude -DSLOW -flto -ffunction-sections -fdata-sections "${extra_flags[@]}" -Wl,--gc-sections \
-    "${src_files[@]}" test/fuzz/harness/coverage.c test/fuzz/harness/parse.c -o build/fuzz.coverage
+    "${src_files[@]}" test/fuzz/harness/coverage.c test/fuzz/harness/parse.c -o "$reach_bin"
 
-  keeplist=$(mktemp)
   # Keep reachable static (t) and global (T) functions; exclude harness entrypoints.
-  llvm-nm --defined-only build/fuzz.coverage | grep " [Tt] " | grep -Ev '[Tt] (main|run_file|run_stdin|setup_signal_handlers|handle_crash_signal|harness|harness_parse|check_node_location)$' | awk '{print $3}' | sed 's/^/fun:/' > "$keeplist"
+  llvm-nm --defined-only "$reach_bin" | grep " [Tt] " | grep -Ev '[Tt] (main|run_file|run_stdin|setup_signal_handlers|handle_crash_signal|harness|harness_parse|check_node_location)$' | awk '{print $3}' | sed 's/^/fun:/' > "$keeplist"
+  rm -f "$reach_bin"
 
   echo "Building coverage-instrumented binary..."
   # Map REPO_ROOT (/prism in Docker) to '.' so exported LCOV/profdata paths are
   # workspace-relative (e.g. SF:src/prism.c) and work directly in host IDEs.
+  rm -f "$COVERAGE_TMP_BIN"
   clang -O1 -Iinclude -DSLOW -DPROFILE "${extra_flags[@]}" \
     -fcoverage-prefix-map="${REPO_ROOT}=." \
     -fprofile-instr-generate -fcoverage-mapping \
     -fprofile-list="$keeplist" \
-    "${src_files[@]}" test/fuzz/harness/coverage.c test/fuzz/harness/parse.c -o build/fuzz.coverage
+    "${src_files[@]}" test/fuzz/harness/coverage.c test/fuzz/harness/parse.c -o "$COVERAGE_TMP_BIN"
 
   rm -f "$keeplist"
+  if ! smoke_check_coverage_bin "$COVERAGE_TMP_BIN"; then
+    echo "Error: newly built coverage binary failed smoke check." >&2
+    exit 1
+  fi
+  mv -f "$COVERAGE_TMP_BIN" build/fuzz.coverage
   printf '%s' "$FUZZ_FLAGS" > "$FLAGS_STAMP"
 else
   echo "Using existing coverage-instrumented binary (build/fuzz.coverage)..."
 fi
 
-COVERAGE_DIR="tmp/fuzz/coverage"
 REPORT_DIR="$COVERAGE_DIR/report"
 WORKERS_DIR="$COVERAGE_DIR/workers"
 PROFDATA_FILE="$COVERAGE_DIR/coverage.profdata"
@@ -56,10 +101,13 @@ LCOV_FILE="$COVERAGE_DIR/lcov.info"
 SUMMARY_FILE="$COVERAGE_DIR/summary.txt"
 JSON_FILE="$COVERAGE_DIR/coverage.json"
 
-WORK_DIR=$(mktemp -d)
-ORIGINS_DIR="$WORK_DIR/origins"
-ORIGINS_META="$WORK_DIR/origins.json"
-trap 'rm -rf "$WORK_DIR"' EXIT
+if [ -n "${FUZZ_LIVE_SEEDS_TAR:-}" ]; then
+  if [ -s "$FUZZ_LIVE_SEEDS_TAR" ]; then
+    mkdir -p /tmp/afl-tmpdir/grammar/seeds
+    tar -C /tmp/afl-tmpdir/grammar/seeds -xf "$FUZZ_LIVE_SEEDS_TAR" 2>/dev/null || rm -rf /tmp/afl-tmpdir/grammar/seeds
+  fi
+  rm -f "$FUZZ_LIVE_SEEDS_TAR"
+fi
 
 JOBS=$(nproc 2>/dev/null || echo 4)
 rm -rf "$COVERAGE_DIR"
@@ -213,23 +261,31 @@ ruby -rdigest -rjson -rfileutils -e '
     end
   end
 
-  # 5. If /tmp/afl-tmpdir/grammar/seeds (live container) or tmp/fuzz/seeds (saved on exit)
-  #    has pending seeds, sample up to 5,000
+  # 5. If /tmp/afl-tmpdir/grammar/seeds (live snapshot / container) or tmp/fuzz/seeds
+  #    (saved on exit) has pending seeds, sample up to 5,000 into origins_dir so
+  #    concurrently starting/stopping a fuzz run neither alters seed atimes nor
+  #    removes files while batches are executing.
   live_seeds_dir = ["/tmp/afl-tmpdir/grammar/seeds", "tmp/fuzz/seeds"].find do |d|
     Dir.exist?(d) && Dir.children(d).any? { |f| !f.start_with?(".") }
   end
   if live_seeds_dir
     b = buckets["grammar"]
+    staged_seeds_dir = File.join(origins_dir, "_pending_seeds")
+    FileUtils.mkdir_p(staged_seeds_dir)
+    rd_flags = File::RDONLY | (defined?(File::NOATIME) ? File::NOATIME : 0)
     pending_paths = Dir.children(live_seeds_dir)
       .reject { |f| f.start_with?(".") }
       .first(5000)
       .map { |f| File.join(live_seeds_dir, f) }
-    pending_paths.each do |full|
+    pending_paths.each_with_index do |full, idx|
       next unless File.file?(full)
-      digest = Digest::SHA256.file(full).digest rescue next
+      data = (File.open(full, rd_flags, &:read) rescue File.binread(full)) rescue next
+      digest = Digest::SHA256.digest(data)
       next if b[:seen][digest]
       b[:seen][digest] = true
-      b[:queue] << full
+      staged = File.join(staged_seeds_dir, "#{idx}_#{File.basename(full)}")
+      File.binwrite(staged, data)
+      b[:queue] << staged
       b[:pending_seeds] += 1
     end
   end
@@ -913,11 +969,18 @@ ruby -rjson -rtime -e '
   File.write(out_json_path, JSON.pretty_generate(payload))
 ' "$WORK_DIR" "$ORIGINS_META" "$JSON_FILE" "$LCOV_FILE" "$COVERAGE_DIR" "$PROFDATA_FILE" "$IGNORE_REGEX"
 
+rm -rf "$OLD_COVERAGE_DIR"
+if [ -d "$FINAL_COVERAGE_DIR" ]; then
+  mv "$FINAL_COVERAGE_DIR" "$OLD_COVERAGE_DIR"
+fi
+mv "$COVERAGE_DIR" "$FINAL_COVERAGE_DIR"
+rm -rf "$OLD_COVERAGE_DIR"
+
 echo ""
-echo "Coverage artifacts written to $COVERAGE_DIR:"
-echo "  - LCOV (IDE integration): $LCOV_FILE"
-echo "  - Combined HTML report:   $REPORT_DIR/index.html"
-echo "  - Per-worker HTML reports:$WORKERS_DIR/<worker>/report/index.html"
-echo "  - JSON breakdown:         $JSON_FILE"
-echo "  - LLVM profdata:          $PROFDATA_FILE"
-echo "  - Text summary:           $SUMMARY_FILE"
+echo "Coverage artifacts written to $FINAL_COVERAGE_DIR:"
+echo "  - LCOV (IDE integration): $FINAL_COVERAGE_DIR/lcov.info"
+echo "  - Combined HTML report:   $FINAL_COVERAGE_DIR/report/index.html"
+echo "  - Per-worker HTML reports:$FINAL_COVERAGE_DIR/workers/<worker>/report/index.html"
+echo "  - JSON breakdown:         $FINAL_COVERAGE_DIR/coverage.json"
+echo "  - LLVM profdata:          $FINAL_COVERAGE_DIR/coverage.profdata"
+echo "  - Text summary:           $FINAL_COVERAGE_DIR/summary.txt"
