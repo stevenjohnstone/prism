@@ -620,11 +620,12 @@ fleet_max_corpus = afl_fuzzers.map { |f| f[:corpus_count] }.max || 0
 fleet_max_runtime = fuzzers.map { |f| f[:run_time] }.max || 0
 main_fuzzer = afl_fuzzers.find { |f| f[:name] == "main" } || afl_fuzzers.first || fuzzers.first
 
-# Compute snapshot sync progress of `main` across each peer queue (from main/.synced/<peer> + queue origins)
+# Compute snapshot sync progress across each upstream generator (-F), foreign fuzzer (-F), and peer queue (.synced/<peer>)
 main_name = main_fuzzer[:name]
 main_synced_cursors = main_fuzzer[:synced_cursors] || {}
 main_max_src = main_fuzzer[:origins][:max_src_by_source] || {}
 main_by_source = main_fuzzer[:origins][:by_source] || {}
+expanded_afl_dir = File.expand_path(afl_dir)
 
 peer_sync_by_name = {}
 fuzzers.each do |f|
@@ -643,8 +644,10 @@ fuzzers.each do |f|
     yield_pct = tested_count > 0 ? (imported_count * 100.0 / tested_count) : 0.0
     peer_sync_by_name[peer_name] = {
       is_generator: true,
+      sync_mode: :foreign_seeds,
       intake_fuzzer: intake_fuzzer,
       intake_name: intake_fuzzer[:name],
+      consumer_name: intake_fuzzer[:name],
       peer_total: tested_count,
       watermark: tested_count,
       cursor: tested_count,
@@ -661,10 +664,11 @@ fuzzers.each do |f|
     next
   end
 
+  is_foreign_queue = File.expand_path(File.dirname(f[:dir])) != expanded_afl_dir
   peer_total = f[:corpus_count]
   watermark = main_synced_cursors[peer_name] || 0
   in_flight = main_max_src[peer_name] || 0
-  if !main_synced_cursors.key?(peer_name) && in_flight > 0
+  if is_foreign_queue && in_flight > 0
     # Foreign-synced fuzzer (-F, e.g. ijon -> main): main scanned every peer queue file
     # whose mtime was <= the mtime of the highest imported peer item during that -F pass.
     qdir = File.join(f[:dir], "queue")
@@ -684,7 +688,7 @@ fuzzers.each do |f|
   cursor = [[watermark, in_flight].max, peer_total].min
 
   # Items in peer's queue[0...cursor] that originally came from `main` (sync:main) are skipped by `main` without running
-  skipped_from_main = lookup_prefix(f[:origins][:by_source][main_name] || [], cursor)
+  skipped_from_main = is_foreign_queue ? 0 : lookup_prefix(f[:origins][:by_source][main_name] || [], cursor)
   tested_by_main = [cursor - skipped_from_main, 0].max
   imported_by_main = lookup_prefix(main_by_source[peer_name] || [], main_fuzzer[:corpus_count])
   rejected_by_main = [tested_by_main - imported_by_main, 0].max
@@ -700,6 +704,8 @@ fuzzers.each do |f|
 
   peer_sync_by_name[peer_name] = {
     is_generator: false,
+    sync_mode: is_foreign_queue ? :foreign_queue : :peer,
+    consumer_name: main_name,
     peer_total: peer_total,
     watermark: watermark,
     cursor: cursor,
@@ -717,23 +723,41 @@ end
 
 peer_sync_rows_html = fuzzers.reject { |f| f[:name] == main_name }.map do |f|
   ps = peer_sync_by_name[f[:name]]
+  consumer = ps[:consumer_name] || main_name
   total = [ps[:peer_total], 1].max.to_f
   imp_w = (ps[:imported_by_main] * 100.0 / total).round(2)
   rej_w = (ps[:rejected_by_main] * 100.0 / total).round(2)
   skp_w = (ps[:skipped_from_main] * 100.0 / total).round(2)
   uns_w = [100.0 - imp_w - rej_w - skp_w, 0.0].max.round(2)
-  tip = "#{f[:name]} (queue: #{format_int(ps[:peer_total])}) — " \
-        "Cursor: #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
-        "Tested by #{main_name}: #{format_int(ps[:tested_by_main])} | " \
-        "Imported by #{main_name}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
-        "Rejected by #{main_name}: #{format_int(ps[:rejected_by_main])} | " \
-        "Skipped (sync:#{main_name}): #{format_int(ps[:skipped_from_main])} | " \
-        "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
+  tip = case ps[:sync_mode]
+        when :foreign_seeds
+          "#{f[:name]} → #{consumer} (-F foreign seeds, created: #{format_int(ps[:peer_total])}) — " \
+          "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
+          "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
+          "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])}"
+        when :foreign_queue
+          "#{f[:name]} → #{consumer} (-F foreign queue: #{format_int(ps[:peer_total])}) — " \
+          "Scanned (mtime watermark): #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
+          "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
+          "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
+          "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])} | " \
+          "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
+        else
+          "#{f[:name]} → #{consumer} (#{consumer}/.synced/#{f[:name]}, queue: #{format_int(ps[:peer_total])}) — " \
+          "Cursor: #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
+          "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
+          "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
+          "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])} | " \
+          "Skipped (sync:#{consumer}): #{format_int(ps[:skipped_from_main])} | " \
+          "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
+        end
+  route_suffix = ps[:sync_mode] == :peer ? "" : " (-F)"
   <<~HTML
     <div class="sync-row" title="#{CGI.escapeHTML(tip)}" onclick="selectTab('#{CGI.escapeHTML(f[:name])}')">
       <div class="sync-peer">
         <span class="legend-dot" style="background:#{f[:color]}"></span>
         <strong>#{CGI.escapeHTML(f[:name])}</strong>
+        <span class="muted" style="font-size:0.75rem;font-weight:400">&rarr; #{CGI.escapeHTML(consumer)}#{route_suffix}</span>
       </div>
       <div class="sync-bar-wrap">
         <div class="sync-bar">
@@ -756,16 +780,23 @@ peer_sync_rows_html = fuzzers.reject { |f| f[:name] == main_name }.map do |f|
 end.join("\n")
 
 peer_sync_card_html = if peer_sync_by_name.any?
-  total_peer_tested = peer_sync_by_name.values.sum { |ps| ps[:tested_by_main] }
-  total_peer_imported = peer_sync_by_name.values.sum { |ps| ps[:imported_by_main] }
-  total_peer_backlog = peer_sync_by_name.values.sum { |ps| ps[:unsynced_backlog] }
-  overall_yield = total_peer_tested > 0 ? (total_peer_imported * 100.0 / total_peer_tested) : 0.0
+  main_feeds = peer_sync_by_name.select { |_k, ps| ps[:consumer_name] == main_name }.values
+  upstream_feeds = peer_sync_by_name.reject { |_k, ps| ps[:consumer_name] == main_name }
+  total_main_tested = main_feeds.sum { |ps| ps[:tested_by_main] }
+  total_main_imported = main_feeds.sum { |ps| ps[:imported_by_main] }
+  total_main_backlog = main_feeds.sum { |ps| ps[:unsynced_backlog] }
+  overall_yield = total_main_tested > 0 ? (total_main_imported * 100.0 / total_main_tested) : 0.0
+  upstream_summary = upstream_feeds.map do |src_name, ps|
+    "; <code>#{CGI.escapeHTML(src_name)} &rarr; #{CGI.escapeHTML(ps[:consumer_name])}</code>: " \
+      "<strong>+#{format_int(ps[:imported_by_main])}</strong> / <strong>#{format_int(ps[:tested_by_main])}</strong> " \
+      "(<strong>#{format('%.2f%%', ps[:yield_pct])}</strong> yield)"
+  end.join
   <<~HTML
     <div class="chart-card sync-overview-card">
       <div class="chart-header">
         <div>
-          <h3>Peer Queue Sync Snapshot (<code>#{CGI.escapeHTML(main_name)}/.synced/&lt;peer&gt;</code>)</h3>
-          <p class="chart-sub">How far <code>#{CGI.escapeHTML(main_name)}</code> has scanned each peer's queue, and how many foreign inputs yielded novel edges vs. were rejected or skipped (overall: <strong>+#{format_int(total_peer_imported)}</strong> imported / <strong>#{format_int(total_peer_tested)}</strong> tested = <strong>#{format("%.2f%%", overall_yield)}</strong> yield, <strong>#{format_int(total_peer_backlog)}</strong> unsynced backlog)</p>
+          <h3>Queue &amp; Foreign Sync Snapshot</h3>
+          <p class="chart-sub">How far each source has been scanned by its consumer via foreign sync (<code>-F</code>) or peer sync (<code>#{CGI.escapeHTML(main_name)}/.synced/&lt;peer&gt;</code>), and how many inputs yielded novel coverage vs. were rejected or skipped (into <code>#{CGI.escapeHTML(main_name)}</code>: <strong>+#{format_int(total_main_imported)}</strong> imported / <strong>#{format_int(total_main_tested)}</strong> tested = <strong>#{format("%.2f%%", overall_yield)}</strong> yield, <strong>#{format_int(total_main_backlog)}</strong> unsynced backlog#{upstream_summary})</p>
         </div>
         <div class="chart-legend">
           <span class="legend-item"><span class="legend-dot" style="background:#34d399"></span><span class="legend-name">Imported (Novel)</span></span>
@@ -775,9 +806,9 @@ peer_sync_card_html = if peer_sync_by_name.any?
         </div>
       </div>
       <div class="sync-rows-head">
-        <div>Peer Worker</div>
-        <div>Peer Queue Breakdown</div>
-        <div style="text-align:right">Cursor / Queue</div>
+        <div>Source &rarr; Consumer</div>
+        <div>Sync Breakdown</div>
+        <div style="text-align:right">Scanned / Total</div>
         <div style="text-align:right">Imported / Tested (Yield)</div>
       </div>
       <div class="sync-rows">
@@ -2619,18 +2650,48 @@ fuzzers.each do |f|
           <div class="kpi-sub"> Peak RSS: #{f[:stats]['peak_rss_mb'] || '-'} MB</div>
         </div>
         #{if (ps = peer_sync_by_name[f[:name]])
-            <<~SYNC_KPI
-              <div class="kpi-card">
-                <div class="kpi-label">Sync to #{CGI.escapeHTML(main_name)}</div>
-                <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
-                <div class="kpi-sub">#{format_int(ps[:tested_by_main])} tested &bull; cursor #{format_int(ps[:cursor])}/#{format_int(ps[:peer_total])} (#{format("%.0f%%", ps[:sync_pct])})</div>
-              </div>
-              <div class="kpi-card">
-                <div class="kpi-label">Sync from #{CGI.escapeHTML(main_name)}</div>
-                <div class="kpi-value">#{format("%.0f%%", ps[:peer_from_main_pct])}</div>
-                <div class="kpi-sub">cursor #{format_int(ps[:peer_from_main_cursor])} / #{format_int(main_fuzzer[:corpus_count])} in #{CGI.escapeHTML(main_name)}</div>
-              </div>
-            SYNC_KPI
+            if ps[:sync_mode] == :foreign_queue
+              upstream_gen_entry = peer_sync_by_name.find { |_gn, gps| gps[:is_generator] && gps[:consumer_name] == f[:name] }
+              intake_kpi = if upstream_gen_entry
+                             gen_name, gen_ps = upstream_gen_entry
+                             <<~INTAKE_KPI
+                               <div class="kpi-card">
+                                 <div class="kpi-label">Intake from #{CGI.escapeHTML(gen_name)} (-F)</div>
+                                 <div class="kpi-value">+#{format_int(gen_ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", gen_ps[:yield_pct])})</span></div>
+                                 <div class="kpi-sub">#{format_int(gen_ps[:tested_by_main])} seeds tested &bull; standalone master (-M)</div>
+                               </div>
+                             INTAKE_KPI
+                           else
+                             <<~INTAKE_KPI
+                               <div class="kpi-card">
+                                 <div class="kpi-label">Sync Role</div>
+                                 <div class="kpi-value">Master (-M)</div>
+                                 <div class="kpi-sub">isolated sync root (no sync from #{CGI.escapeHTML(main_name)})</div>
+                               </div>
+                             INTAKE_KPI
+                           end
+              <<~SYNC_KPI
+                <div class="kpi-card">
+                  <div class="kpi-label">Foreign Sync to #{CGI.escapeHTML(main_name)} (-F)</div>
+                  <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
+                  <div class="kpi-sub">#{format_int(ps[:tested_by_main])} tested &bull; scanned #{format_int(ps[:cursor])}/#{format_int(ps[:peer_total])} (#{format("%.0f%%", ps[:sync_pct])})</div>
+                </div>
+                #{intake_kpi}
+              SYNC_KPI
+            else
+              <<~SYNC_KPI
+                <div class="kpi-card">
+                  <div class="kpi-label">Sync to #{CGI.escapeHTML(main_name)}</div>
+                  <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
+                  <div class="kpi-sub">#{format_int(ps[:tested_by_main])} tested &bull; cursor #{format_int(ps[:cursor])}/#{format_int(ps[:peer_total])} (#{format("%.0f%%", ps[:sync_pct])})</div>
+                </div>
+                <div class="kpi-card">
+                  <div class="kpi-label">Sync from #{CGI.escapeHTML(main_name)}</div>
+                  <div class="kpi-value">#{format("%.0f%%", ps[:peer_from_main_pct])}</div>
+                  <div class="kpi-sub">cursor #{format_int(ps[:peer_from_main_cursor])} / #{format_int(main_fuzzer[:corpus_count])} in #{CGI.escapeHTML(main_name)}</div>
+                </div>
+              SYNC_KPI
+            end
           else
             ""
           end}
@@ -3169,7 +3230,7 @@ html = <<~HTML
       }
       .sync-rows-head {
         display: grid;
-        grid-template-columns: 140px 1fr 160px 210px;
+        grid-template-columns: 210px 1fr 160px 210px;
         gap: 14px;
         padding: 6px 8px;
         color: var(--muted);
@@ -3185,7 +3246,7 @@ html = <<~HTML
       }
       .sync-row {
         display: grid;
-        grid-template-columns: 140px 1fr 160px 210px;
+        grid-template-columns: 210px 1fr 160px 210px;
         gap: 14px;
         align-items: center;
         padding: 7px 8px;
