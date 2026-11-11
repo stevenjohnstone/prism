@@ -140,27 +140,30 @@ fuzz-stop:
 	$(Q) docker stop $(FUZZ_CONTAINER_NAME)
 
 define FUZZ_RUN_COVERAGE
-@if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
-	docker exec -e FUZZ_FLAGS="$(FUZZ_FLAGS)" $(FUZZ_CONTAINER_NAME) ./test/fuzz/report/coverage.sh; \
-else \
-	docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh; \
-fi
+( \
+	LIVE_SEEDS_TAR=""; \
+	trap 'rc=$$?; rm -f "$$LIVE_SEEDS_TAR"; exit $$rc' EXIT; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
+		mkdir -p $(FUZZ_DIR); \
+		LIVE_SEEDS_TAR="tmp/fuzz/.live-seeds.$$$$.tar"; \
+		docker exec $(FUZZ_CONTAINER_NAME) bash -c 'test -d /tmp/afl-tmpdir/grammar/seeds && find /tmp/afl-tmpdir/grammar/seeds -maxdepth 1 -type f ! -name ".*" -printf "%f\0" | head -z -n 5000 | tar --atime-preserve=system --ignore-failed-read --warning=no-file-changed --warning=no-file-removed -C /tmp/afl-tmpdir/grammar/seeds --null -T - -cf -' > "$$LIVE_SEEDS_TAR" 2>/dev/null || { rm -f "$$LIVE_SEEDS_TAR"; LIVE_SEEDS_TAR=""; }; \
+	fi; \
+	docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -e FUZZ_LIVE_SEEDS_TAR="$$LIVE_SEEDS_TAR" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh \
+)
 endef
 
 fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "collecting coverage"
-	$(FUZZ_RUN_COVERAGE)
+	@$(FUZZ_RUN_COVERAGE)
 	$(Q) ruby ./test/fuzz/report/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html $(FUZZ_COVERAGE_DIR)/coverage.json
 
 fuzz-plot: fuzz-docker-build fuzz-gen-templates
 	@if [ -z "$(FUZZ_SKIP_COVERAGE)" ] && [ -d "$(FUZZ_AFL_DIR)" ]; then \
-		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
+		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ] || [ -n "$$(find $(FUZZ_SEEDS_DIR) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
 			echo "collecting coverage (set FUZZ_SKIP_COVERAGE=1 to skip)"; \
-			if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
-				docker exec -e FUZZ_FLAGS="$(FUZZ_FLAGS)" $(FUZZ_CONTAINER_NAME) ./test/fuzz/report/coverage.sh; \
-			else \
-				docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh; \
-			fi; \
+			$(FUZZ_RUN_COVERAGE); \
 		fi; \
 	fi
 	$(ECHO) "generating AFL++ plots"
@@ -203,7 +206,7 @@ fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FU
 fuzz-clean:
 	$(FUZZ_CLEAN_CONFIRM)
 	$(ECHO) "Removing fuzz data (preserving tmp/fuzz/triage)"
-	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR)
+	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
 	$(ECHO) "done"
 
 .PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-test
