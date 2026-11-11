@@ -64,8 +64,21 @@ end
 
 def normalize_origin(origin)
   return "grammar" if origin =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
+  return "ijon" if origin =~ /\Aijon(?:_\d+)?\z/
 
   origin
+end
+
+def worker_root_dirs(afl_dir)
+  [afl_dir, "#{afl_dir}-ijon"].select { |d| Dir.exist?(d) }
+end
+
+def find_worker_dir(afl_dir, name)
+  worker_root_dirs(afl_dir).each do |root|
+    d = File.join(root, name)
+    return d if Dir.exist?(d)
+  end
+  File.join(afl_dir, name)
 end
 
 def pid_alive?(pid)
@@ -98,43 +111,56 @@ def compute_contributions(afl_dir)
   local_items = []
   grammar_shared_srcs = {}
 
-  Dir.glob(File.join(afl_dir, "*/queue")).each do |qdir|
+  worker_root_dirs(afl_dir).flat_map { |r| Dir.glob(File.join(r, "*/queue")) }.each do |qdir|
     fuzzer = File.basename(File.dirname(qdir))
     entries = Dir.children(qdir).sort rescue next
     entries.each do |f|
-      id = f[/^id:(\d+)/, 1]
-      next unless id
+      raw_id = f[/\Aid:(\d+),/, 1]
+      next unless raw_id
 
-      if f.include?("orig:")
-        origin[fuzzer][id] = :seed
-      elsif f =~ /sync:([^,]+),src:([^,]+)/
+      id = raw_id.to_i.to_s
+      if f =~ /\Aid:\d+,sync:([^,]+),src:(?:id:)?([^,+]+)/
         peer = normalize_origin(Regexp.last_match(1))
         src_ref = Regexp.last_match(2)
         if peer == "grammar"
           origin[fuzzer][id] = "grammar"
           grammar_shared_srcs[src_ref] = true
         else
+          src_key = src_ref =~ /\A\d+\z/ ? src_ref.to_i.to_s : src_ref
           origin[fuzzer][id] = peer
-          sync_items << [fuzzer, id, peer, src_ref]
+          sync_items << [fuzzer, id, peer, src_key]
         end
+      elsif f =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:/
+        origin[fuzzer][id] = :seed
       else
-        srcs = f[/src:([0-9+]+)/, 1]&.split("+") || []
+        srcs = (f[/\Aid:\d+,src:([0-9+]+)/, 1]&.split("+") || []).map { |s| s.to_i.to_s }
         origin[fuzzer][id] = fuzzer
         local_items << [fuzzer, id, srcs]
       end
     end
   end
 
-  # Propagate transitive origins across multi-hop syncs (e.g. grammar -> ldet -> main -> main-2)
-  3.times do
+  # Propagate transitive origins to fixed point across multi-hop syncs
+  # (e.g. grammar -> ijon -> main -> main-4 -> main -> msan)
+  16.times do
+    changed = false
     sync_items.each do |fuzzer, id, peer, src_ref|
       src_orig = origin[peer][src_ref]
-      origin[fuzzer][id] = (src_orig && src_orig != :seed) ? src_orig : peer
+      new_orig = (src_orig && src_orig != :seed) ? src_orig : peer
+      if origin[fuzzer][id] != new_orig
+        origin[fuzzer][id] = new_orig
+        changed = true
+      end
     end
     local_items.each do |fuzzer, id, srcs|
       foreign = srcs.filter_map { |s| origin[fuzzer][s] }.reject { |o| o == :seed || o == fuzzer }.uniq
-      origin[fuzzer][id] = foreign.first || fuzzer
+      new_orig = (foreign.include?("grammar") ? "grammar" : foreign.first) || fuzzer
+      if origin[fuzzer][id] != new_orig
+        origin[fuzzer][id] = new_orig
+        changed = true
+      end
     end
+    break unless changed
   end
 
   shared_ids = Hash.new { |h, k| h[k] = {} }
@@ -161,11 +187,11 @@ rescue StandardError
 end
 
 def collect_fuzzer_rows(afl_dir, expected_fuzzers, started_at, now)
-  discovered = Dir.glob(File.join(afl_dir, "*/fuzzer_stats")).map { |p| File.basename(File.dirname(p)) }
+  discovered = worker_root_dirs(afl_dir).flat_map { |r| Dir.glob(File.join(r, "*/fuzzer_stats")) }.map { |p| File.basename(File.dirname(p)) }
   names = (expected_fuzzers + discovered).uniq
 
   names.map do |name|
-    stats_path = File.join(afl_dir, name, "fuzzer_stats")
+    stats_path = File.join(find_worker_dir(afl_dir, name), "fuzzer_stats")
     if File.exist?(stats_path)
       stats = parse_stats_file(stats_path)
       pid = stats["fuzzer_pid"].to_i

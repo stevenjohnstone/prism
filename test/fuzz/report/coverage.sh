@@ -78,10 +78,21 @@ ruby -rdigest -rjson -rfileutils -e '
 
   def normalize_source(src)
     return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
+    return "ijon" if src =~ /\Aijon(?:_\d+)?\z/
     src
   end
 
-  worker_dirs = Dir.glob("tmp/fuzz/afl/*").select { |d| File.directory?(d) }.sort
+  worker_dirs = []
+  seen_workers = {}
+  ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].each do |root|
+    next unless Dir.exist?(root)
+    Dir.glob(File.join(root, "*")).sort.each do |d|
+      w = File.basename(d)
+      next if w.start_with?(".") || !File.directory?(d) || seen_workers[w]
+      seen_workers[w] = d
+      worker_dirs << d
+    end
+  end
   worker_names = worker_dirs.map { |d| File.basename(d) }
 
   # 1. Index all queue entries by [worker, id] so transitive sync:<peer>,src:<id>
@@ -96,15 +107,15 @@ ruby -rdigest -rjson -rfileutils -e '
     next unless Dir.exist?(q_dir)
 
     Dir.children(q_dir).each do |fname|
-      next unless fname.start_with?("id:")
+      id = fname[/\Aid:(\d+),/, 1]&.to_i
+      next unless id
       full = File.join(q_dir, fname)
       next unless File.file?(full)
 
-      id = fname[3, 6].to_i
       key = [w, id]
       path_map[key] = full
 
-      if fname =~ /,sync:([^,]+),src:(\d{6})/
+      if fname =~ /\Aid:\d+,sync:([^,]+),src:(?:id:)?(\d+)/
         src_w = normalize_source($1)
         src_id = $2.to_i
         if src_w == "grammar"
@@ -113,10 +124,10 @@ ruby -rdigest -rjson -rfileutils -e '
           kind_map[key] = :sync
           parent_map[key] = [src_w, src_id]
         end
-      elsif fname =~ /,sync:([^,]+)/
+      elsif fname =~ /\Aid:\d+,sync:([^,]+)/
         src_w = normalize_source($1)
         kind_map[key] = src_w == "grammar" ? "grammar" : src_w
-      elsif fname.include?(",orig:")
+      elsif fname =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:/
         kind_map[key] = "corpus"
       else
         kind_map[key] = w
@@ -202,9 +213,12 @@ ruby -rdigest -rjson -rfileutils -e '
     end
   end
 
-  # 5. If /tmp/afl-tmpdir/grammar/seeds has live pending seeds, sample up to 5,000
-  live_seeds_dir = "/tmp/afl-tmpdir/grammar/seeds"
-  if Dir.exist?(live_seeds_dir)
+  # 5. If /tmp/afl-tmpdir/grammar/seeds (live container) or tmp/fuzz/seeds (saved on exit)
+  #    has pending seeds, sample up to 5,000
+  live_seeds_dir = ["/tmp/afl-tmpdir/grammar/seeds", "tmp/fuzz/seeds"].find do |d|
+    Dir.exist?(d) && Dir.children(d).any? { |f| !f.start_with?(".") }
+  end
+  if live_seeds_dir
     b = buckets["grammar"]
     pending_paths = Dir.children(live_seeds_dir)
       .reject { |f| f.start_with?(".") }
@@ -220,8 +234,8 @@ ruby -rdigest -rjson -rfileutils -e '
     end
   end
 
-  # Sort origins in canonical display order: corpus, grammar, main, msan, ldet, main-2..N
-  priority = { "corpus" => 0, "grammar" => 1, "main" => 2, "msan" => 3, "ldet" => 4 }
+  # Sort origins in canonical display order: corpus, grammar, main, msan, ijon, main-2..N
+  priority = { "corpus" => 0, "grammar" => 1, "main" => 2, "msan" => 3, "ijon" => 4 }
   sorted_origins = buckets.keys.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]
@@ -249,9 +263,10 @@ ruby -rdigest -rjson -rfileutils -e '
       b[:crash].each { |p| f.write(p); f.write("\0") }
     end
 
+    w_stats = seen_workers[origin] && File.join(seen_workers[origin], "fuzzer_stats")
     kind = if origin == "corpus"
              "corpus"
-           elsif origin == "grammar" || File.exist?(File.join("tmp/fuzz/afl", origin, "fuzzer_stats")) && File.read(File.join("tmp/fuzz/afl", origin, "fuzzer_stats")).include?("generator")
+           elsif origin == "grammar" || (w_stats && File.exist?(w_stats) && File.read(w_stats).include?("generator"))
              "generator"
            else
              "fuzzer"
