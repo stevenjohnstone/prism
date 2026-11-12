@@ -67,36 +67,26 @@ Everything needed to build the fuzzers, run a campaign, and triage crashes is se
 tmp/fuzz/triage
 └── ABRT                          <-- crash category (e.g., ABRT, SEGV, heap-buffer-overflow, memory-leak)
     └── 14a9275da317ddd6          <-- hash of the normalized backtrace
+        ├── build.sh              <-- executable compiler script with the exact flags for this crash
         ├── id:000000,sig:06,...  <-- original unminimized AFL++ crash input
         ├── input.min             <-- minimized raw input (4-byte option header + Ruby source)
         └── testcase.c            <-- self-contained C program that reproduces the crash
 ```
 
-Each `testcase.c` is synthesized as a minimal, self-contained `<prism.h>` program: `triage.rb` minimizes both the Ruby source and the 4-byte options header, emits only the non-default `pm_options_*` calls and the specific invariant or downstream consumer (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, or `pm_dump_json`) needed to trigger the crash, and includes a readable string dump, [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) link, and captured sanitizer report in comments.
+Each `testcase.c` is synthesized as a minimal, self-contained `<prism.h>` program: `triage.rb` minimizes both the Ruby source and the 4-byte options header, emits only the non-default `pm_options_*` calls and the specific invariant or downstream consumer (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, or `pm_dump_json`) needed to trigger the crash, and includes a readable string dump, [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) link, and captured sanitizer report in comments. Alongside it, `build.sh` compiles `testcase.c` into `testcase` with the specific sanitizer (`address,undefined`, `memory`, `leak`, or `undefined`) and compile-time `-D` tunings needed for that finding.
 
-To reproduce a triaged finding, you can either pass `input.min` directly to the prebuilt fuzzer binaries (inside `make fuzz-debug`) or compile the standalone `testcase.c` reproducer:
+To reproduce a triaged finding, you can either pass `input.min` directly to the prebuilt fuzzer binaries (inside `make fuzz-debug`) or run its generated `build.sh`:
 
 ```bash
 # Replay input.min directly against a prebuilt fuzzer binary (inside make fuzz-debug):
 ./build/fuzz ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/input.min
 
-# Or compile testcase.c with AddressSanitizer and UndefinedBehaviorSanitizer:
-clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -Isrc \
-  -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 \
-  -fsanitize=address,undefined $(find src -name '*.c') \
-  ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c -o ./testcase
-
-# Or, for uninitialized-memory crashes (use-of-uninitialized-value), build with MemorySanitizer:
-clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -Isrc \
-  -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 \
-  -fsanitize=memory $(find src -name '*.c') \
-  ./tmp/fuzz/triage/use-of-uninitialized-value/<signature>/testcase.c -o ./testcase
-
-# Run the compiled reproducer:
-./testcase
+# Or compile and run the standalone testcase.c reproducer via its build.sh:
+./tmp/fuzz/triage/ABRT/14a9275da317ddd6/build.sh
+./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase
 ```
 
-> **Note:** If your host machine does not have `clang` with sanitizer support (for example on macOS when reproducing MSAN crashes), run `make fuzz-debug` to open an interactive shell inside the fuzzing container and run the commands above there.
+> **Note:** `build.sh` locates the Prism repository root automatically (or accepts `PRISM_ROOT=/path/to/prism` if moved outside the checkout) and forwards any extra arguments (`"$@"`) to `${CC:-clang}`. If your host machine does not have `clang` with the required sanitizer (for example on macOS when reproducing `use-of-uninitialized-value` MSAN or `memory-leak` LSAN crashes), run `make fuzz-debug` to open an interactive shell inside the fuzzing container and run `./tmp/fuzz/triage/.../build.sh` there.
 
 Running `./testcase` prints the assertion failure or sanitizer report:
 

@@ -286,6 +286,48 @@ File.write(File.join(workdir, "tc_empty.c"), tc_empty_c)
 File.write(File.join(workdir, "tc_min_oob.c"), tc_min_oob_c)
 File.write(File.join(workdir, "tc_stream_slow.c"), tc_stream_slow_c)
 File.write(File.join(workdir, "tc_node_loc.c"), tc_node_loc_c)
+
+inv_build = build_script(
+  min_oob_in,
+  crash_output: "INVARIANT[diagnostic]: list=error type=escape_invalid_meta kind=end_oob\n",
+  reason: "ABRT",
+  executable: "./build/fuzz"
+)
+raise "INVARIANT build.sh should omit unnecessary -D flags:\n#{inv_build}" if inv_build.include?("-DPM_") || inv_build.include?("-DPRISM_")
+raise "INVARIANT build.sh missing ASAN+UBSAN flags:\n#{inv_build}" unless inv_build.include?("-fsanitize=address,undefined -fno-sanitize-recover=all")
+
+msan_build = build_script(
+  stream_slow_in,
+  crash_output: "    #0 0x1234 in pm_prettyprint\n",
+  reason: "use-of-uninitialized-value",
+  executable: "./build/fuzz.msan"
+)
+raise "MSAN build.sh missing MSAN/arena flags:\n#{msan_build}" unless msan_build.include?("-DPM_ARENA_INITIAL_SIZE=0") && msan_build.include?("-fsanitize=memory -fsanitize-memory-track-origins -fno-sanitize-recover=all")
+
+ub_build = build_script(
+  nonempty_in,
+  crash_output: "src/line_offset_list.c:85: runtime error: signed integer overflow\n",
+  reason: "undefined-behavior",
+  executable: "./build/fuzz"
+)
+raise "UB build.sh unexpected flags:\n#{ub_build}" unless ub_build.include?("-fsanitize=undefined -fno-sanitize-recover=undefined") && !ub_build.include?("-DPM_") && !ub_build.include?("-DPRISM_")
+
+bignum_in = File.join(workdir, "repro_bignum.bin")
+File.binwrite(bignum_in, "\x00\x00\x03\x01".b + ("9" * 75).b)
+bignum_build = build_script(
+  bignum_in,
+  crash_output: "fuzz_free_sized\n",
+  reason: "ABRT",
+  executable: "./build/fuzz.native"
+)
+raise "bignum/native build.sh unexpected flags:\n#{bignum_build}" unless bignum_build.include?("-DPM_INTEGER_DIVIDE_THRESHOLD=8") && bignum_build.include?("-DPRISM_DEPTH_MAXIMUM=128") && bignum_build.include?("-DPRISM_BUILD_DEBUG") && !bignum_build.include?("-DPM_ARENA_INITIAL_SIZE=0")
+
+repro_dir = File.join(workdir, "standalone_repro")
+FileUtils.mkdir_p(repro_dir)
+File.write(File.join(repro_dir, "testcase.c"), tc_min_oob_c)
+build_sh_path = File.join(repro_dir, "build.sh")
+File.write(build_sh_path, inv_build)
+File.chmod(0o755, build_sh_path)
 EOF
 
 grep -q "static const size_t input_size = 6;" "$WORKDIR/tc_nonempty.c" || fail "missing input_size = 6 in tc_nonempty.c"
@@ -308,12 +350,12 @@ done
 
 "$WORKDIR/tc_nonempty"
 "$WORKDIR/tc_empty"
+"$WORKDIR/tc_min_oob"
 "$WORKDIR/tc_stream_slow"
 "$WORKDIR/tc_node_loc"
-if sh -c '"$1"' _ "$WORKDIR/tc_min_oob" >/dev/null 2>&1; then
-    fail "tc_min_oob did not reproduce the escape_invalid_meta diagnostic OOB assertion"
-fi
-echo "  minimal <prism.h> testcase.c compiled with -Iinclude only under -std=c99 -Werror and reproduced diagnostic OOB"
+PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
+"$WORKDIR/standalone_repro/testcase"
+echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
 echo "[4/4] Checking concurrent triage.rb deduplication, header minimization, coalescing, and sentinels..."
 mkdir -p "$WORKDIR/afl/w1/crashes" "$WORKDIR/afl/w2/crashes" "$WORKDIR/afl/w1/hangs"
@@ -368,7 +410,9 @@ abrt_dirs.each do |abrt_dir|
   mode = File.stat(abrt_dir).mode & 0o777
   raise "expected world-readable/traversable dir mode, got #{format('%#o', mode)}" unless (mode & 0o755) == 0o755
   tc_path = File.join(abrt_dir, "testcase.c")
+  build_path = File.join(abrt_dir, "build.sh")
   raise "missing testcase.c in #{abrt_dir}" unless File.file?(tc_path)
+  raise "missing executable build.sh in #{abrt_dir}" unless File.executable?(build_path)
   tc = File.read(tc_path)
 
   min_data = File.binread(File.join(abrt_dir, "input.min"))
@@ -396,6 +440,7 @@ raise "expected all 3 distinct ABRT tokens, got #{tokens_found.inspect}" unless 
 unrepro_dirs = Dir.glob(File.join(triage_dir, "unreproducible", "*"))
 raise "expected 1 unreproducible dir, got #{unrepro_dirs.inspect}" unless unrepro_dirs.size == 1
 raise "missing testcase.c in unreproducible dir" unless File.file?(File.join(unrepro_dirs.first, "testcase.c"))
+raise "missing executable build.sh in unreproducible dir" unless File.executable?(File.join(unrepro_dirs.first, "build.sh"))
 
 raise "transient hang should not create hang dir" if File.exist?(File.join(triage_dir, "hang"))
 min_runs = log.scan(/^minimizing /).size
