@@ -1,7 +1,21 @@
-#!/bin/bash
+#!/bin/sh
 
-# FUZZ_SIG and FUZZ_EXE are passed as environment variables
-[ "$($FUZZ_EXE /dev/stdin 2>&1 | ./test/fuzz/triage/signature.sh )" = "$FUZZ_SIG" ] && {
-    exit 0
+# FUZZ_SIG, FUZZ_EXE, FUZZ_HEADER_FILE, and FUZZ_WORKDIR are passed via environment variables.
+tmpfile="${FUZZ_WORKDIR:-${TMPDIR:-/tmp}}/he_cand.$$"
+cleanup() {
+  rm -f "$tmpfile"
 }
-exit 1
+trap cleanup EXIT
+trap 'cleanup; exit 143' TERM INT
+
+cat "$FUZZ_HEADER_FILE" - > "$tmpfile" || exit 1
+
+out=$("$FUZZ_EXE" "$tmpfile" 2>&1)
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+  exit 1
+fi
+
+sig=$(printf '%s\n' "$out" | ./test/fuzz/triage/signature.sh)
+[ "$sig" = "$FUZZ_SIG" ]
