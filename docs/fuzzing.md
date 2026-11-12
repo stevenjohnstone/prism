@@ -298,7 +298,7 @@ Prism normally uses its own `pm_strncasecmp` implementation (`src/strncasecmp.c`
 
 Many parser and lexer bugs in Prism depend on combinations of state stacks and bitflags (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack`, `accepts_block_stack`, and `current_scope->parameters`) that pass through shared helper functions and therefore produce no new CFG edges on their own.
 
-`build/fuzz.ijon` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s IJON bitmap region (while `FUZZ_IJON_MAX` tracks maximum lexer-mode and parser-context stack depths) for:
+`build/fuzz.ijon` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this forces `stream_mode = false` (since `pm_parse_stream` constructs and runs its internal `pm_parser_t` without exposing a pre-parse hook, and non-IJON workers already cover `pm_parse_stream`) and registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` on every execution (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s IJON bitmap region (while `FUZZ_IJON_MAX` tracks maximum lexer-mode and parser-context stack depths) for:
 
 1. Lexer mode stack transitions (top 4 modes in `parser->lex_modes`, including balanced delimiter nesting and heredoc quote/indent flags).
 2. Parser context stack transitions (current and parent `pm_context_t` plus the enclosing `current_context->mask`).
