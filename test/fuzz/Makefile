@@ -172,9 +172,14 @@ fuzz-plot: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "generating AFL++ plots"
 	$(Q) ruby ./test/fuzz/report/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html $(FUZZ_COVERAGE_DIR)/coverage.json
 
+fuzz-bench: fuzz-docker-build fuzz-gen-templates
+	$(ECHO) "benchmarking grammar seed generator"
+	$(Q) $(MAKEDIRS) $(FUZZ_DIR)
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/runtime/grammar_bench.rb --json tmp/fuzz/grammar-bench.json $(GRAMMAR_BENCH_ARGS)
+
 fuzz-test: fuzz-docker-build fuzz-gen-templates
-	$(ECHO) "testing AFL++ instrumentation patch and crash triage"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh && ./test/fuzz/triage/test_triage.sh"
+	$(ECHO) "testing AFL++ instrumentation patch, crash triage, and grammar generator"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh && ./test/fuzz/triage/test_triage.sh && ./test/fuzz/runtime/test_grammar.sh"
 
 define FUZZ_CLEAN_CONFIRM
 @if [ -t 1 ]; then \
@@ -212,5 +217,5 @@ fuzz-clean:
 	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
 
