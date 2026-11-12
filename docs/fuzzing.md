@@ -247,7 +247,7 @@ Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json`
 /tmp/afl-tmpdir/grammar/seeds     tmp/fuzz/afl-ijon             tmp/fuzz/afl
 ┌───────────────────────────┐    ┌──────────────────┐         ┌──────────────────┐
 │ grammar (lrama-fuzz)      ├───►│ -M ijon          ├────────►│ -M main          │
-│ ~500 Ruby seeds/s + USR2  │ -F │ (fuzz.ijon)      │   -F    │ (ASAN+UBSAN +    │
+│ ~500 Ruby seeds/s + USR2  │ -F │ (fuzz.ijon)      │  peer   │ (ASAN+UBSAN +    │
 └───────────────────────────┘    └──────────────────┘         │  fuzz.cmplog)    │
                                                               └────────▲─────────┘
                                                                        │ peer sync
@@ -264,11 +264,11 @@ Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json`
  AFL++ restricts `-F` (foreign testcase import) to `-M` master instances, and inside `sync_fuzzers()` a `-M` node scans every peer queue in its `-o` sync directory *before* calling `read_foreign_testcases()`. Keeping two separate single-master sync roots avoids multi-master contention:
 
 - In `tmp/fuzz/afl-ijon`, `-M ijon` has **no** peer queues to scan, so every foreign sync goes straight to `/tmp/afl-tmpdir/grammar/seeds` at native speed (~45k execs/s) and filters generated Ruby snippets by both CFG edges and IJON parser/lexer state transitions.
-- In `tmp/fuzz/afl`, `-M main` is the sole master: it imports `ijon`'s curated queue via `-F tmp/fuzz/afl-ijon/.foreign/ijon` and exchanges queue discoveries bidirectionally with `-S msan` and `-S main-2..N`. Secondary workers only sync from `main` rather than scanning two masters. (When `FUZZ_WORKERS < 4`, `ijon` is omitted and `main` ingests `/tmp/afl-tmpdir/grammar/seeds` directly via `-F`.)
+- In `tmp/fuzz/afl`, `-M main` is the sole master: it imports `ijon`'s curated queue sequentially via a one-way shadow peer directory (`tmp/fuzz/afl/ijon_peer/queue -> ../../afl-ijon/ijon/queue`, with no `is_main_node` marker so `-S` secondaries skip it while `main` tracks exact `id:NNNNNN` cursors in `.synced/ijon_peer` without 1-second `-F` `mtime` loss) and exchanges queue discoveries bidirectionally with `-S msan` and `-S main-2..N`. (When `FUZZ_WORKERS < 4`, `ijon` is omitted and `main` ingests `/tmp/afl-tmpdir/grammar/seeds` directly via `-F`.)
 
 The workers are:
 
-1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN master (`-M main -o tmp/fuzz/afl`) with CmpLog enabled, seeded with the full minimized fixture corpus and pulling filtered discoveries from `ijon` via `-F`.
+1. **`main`** (`build/fuzz` + `build/fuzz.cmplog`): Primary ASAN+UBSAN master (`-M main -o tmp/fuzz/afl`) with CmpLog enabled, seeded with the full minimized fixture corpus and pulling filtered discoveries from `ijon` via `ijon_peer`.
 2. **`grammar`** (`test/fuzz/runtime/grammar.rb`): Structure-aware Ruby seed generator powered by [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz), writing candidate seeds to `/tmp/afl-tmpdir/grammar/seeds` and nudging `ijon` via `SIGUSR2`.
 3. **`msan`** (`build/fuzz.msan`): Secondary worker (`-S msan`) running the full `-DSLOW` pipeline under MemorySanitizer to catch uninitialized memory reads and out-of-bounds reads across parsing, serialization, pretty-printing, and JSON dumping.
 4. **`ijon`** (`build/fuzz.ijon`): Isolated native master (`-M ijon -o tmp/fuzz/afl-ijon -F /tmp/afl-tmpdir/grammar/seeds`) with custom leak detection and IJON state-guided instrumentation enabled, acting as a high-throughput state-space filter for grammar seeds and exploring mutations with `-p explore` before `main` imports its winners.
@@ -314,7 +314,7 @@ Many parser and lexer bugs in Prism depend on combinations of state stacks and b
 4. Scope parameter, `closed`, and `shareable_constant` flags across the current and parent `pm_scope_t`.
 5. Syntax error recovery transitions (`error_list.size`, `recovering`) and non-trivial `PM_TOKEN_EOF` states.
 
-When `ijon` reaches a novel state combination and saves the input to `tmp/fuzz/afl-ijon/ijon/queue/`, `main` imports interesting entries via `-F tmp/fuzz/afl-ijon/.foreign/ijon` under ASAN+UBSAN and redistributes them to `msan` and `main-2..N` via peer sync.
+When `ijon` reaches a novel state combination and saves the input to `tmp/fuzz/afl-ijon/ijon/queue/`, `main` imports interesting entries via `tmp/fuzz/afl/ijon_peer` under ASAN+UBSAN and redistributes them to `msan` and `main-2..N` via peer sync.
 
 ### Compile-Time Prism Tunings for Fuzzing
 

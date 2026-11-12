@@ -71,7 +71,7 @@ end
 
 def normalize_sync_source(src)
   return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
-  return "ijon" if src =~ /\Aijon(?:_\d+)?\z/
+  return "ijon" if src =~ /\Aijon(?:_\d+|_peer)?\z/
 
   src
 end
@@ -972,11 +972,15 @@ def analyze_fleet_lineage(afl_dir)
   roots = worker_root_dirs(afl_dir)
 
   q_index = {}
-  roots.flat_map { |r| Dir.glob(File.join(r, "*/queue/id:*")) }.each do |p|
-    next unless File.file?(p)
-    w = File.basename(File.dirname(File.dirname(p)))
-    id = File.basename(p)[/\Aid:(\d+)/, 1]
-    q_index[[w, id.to_i]] = p if id
+  roots.flat_map { |r| Dir.glob(File.join(r, "*/queue")) }.each do |qdir|
+    next if File.symlink?(qdir)
+
+    w = File.basename(File.dirname(qdir))
+    Dir.glob(File.join(qdir, "id:*")).each do |p|
+      next unless File.file?(p)
+      id = File.basename(p)[/\Aid:(\d+)/, 1]
+      q_index[[w, id.to_i]] = p if id
+    end
   end
 
   rank_parent_chain = lambda do |ch|
