@@ -5,19 +5,12 @@ We use coverage-guided fuzzing with [AFL++](https://aflplus.plus) to test `pm_pa
 ```
 test/fuzz
 ├── Makefile                      make targets for building, running, triaging, and coverage
-├── debug
-│   ├── backtrace.sh              generates gdb backtraces for a crash directory
-│   ├── build.asan.sh             builds a test case with ASAN/UBSAN enabled
-│   ├── build.memory.sh           builds a test case with MSAN enabled
-│   ├── build.sh                  builds a test case without sanitizers
-│   └── minimize.sh               minimizes crash/hang inputs in a directory via afl-tmin
 ├── dict                          an AFL++ dictionary containing Ruby tokens
 ├── docker
 │   └── Dockerfile                for building a container with the fuzzer toolchain
 ├── harness
 │   ├── coverage.c                driver for coverage collection
 │   ├── fuzz.c                    generic entrypoint for fuzzing
-│   ├── heisenbug.c               standalone harness template for non-deterministic crashes
 │   ├── include
 │   │   └── prism_xallocator.h    custom allocator header for fast leak detection
 │   └── parse.c                   fuzz harness for parsing, serialization, and formatting
@@ -38,6 +31,7 @@ test/fuzz
     ├── halfempty.sh              minimizes crash inputs with Google Project Zero's halfempty
     ├── halfempty_compare.sh      identifies similar backtraces during minimization
     ├── signature.sh              hashes stack traces into a crash signature
+    ├── test_triage.sh            verifies signature normalization, minimization, and crash triage
     └── triage.rb                 deduplicates, minimizes, and packages crashes into C reproducers
 ```
 
@@ -80,17 +74,23 @@ tmp/fuzz/triage
 
 Each `testcase.c` embeds the decoded `pm_options_t` settings, the Ruby source as a C byte array (with a readable string dump in a comment at the top), and the sanitizer output captured during triage.
 
-To compile and run a `testcase.c` reproducer:
+To reproduce a triaged finding, you can either pass `input.min` directly to the prebuilt fuzzer binaries (inside `make fuzz-debug`) or compile the standalone `testcase.c` reproducer:
 
 ```bash
-# Build with AddressSanitizer and UndefinedBehaviorSanitizer:
-./test/fuzz/debug/build.asan.sh ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c
+# Replay input.min directly against a prebuilt fuzzer binary (inside make fuzz-debug):
+./build/fuzz ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/input.min
+
+# Or compile testcase.c with AddressSanitizer and UndefinedBehaviorSanitizer:
+clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -DSLOW \
+  -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 \
+  -fsanitize=address,undefined $(find src -name '*.c') \
+  ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c -o ./testcase
 
 # Or, for uninitialized-memory crashes (use-of-uninitialized-value), build with MemorySanitizer:
-./test/fuzz/debug/build.memory.sh ./tmp/fuzz/triage/use-of-uninitialized-value/<signature>/testcase.c
-
-# Or build without sanitizers for plain gdb/lldb debugging:
-./test/fuzz/debug/build.sh ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c
+clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -DSLOW \
+  -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 \
+  -fsanitize=memory $(find src -name '*.c') \
+  ./tmp/fuzz/triage/use-of-uninitialized-value/<signature>/testcase.c -o ./testcase
 
 # Run the compiled reproducer:
 ./testcase
@@ -197,6 +197,14 @@ make fuzz-clean
 
 Run `make fuzz-triage` before `make fuzz-clean` if your campaign has untriaged crashes or hangs.
 
+### Testing the Fuzzing Infrastructure
+
+To run the automated regression suites for both the custom AFL++ instrumentation patch (`test/fuzz/patches/test_afl_patch.sh`) and the crash triage/minimization pipeline (`test/fuzz/triage/test_triage.sh`):
+
+```bash
+make fuzz-test
+```
+
 ---
 
 ## Technical Details
@@ -229,7 +237,7 @@ After `pm_parse()` returns, `harness_parse()` checks two invariants on every run
 Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json` on every fuzzing iteration would slow down parser exploration and pollute the coverage bitmap with output-formatter edges. We split the build into two modes:
 
 - **Fast parse-only binaries** (`build/fuzz`, `build/fuzz.native`, `build/fuzz.ijon`, `build/fuzz.sand`, `build/fuzz.cmplog`): Compiled with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`. They only run `pm_parse` and the AST/line-offset invariant checks.
-- **Slow full-pipeline binaries** (`build/fuzz.msan`, `build/fuzz.lsan`, `build/fuzz.coverage`, and the `test/fuzz/debug/build*.sh` scripts): Compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (plain and color), `pm_prettyprint`, and `pm_dump_json` on every input. Because these serializers and printers read every AST node, token, error, and line offset, running them under MemorySanitizer (`fuzz.msan`) catches uninitialized fields anywhere in the parse tree.
+- **Slow full-pipeline binaries** (`build/fuzz.msan`, `build/fuzz.lsan`, and `build/fuzz.coverage`): Compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (plain and color), `pm_prettyprint`, and `pm_dump_json` on every input. Because these serializers and printers read every AST node, token, error, and line offset, running them under MemorySanitizer (`fuzz.msan`) catches uninitialized fields anywhere in the parse tree.
 
 ### Worker Fleet Architecture and Sync Topology
 
@@ -270,7 +278,7 @@ The workers are:
 
 Enabling LeakSanitizer (LSAN) or ASAN per-allocation redzones on every fuzzing execution significantly reduces throughput on inputs that allocate deep ASTs.
 
-For `build/fuzz.native` and `build/fuzz.ijon`, we compile without sanitizers and enable Prism's custom allocator hook (`-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`). `test/fuzz/harness/include/prism_xallocator.h` routes `xmalloc`, `xcalloc`, `xrealloc`, and `xfree` to wrappers in `test/fuzz/harness/fuzz.c` that prepend an 8-byte size header to each allocation and maintain a running `allocated` byte counter. At the end of `LLVMFuzzerTestOneInput`, `assert(allocated == 0)` immediately aborts if any memory was leaked during the parse, with near-zero runtime overhead. Wrappers also enforce a per-input cumulative allocation cap (`FUZZ_MAX_ALLOCATED_BYTES`, 128 MiB) to catch exponential memory-blowup bugs early.
+For `build/fuzz.native` and `build/fuzz.ijon`, we compile without sanitizers and enable Prism's custom allocator hook (`-DPRISM_XALLOCATOR -Itest/fuzz/harness/include`). `test/fuzz/harness/include/prism_xallocator.h` routes `xmalloc`, `xcalloc`, `xrealloc`, `xrealloc_sized`, `xfree`, and `xfree_sized` to wrappers in `test/fuzz/harness/fuzz.c` that prepend a 16-byte naturally aligned size header to each allocation, assert that sized frees and reallocations pass the exact recorded size, and maintain a running `allocated` byte counter. At the end of `LLVMFuzzerTestOneInput`, `assert(allocated == 0)` immediately aborts if any memory was leaked during the parse, with near-zero runtime overhead. Wrappers also enforce a per-input cumulative allocation cap (`FUZZ_MAX_ALLOCATED_BYTES`, 128 MiB) to catch exponential memory-blowup bugs early.
 
 When `make fuzz-triage` processes a leak crash from `fuzz.ijon` or `fuzz.native`, it re-runs the input against `build/fuzz.lsan` so the generated `testcase.c` includes a full LeakSanitizer allocation backtrace.
 
@@ -298,7 +306,7 @@ Prism normally uses its own `pm_strncasecmp` implementation (`src/strncasecmp.c`
 
 Many parser and lexer bugs in Prism depend on combinations of state stacks and bitflags (`parser->lex_modes`, `parser->current_context`, `parser->lex_state`, `parser->error_list`, `do_loop_stack`, `accepts_block_stack`, and `current_scope->parameters`) that pass through shared helper functions and therefore produce no new CFG edges on their own.
 
-`build/fuzz.ijon` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s 64 KB IJON bitmap region for:
+`build/fuzz.ijon` is compiled with `AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON`. In `test/fuzz/harness/parse.c`, this registers `fuzz_ijon_lex_callback` via `pm_parser_lex_callback_set` (requiring no changes to `src/`). On each token boundary where a tracked state changes, `FUZZ_IJON_SET` hashes the transition into AFL++'s IJON bitmap region (while `FUZZ_IJON_MAX` tracks maximum lexer-mode and parser-context stack depths) for:
 
 1. Lexer mode stack transitions (top 4 modes in `parser->lex_modes`, including balanced delimiter nesting and heredoc quote/indent flags).
 2. Parser context stack transitions (current and parent `pm_context_t` plus the enclosing `current_context->mask`).
