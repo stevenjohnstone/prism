@@ -72,7 +72,7 @@ tmp/fuzz/triage
         └── testcase.c            <-- self-contained C program that reproduces the crash
 ```
 
-Each `testcase.c` embeds the decoded `pm_options_t` settings, the Ruby source as a C byte array (with a readable string dump in a comment at the top), and the sanitizer output captured during triage.
+Each `testcase.c` is synthesized as a minimal, self-contained `<prism.h>` program: `triage.rb` minimizes both the Ruby source and the 4-byte options header, emits only the non-default `pm_options_*` calls and the specific invariant or downstream consumer (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, or `pm_dump_json`) needed to trigger the crash, and includes a readable string dump, [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) link, and captured sanitizer report in comments.
 
 To reproduce a triaged finding, you can either pass `input.min` directly to the prebuilt fuzzer binaries (inside `make fuzz-debug`) or compile the standalone `testcase.c` reproducer:
 
@@ -81,13 +81,13 @@ To reproduce a triaged finding, you can either pass `input.min` directly to the 
 ./build/fuzz ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/input.min
 
 # Or compile testcase.c with AddressSanitizer and UndefinedBehaviorSanitizer:
-clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -DSLOW \
+clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -Isrc \
   -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 \
   -fsanitize=address,undefined $(find src -name '*.c') \
   ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/testcase.c -o ./testcase
 
 # Or, for uninitialized-memory crashes (use-of-uninitialized-value), build with MemorySanitizer:
-clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -DSLOW \
+clang -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 -Iinclude -Isrc \
   -DPM_ARENA_INITIAL_SIZE=0 -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 \
   -fsanitize=memory $(find src -name '*.c') \
   ./tmp/fuzz/triage/use-of-uninitialized-value/<signature>/testcase.c -o ./testcase
@@ -118,8 +118,6 @@ gdb ./testcase
 ```
 
 Tip: set a breakpoint on `__sanitizer::Die` if you want the debugger to stop before the ASAN/UBSAN handler exits.
-
-> **Note on crash categories:** When compiled as a standalone `testcase.c`, `input` is a `static const uint8_t[]` array in `.rodata` rather than a heap buffer. An out-of-bounds read that originally triggered `heap-buffer-overflow` inside the fuzzer may therefore report as `global-buffer-overflow` in `./testcase`; the underlying bug is the same.
 
 ---
 
