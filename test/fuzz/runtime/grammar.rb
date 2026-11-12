@@ -11,26 +11,6 @@ require "digest"
 require "fileutils"
 require "securerandom"
 
-afl_dir = ARGV[0] || "./tmp/fuzz/afl"
-queue_dir = ARGV[1] || "/tmp/afl-tmpdir/grammar/seeds"
-work_dir = File.dirname(queue_dir)
-staging_dir = File.join(work_dir, "staging")
-in_flight_path = File.join(work_dir, "in_flight")
-
-stats_dir = File.join(afl_dir, "grammar")
-crashes_dir = File.join(stats_dir, "crashes")
-cmdline_path = File.join(stats_dir, "cmdline")
-stats_path = File.join(stats_dir, "fuzzer_stats")
-stats_tmp_path = File.join(stats_dir, ".fuzzer_stats.tmp")
-plot_path = File.join(stats_dir, "plot_data")
-
-FileUtils.mkdir_p(queue_dir)
-FileUtils.mkdir_p(staging_dir)
-FileUtils.mkdir_p(crashes_dir)
-
-# Allow `make fuzz-triage` to triage any crashes caught directly inside grammar.rb
-File.write(cmdline_path, "./build/fuzz.native\n")
-
 # 4-byte options header consumed by harness() in test/fuzz/harness/parse.c
 DEFAULT_HEADER = "\x00\x00\x03\x01".b
 ATTACH_COMMENTS_HEADER = "\x04\x00\x03\x01".b
@@ -249,7 +229,7 @@ rescue StandardError
   {}
 end
 
-def write_atomic_seed(queue_dir, staging_dir, header, payload, seen_digests)
+def write_atomic_seed(queue_dir, staging_dir, header, payload, seen_digests, max_seen_digests: MAX_SEEN_DIGESTS)
   payload_bytes = payload.b
   sha1 = Digest::SHA1.new
   sha1.update(header)
@@ -259,7 +239,7 @@ def write_atomic_seed(queue_dir, staging_dir, header, payload, seen_digests)
   return false if seen_digests&.key?(raw_digest)
 
   if seen_digests
-    seen_digests.clear if seen_digests.size >= MAX_SEEN_DIGESTS
+    seen_digests.clear if seen_digests.size >= max_seen_digests
     seen_digests[raw_digest] = true
   end
 
@@ -289,11 +269,15 @@ end
 # immediately upon read) unless pending files exceed MAX_PENDING_SEEDS.
 @max_synced_mtime = nil
 
+def reset_max_synced_mtime!
+  @max_synced_mtime = nil
+end
+
 def seed_was_read?(st)
   st.atime.to_i > 1 && st.atime != st.mtime
 end
 
-def prune_synced_seeds(queue_dir)
+def prune_synced_seeds(queue_dir, max_pending: MAX_PENDING_SEEDS)
   now = Time.now
   entries = []
 
@@ -327,8 +311,8 @@ def prune_synced_seeds(queue_dir)
   end
 
   remaining = entries.size - pruned
-  if remaining > MAX_PENDING_SEEDS && stranded_unread.any?
-    excess = remaining - MAX_PENDING_SEEDS
+  if remaining > max_pending && stranded_unread.any?
+    excess = remaining - max_pending
     stranded_unread.sort_by! { |_, mtime| mtime }
     stranded_unread.shift(excess).each do |path, _|
       begin
@@ -838,6 +822,40 @@ def inject_heredocs(code, rng, parse_fn)
   pass1
 end
 
+def default_seed_header(rng)
+  rng.rand < 0.5 ? ATTACH_COMMENTS_HEADER : DEFAULT_HEADER
+end
+
+# Expand a single evolved [code, is_valid] candidate into the exact
+# [header, payload, valid, variant_kind] tuples emitted to the seed queue.
+def expand_candidate_variants(code, is_valid, rng, validator, parse_fn)
+  variants = [[default_seed_header(rng), code, is_valid, :raw]]
+
+  # Rewrite double-quoted strings into heredocs (including multi-heredoc lines
+  # and nested heredocs in interpolation) on ~35% of string-bearing candidates.
+  if code.include?('"') && rng.rand < 0.35
+    heredoc_code = inject_heredocs(code, rng, parse_fn)
+    if heredoc_code
+      variants << [default_seed_header(rng), heredoc_code, validator.call(heredoc_code), :heredoc]
+    end
+  end
+
+  # Emit magic `# encoding:` + multibyte/modifier regexp variants on ~18% of candidates.
+  if rng.rand < 0.18
+    enc_code = inject_encoding_variant(code, rng)
+    variants << [ATTACH_COMMENTS_HEADER, enc_code, validator.call(enc_code), :encoding]
+  end
+
+  # Emit magic/shebang/embdoc/inline comment variants with attach_comments enabled on ~25% of candidates.
+  if rng.rand < 0.25
+    comment_code, is_main_script = inject_comments_variant(code, rng)
+    hdr = is_main_script ? MAIN_SCRIPT_COMMENTS_HEADER : ATTACH_COMMENTS_HEADER
+    variants << [hdr, comment_code, validator.call(comment_code), :comments]
+  end
+
+  variants
+end
+
 def build_evolvers(grammar, rng, fitness, validator)
   classifier = Lrama::Fuzz::Ruby.method(:classifier)
   # Also avoid dsym (tSYMBEG string_contents tSTRING_END emits `:..."` without an
@@ -1062,7 +1080,7 @@ def run_worker(grammar:, supervisor_pid:, start_time:, prior_elapsed:, saved_cra
       sleep(0.5)
     end
 
-    seed_header = header || (master_rng.rand < 0.5 ? ATTACH_COMMENTS_HEADER : DEFAULT_HEADER)
+    seed_header = header || default_seed_header(master_rng)
     attempts_done += 1
     if write_atomic_seed(queue_dir, staging_dir, seed_header, code, seen_digests)
       files_created += 1
@@ -1096,28 +1114,8 @@ def run_worker(grammar:, supervisor_pid:, start_time:, prior_elapsed:, saved_cra
 
   record_batch = lambda do |batch|
     batch.each do |code, fitness_score|
-      emit_candidate.call(code, fitness_score >= 1.0)
-
-      # Rewrite double-quoted strings into heredocs (including multi-heredoc lines
-      # and nested heredocs in interpolation) on ~35% of string-bearing candidates.
-      if code.include?('"') && master_rng.rand < 0.35
-        heredoc_code = inject_heredocs(code, master_rng, parse_fn)
-        if heredoc_code
-          emit_candidate.call(heredoc_code, validator.call(heredoc_code))
-        end
-      end
-
-      # Emit magic `# encoding:` + multibyte/modifier regexp variants on ~18% of candidates.
-      if master_rng.rand < 0.18
-        enc_code = inject_encoding_variant(code, master_rng)
-        emit_candidate.call(enc_code, validator.call(enc_code), header: ATTACH_COMMENTS_HEADER)
-      end
-
-      # Emit magic/shebang/embdoc/inline comment variants with attach_comments enabled on ~25% of candidates.
-      if master_rng.rand < 0.25
-        comment_code, is_main_script = inject_comments_variant(code, master_rng)
-        hdr = is_main_script ? MAIN_SCRIPT_COMMENTS_HEADER : ATTACH_COMMENTS_HEADER
-        emit_candidate.call(comment_code, validator.call(comment_code), header: hdr)
+      expand_candidate_variants(code, fitness_score >= 1.0, master_rng, validator, parse_fn).each do |hdr, payload, valid, _kind|
+        emit_candidate.call(payload, valid, header: hdr)
       end
     end
   end
@@ -1133,91 +1131,115 @@ ensure
   in_flight_io&.close rescue nil
 end
 
-# Parse CRuby's parse.y once in the supervisor before forking so respawned
-# workers inherit the prepared grammar via copy-on-write without re-parsing.
-ruby_src_dir = ENV.fetch("RUBY_SRC_DIR", "/opt/ruby")
-grammar = Lrama::Fuzz.parse_ruby(
-  parse_y_path: File.join(ruby_src_dir, "parse.y"),
-  id_def_path: File.join(ruby_src_dir, "defs", "id.def")
-)
+def run_grammar_supervisor(argv = ARGV)
+  afl_dir = argv[0] || "./tmp/fuzz/afl"
+  queue_dir = argv[1] || "/tmp/afl-tmpdir/grammar/seeds"
+  work_dir = File.dirname(queue_dir)
+  staging_dir = File.join(work_dir, "staging")
+  in_flight_path = File.join(work_dir, "in_flight")
 
-initial_prev_stats = parse_kv_file(stats_path)
-prior_elapsed = if File.exist?(stats_path) && File.exist?(plot_path)
-                  [initial_prev_stats["run_time"].to_i, last_plot_relative_time(plot_path)].max
-                else
-                  File.write(plot_path, "# relative_time, files_created, files_per_sec, avg_files_per_sec, attempts_done, files_valid, files_invalid\n")
-                  0
-                end
-File.unlink(in_flight_path) if File.exist?(in_flight_path)
+  stats_dir = File.join(afl_dir, "grammar")
+  crashes_dir = File.join(stats_dir, "crashes")
+  cmdline_path = File.join(stats_dir, "cmdline")
+  stats_path = File.join(stats_dir, "fuzzer_stats")
+  stats_tmp_path = File.join(stats_dir, ".fuzzer_stats.tmp")
+  plot_path = File.join(stats_dir, "plot_data")
 
-supervisor_pid = Process.pid
-start_time = Time.now.to_f
-saved_crashes = Dir.glob(File.join(crashes_dir, "id:*")).size
-stopping = false
-child_pid = nil
+  FileUtils.mkdir_p(queue_dir)
+  FileUtils.mkdir_p(staging_dir)
+  FileUtils.mkdir_p(crashes_dir)
 
-stop_supervisor = lambda do |sig|
-  stopping = true
-  if child_pid
-    begin
-      Process.kill(sig, child_pid)
-    rescue Errno::ESRCH
-      # already exited
-    end
-  end
-end
+  # Allow `make fuzz-triage` to triage any crashes caught directly inside grammar.rb
+  File.write(cmdline_path, "./build/fuzz.native\n")
 
-Signal.trap("INT") { stop_supervisor.call("INT") }
-Signal.trap("TERM") { stop_supervisor.call("TERM") }
+  # Parse CRuby's parse.y once in the supervisor before forking so respawned
+  # workers inherit the prepared grammar via copy-on-write without re-parsing.
+  ruby_src_dir = ENV.fetch("RUBY_SRC_DIR", "/opt/ruby")
+  grammar = Lrama::Fuzz.parse_ruby(
+    parse_y_path: File.join(ruby_src_dir, "parse.y"),
+    id_def_path: File.join(ruby_src_dir, "defs", "id.def")
+  )
 
-until stopping
-  child_pid = Process.fork do
-    run_worker(
-      grammar: grammar,
-      supervisor_pid: supervisor_pid,
-      start_time: start_time,
-      prior_elapsed: prior_elapsed,
-      saved_crashes: saved_crashes,
-      afl_dir: afl_dir,
-      queue_dir: queue_dir,
-      staging_dir: staging_dir,
-      in_flight_path: in_flight_path,
-      stats_path: stats_path,
-      stats_tmp_path: stats_tmp_path,
-      plot_path: plot_path
-    )
-  end
+  initial_prev_stats = parse_kv_file(stats_path)
+  prior_elapsed = if File.exist?(stats_path) && File.exist?(plot_path)
+                    [initial_prev_stats["run_time"].to_i, last_plot_relative_time(plot_path)].max
+                  else
+                    File.write(plot_path, "# relative_time, files_created, files_per_sec, avg_files_per_sec, attempts_done, files_valid, files_invalid\n")
+                    0
+                  end
+  File.unlink(in_flight_path) if File.exist?(in_flight_path)
 
-  _, status = Process.wait2(child_pid)
+  supervisor_pid = Process.pid
+  start_time = Time.now.to_f
+  saved_crashes = Dir.glob(File.join(crashes_dir, "id:*")).size
+  stopping = false
   child_pid = nil
-  break if stopping
 
-  if status.signaled? && ![Signal.list["INT"], Signal.list["TERM"]].include?(status.termsig)
-    sig = status.termsig
-    if File.exist?(in_flight_path) && File.size(in_flight_path) > 0
-      raw = File.binread(in_flight_path)
-      File.unlink(in_flight_path) rescue nil
-
-      rel_ms = ((Time.now.to_f - start_time) * 1000).round
-      crash_name = format("id:%06d,sig:%02d,src:lrama-fuzz,time:%d", saved_crashes, sig, rel_ms)
-      crash_file = File.join(crashes_dir, crash_name)
-      File.binwrite(crash_file, raw)
-      saved_crashes += 1
-
-      # Also drop into queue_dir so main tests it under ASAN/UBSAN as well
-      if raw.bytesize >= 4
-        write_atomic_seed(queue_dir, staging_dir, raw.byteslice(0, 4), raw.byteslice(4..), nil) rescue nil
+  stop_supervisor = lambda do |sig|
+    stopping = true
+    if child_pid
+      begin
+        Process.kill(sig, child_pid)
+      rescue Errno::ESRCH
+        # already exited
       end
-
-      warn "\n[lrama-fuzz] Caught worker signal #{sig}! Saved crashing input to #{crash_file} and restarting worker..."
-    else
-      warn "\n[lrama-fuzz] Worker exited on signal #{sig} (no in-flight input); restarting in 1s..."
-      sleep(1.0)
     end
-  elsif !status.success?
-    warn "\n[lrama-fuzz] Worker exited with status #{status.exitstatus}; restarting in 1s..."
-    sleep(1.0)
-  else
-    break
+  end
+
+  Signal.trap("INT") { stop_supervisor.call("INT") }
+  Signal.trap("TERM") { stop_supervisor.call("TERM") }
+
+  until stopping
+    child_pid = Process.fork do
+      run_worker(
+        grammar: grammar,
+        supervisor_pid: supervisor_pid,
+        start_time: start_time,
+        prior_elapsed: prior_elapsed,
+        saved_crashes: saved_crashes,
+        afl_dir: afl_dir,
+        queue_dir: queue_dir,
+        staging_dir: staging_dir,
+        in_flight_path: in_flight_path,
+        stats_path: stats_path,
+        stats_tmp_path: stats_tmp_path,
+        plot_path: plot_path
+      )
+    end
+
+    _, status = Process.wait2(child_pid)
+    child_pid = nil
+    break if stopping
+
+    if status.signaled? && ![Signal.list["INT"], Signal.list["TERM"]].include?(status.termsig)
+      sig = status.termsig
+      if File.exist?(in_flight_path) && File.size(in_flight_path) > 0
+        raw = File.binread(in_flight_path)
+        File.unlink(in_flight_path) rescue nil
+
+        rel_ms = ((Time.now.to_f - start_time) * 1000).round
+        crash_name = format("id:%06d,sig:%02d,src:lrama-fuzz,time:%d", saved_crashes, sig, rel_ms)
+        crash_file = File.join(crashes_dir, crash_name)
+        File.binwrite(crash_file, raw)
+        saved_crashes += 1
+
+        # Also drop into queue_dir so main tests it under ASAN/UBSAN as well
+        if raw.bytesize >= 4
+          write_atomic_seed(queue_dir, staging_dir, raw.byteslice(0, 4), raw.byteslice(4..), nil) rescue nil
+        end
+
+        warn "\n[lrama-fuzz] Caught worker signal #{sig}! Saved crashing input to #{crash_file} and restarting worker..."
+      else
+        warn "\n[lrama-fuzz] Worker exited on signal #{sig} (no in-flight input); restarting in 1s..."
+        sleep(1.0)
+      end
+    elsif !status.success?
+      warn "\n[lrama-fuzz] Worker exited with status #{status.exitstatus}; restarting in 1s..."
+      sleep(1.0)
+    else
+      break
+    end
   end
 end
+
+run_grammar_supervisor(ARGV) if __FILE__ == $PROGRAM_NAME
