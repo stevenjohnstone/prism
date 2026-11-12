@@ -41,8 +41,25 @@ b2=$(printf "./build/fuzz.ijon: src/prism.c:12: bar: Assertion \`0' failed.\n" |
 b3=$(printf "/prism/build/fuzz.native: src/prism.c:12: bar: Assertion \`0' failed.\n" | SIGLINES=5 ./test/fuzz/triage/signature.sh)
 [ "$b1" = "$b2" ] && [ "$b1" = "$b3" ] || fail "binary name normalization failed ($b1, $b2, $b3)"
 
+i1=$(printf "INVARIANT[diagnostic]: list=error type=escape_invalid_meta kind=end_oob [detail: level=0 start=1 length=3 parsed_size=3]\nAddressSanitizer:DEADLYSIGNAL\n#0 0x1111 in abort\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+i2=$(printf "Reading 487 bytes from /tmp/c\nINVARIANT[diagnostic]: list=error type=escape_invalid_meta kind=end_oob [detail: level=0 start=481 length=3 parsed_size=483]\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+i3=$(printf "INVARIANT[diagnostic]: list=error type=regexp_term kind=end_oob [detail: level=0 start=1 length=3 parsed_size=3]\nAddressSanitizer:DEADLYSIGNAL\n#0 0x1111 in abort\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+i4=$(printf "INVARIANT[diagnostic]: list=error type=escape_invalid_meta kind=length_underflow [detail: level=0 start=1 length=4294967295 parsed_size=3]\nAddressSanitizer:DEADLYSIGNAL\n#0 0x1111 in abort\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+[ "$i1" = "$i2" ] || fail "INVARIANT[diagnostic] signature varied across offsets or sanitizer frames ($i1 != $i2)"
+[ "$i1" != "$i3" ] || fail "INVARIANT[diagnostic] collided across distinct diagnostic types ($i1 == $i3)"
+[ "$i1" != "$i4" ] || fail "INVARIANT[diagnostic] collided across distinct violation kinds ($i1 == $i4)"
+
+n1=$(printf "INVARIANT[node_location]: type=PM_REGULAR_EXPRESSION_NODE kind=end_oob [detail: parent=PM_LOCAL_VARIABLE_WRITE_NODE start=8 length=4 parsed_size=11]\n#0 0x1 in check_node_location\n#1 0x2 in check_node_location\n#2 0x3 in check_node_location\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+n2=$(printf "INVARIANT[node_location]: type=PM_REGULAR_EXPRESSION_NODE kind=end_oob [detail: parent=PM_STATEMENTS_NODE start=0 length=4 parsed_size=3]\n#0 0x9 in check_node_location\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+n3=$(printf "INVARIANT[node_location]: type=PM_CALL_NODE kind=end_oob [detail: parent=PM_STATEMENTS_NODE start=0 length=4 parsed_size=3]\n#0 0x9 in check_node_location\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+[ "$n1" = "$n2" ] || fail "INVARIANT[node_location] varied across parent wrapper or AST recursion depth ($n1 != $n2)"
+[ "$n1" != "$n3" ] || fail "INVARIANT[node_location] collided across distinct node types ($n1 == $n3)"
+[ "$i1" != "$n1" ] || fail "INVARIANT[diagnostic] collided with INVARIANT[node_location] ($i1 == $n1)"
+
 ruby -e 'File.write(ARGV.fetch(0), "stack frame 0xdeadbeef in fn\n" * 5000)' "$WORKDIR/big_trace.txt"
 SIGLINES=3 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_trace.txt" >/dev/null
+ruby -e 'File.write(ARGV.fetch(0), "INVARIANT[stream]: kind=parsed_size_oob [detail: parsed_size=9 size=4]\n" + ("stack frame 0xdeadbeef in fn\n" * 5000))' "$WORKDIR/big_inv_trace.txt"
+SIGLINES=15 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_inv_trace.txt" >/dev/null
 echo "  signature.sh normalization and 5,000-line trace check passed"
 
 echo "[2/4] Checking halfempty.sh minimization, header preservation, and drift protection..."
@@ -53,6 +70,21 @@ cat << 'EOF' > "$WORKDIR/synth_target.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+__attribute__((noreturn, noinline))
+static void fail_invariant_at_shared_site(const char *diag_type, size_t start, size_t parsed_size) {
+    fprintf(
+        stderr,
+        "INVARIANT[diagnostic]: list=error type=%s kind=end_oob [detail: level=0 start=%zu length=4 parsed_size=%zu]\n"
+        "    #0 0x1000 in fail_invariant_at_shared_site /prism/test/fuzz/harness/parse.c:90:5\n"
+        "    #1 0x1010 in harness_parse /prism/test/fuzz/harness/parse.c:550:13\n",
+        diag_type,
+        start,
+        parsed_size
+    );
+    fflush(stderr);
+    abort();
+}
 
 int main(int argc, char **argv) {
     if (argc < 2) return 0;
@@ -96,6 +128,20 @@ int main(int argc, char **argv) {
     if ((buf[0] & 0x04) && body_len >= 4 && memmem(body, body_len, "SEGV", 4) != NULL) {
         free(buf);
         raise(SIGSEGV);
+    }
+    if (buf[0] & 0x10) {
+        const uint8_t *target = body_len >= 10 ? (const uint8_t *)memmem(body, body_len, "INV_TARGET", 10) : NULL;
+        if (target != NULL) {
+            size_t off = (size_t)(target - body);
+            free(buf);
+            fail_invariant_at_shared_site("heredoc_term", off, body_len);
+        }
+        const uint8_t *decoy = body_len >= 9 ? (const uint8_t *)memmem(body, body_len, "INV_DECOY", 9) : NULL;
+        if (decoy != NULL) {
+            size_t off = (size_t)(decoy - body);
+            free(buf);
+            fail_invariant_at_shared_site("escape_invalid_meta", off, body_len);
+        }
     }
 
     free(buf);
@@ -152,7 +198,25 @@ fi
 printf '\x08\xde\xad\x01' > "$WORKDIR/empty_body.in"
 ./test/fuzz/triage/halfempty.sh "$WORKDIR/synth_target" "$WORKDIR/empty_body.in" "$WORKDIR/empty_body.min" >/dev/null 2>&1
 cmp -s "$WORKDIR/empty_body.in" "$WORKDIR/empty_body.min" || fail "4-byte input was altered by halfempty.sh"
-echo "  halfempty.sh header preservation, drift protection, SIGSEGV, and 4-byte checks passed"
+
+# 2e. Two INVARIANT[...] failures sharing the exact same C call stack and shifting offsets:
+#     must preserve INV_TARGET (heredoc_term), delete INV_DECOY (escape_invalid_meta), and shrink prefix/suffix.
+ruby -e '
+  hdr = "\x10\x44\x55\x66".b
+  body = ("p = 1\n".b * 15) + "INV_DECOY\n".b + ("q = 2\n".b * 15) + "INV_TARGET\n".b + ("r = 3\n".b * 15)
+  File.binwrite(ARGV.fetch(0), hdr + body)
+' "$WORKDIR/inv.in"
+SIGLINES=15 ./test/fuzz/triage/halfempty.sh "$WORKDIR/synth_target" "$WORKDIR/inv.in" "$WORKDIR/inv.min" >/dev/null 2>&1
+ruby -e '
+  orig = File.binread(ARGV.fetch(0))
+  mini = File.binread(ARGV.fetch(1))
+  raise "4-byte header mutated on INVARIANT: #{mini.byteslice(0, 4).dump}" unless mini.byteslice(0, 4) == "\x10\x44\x55\x66".b
+  body = mini.byteslice(4..)
+  raise "target invariant token INV_TARGET missing: #{mini.dump}" unless body.include?("INV_TARGET".b)
+  raise "decoy invariant token INV_DECOY not minimized away: #{mini.dump}" if body.include?("INV_DECOY".b)
+  raise "expected <= 18 bytes from #{orig.bytesize} bytes, got #{mini.bytesize}: #{mini.dump}" unless mini.bytesize <= 18
+' "$WORKDIR/inv.in" "$WORKDIR/inv.min"
+echo "  halfempty.sh header preservation, drift protection, INVARIANT symmetry breaking, SIGSEGV, and 4-byte checks passed"
 
 echo "[3/4] Checking triage.rb standalone C reproducer generation and strict C99 build..."
 ruby - "$WORKDIR" << 'EOF'
@@ -192,9 +256,9 @@ grep -q "static const size_t input_size = 6;" "$WORKDIR/tc_nonempty.c" || fail "
 grep -q "static const size_t input_size = 0;" "$WORKDIR/tc_empty.c" || fail "missing input_size = 0 in tc_empty.c"
 
 prism_srcs=$(find src -name '*.c')
-clang -std=c99 -Wall -Wextra -Wstrict-prototypes -Werror -DPRISM_EXPORT_SYMBOLS \
+clang -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror -DPRISM_EXPORT_SYMBOLS \
     -fsanitize=address,undefined -Iinclude -Isrc "$WORKDIR/tc_nonempty.c" $prism_srcs -o "$WORKDIR/tc_nonempty"
-clang -std=c99 -Wall -Wextra -Wstrict-prototypes -Werror -DPRISM_EXPORT_SYMBOLS \
+clang -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror -DPRISM_EXPORT_SYMBOLS \
     -fsanitize=address,undefined -Iinclude -Isrc "$WORKDIR/tc_empty.c" $prism_srcs -o "$WORKDIR/tc_empty"
 "$WORKDIR/tc_nonempty"
 "$WORKDIR/tc_empty"
@@ -216,6 +280,12 @@ end
 # Byte-identical duplicate across workers
 dup = File.binread(File.join(afl, "w1/crashes/id:000000,sig:06"))
 File.binwrite(File.join(afl, "w2/crashes/id:000000,sig:06"), dup)
+
+# Two distinct INVARIANT[...] crashes sharing an identical C call stack (plus a shifted-offset duplicate)
+inv_hdr = "\x10\x44\x55\x66".b
+File.binwrite(File.join(afl, "w1/crashes/id:000010,sig:06"), inv_hdr + ("a = 1\n".b * 8) + "INV_TARGET\n".b)
+File.binwrite(File.join(afl, "w2/crashes/id:000011,sig:06"), inv_hdr + ("b = 222\n".b * 20) + "INV_TARGET\n".b)
+File.binwrite(File.join(afl, "w1/crashes/id:000012,sig:06"), inv_hdr + ("c = 3\n".b * 8) + "INV_DECOY\n".b)
 
 # Unreproducible crash (sig:06, exits 0 on replay)
 File.binwrite(File.join(afl, "w1/crashes/id:000098,sig:06"), "\x00\x00\x03\x011 + 1\n".b)
@@ -239,17 +309,34 @@ ruby - "$WORKDIR/triage" "$WORKDIR/triage.log" << 'EOF'
 triage_dir, log_path = ARGV
 log = File.read(log_path)
 
-abrt_dirs = Dir.glob(File.join(triage_dir, "ABRT", "*"))
-raise "expected 1 ABRT dir, got #{abrt_dirs.inspect}\nlog:\n#{log}" unless abrt_dirs.size == 1
+abrt_dirs = Dir.glob(File.join(triage_dir, "ABRT", "*")).sort
+raise "expected 3 ABRT dirs (BOOM + heredoc_term + escape_invalid_meta), got #{abrt_dirs.inspect}\nlog:\n#{log}" unless abrt_dirs.size == 3
 
-abrt_dir = abrt_dirs.first
-mode = File.stat(abrt_dir).mode & 0o777
-raise "expected world-readable/traversable dir mode, got #{format('%#o', mode)}" unless (mode & 0o755) == 0o755
+tokens_found = []
+abrt_dirs.each do |abrt_dir|
+  mode = File.stat(abrt_dir).mode & 0o777
+  raise "expected world-readable/traversable dir mode, got #{format('%#o', mode)}" unless (mode & 0o755) == 0o755
+  raise "missing testcase.c in #{abrt_dir}" unless File.file?(File.join(abrt_dir, "testcase.c"))
 
-min_data = File.binread(File.join(abrt_dir, "input.min"))
-raise "header mutated by triage.rb: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x2a\x11\x22\x33".b
-raise "unexpected input.min: #{min_data.dump}" unless min_data.byteslice(4..).include?("BOOM".b) && min_data.bytesize <= 12
-raise "missing testcase.c in ABRT dir" unless File.file?(File.join(abrt_dir, "testcase.c"))
+  min_data = File.binread(File.join(abrt_dir, "input.min"))
+  body = min_data.byteslice(4..)
+  if body.include?("BOOM".b)
+    raise "header mutated for BOOM: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x2a\x11\x22\x33".b
+    raise "unexpected BOOM input.min size: #{min_data.dump}" unless min_data.bytesize <= 12
+    tokens_found << "BOOM"
+  elsif body.include?("INV_TARGET".b)
+    raise "header mutated for INV_TARGET: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x44\x55\x66".b
+    raise "unexpected INV_TARGET input.min size: #{min_data.dump}" unless min_data.bytesize <= 18
+    tokens_found << "INV_TARGET"
+  elsif body.include?("INV_DECOY".b)
+    raise "header mutated for INV_DECOY: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x44\x55\x66".b
+    raise "unexpected INV_DECOY input.min size: #{min_data.dump}" unless min_data.bytesize <= 18
+    tokens_found << "INV_DECOY"
+  else
+    raise "unexpected minimized body in #{abrt_dir}: #{min_data.dump}"
+  end
+end
+raise "expected all 3 distinct ABRT tokens, got #{tokens_found.inspect}" unless tokens_found.sort == %w[BOOM INV_DECOY INV_TARGET]
 
 unrepro_dirs = Dir.glob(File.join(triage_dir, "unreproducible", "*"))
 raise "expected 1 unreproducible dir, got #{unrepro_dirs.inspect}" unless unrepro_dirs.size == 1
@@ -257,10 +344,10 @@ raise "missing testcase.c in unreproducible dir" unless File.file?(File.join(unr
 
 raise "transient hang should not create hang dir" if File.exist?(File.join(triage_dir, "hang"))
 min_runs = log.scan(/^minimizing /).size
-raise "expected exactly 1 minimization run across duplicates, got #{min_runs}:\n#{log}" unless min_runs == 1
+raise "expected exactly 3 minimization runs across duplicates, got #{min_runs}:\n#{log}" unless min_runs == 3
 
 sentinels = Dir.glob(File.join(triage_dir, ".processed", "*"))
-raise "expected 7 .processed sentinels (4 BOOM + 1 unrepro + 1 sig:09 + 1 hang), got #{sentinels.size}" unless sentinels.size == 7
+raise "expected 10 .processed sentinels (4 BOOM + 2 INV_TARGET + 1 INV_DECOY + 1 unrepro + 1 sig:09 + 1 hang), got #{sentinels.size}" unless sentinels.size == 10
 EOF
 echo "  concurrent deduplication, coalescing, and sentinel checks passed"
 

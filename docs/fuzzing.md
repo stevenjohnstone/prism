@@ -234,6 +234,8 @@ After `pm_parse()` or `pm_parse_stream()` returns, `harness_parse()` checks four
 3. **Diagnostic and magic-comment span bounds**: Verifies every error, warning, and magic-comment key/value location fits within `parsed_size`.
 4. **Comment span bounds and `attach_comments` sort order**: Verifies every comment location fits within `parsed_size` and, when `attach_comments` is set, that comments are ordered monotonically by `start` offset.
 
+Because these checks run after `pm_parse()` / `pm_parse_stream()` has unwound, `fuzz_invariant_fail()` prints a position-independent `INVARIANT[...]` descriptor to `stderr` (such as the diagnostic type, AST node type, comment/magic-comment kind, or lexical line-offset context, followed by raw offsets in `[detail: ...]`) right before calling `abort()`. `test/fuzz/triage/signature.sh` strips `[detail: ...]` and hashes the `INVARIANT[...]` descriptor so `triage.rb` and `halfempty` separate distinct invariant bugs while still minimizing away unrelated surrounding Ruby code.
+
 ### Parse-Only Fast Workers vs. `-DSLOW` Post-Processing
 
 Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json` on every fuzzing iteration would slow down parser exploration and pollute the coverage bitmap with output-formatter edges. We split the build into two modes:

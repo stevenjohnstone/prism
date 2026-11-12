@@ -69,8 +69,8 @@ if [ "$NEED_BUILD" -eq 1 ]; then
   clang -O0 -Iinclude -DSLOW -flto -ffunction-sections -fdata-sections "${extra_flags[@]}" -Wl,--gc-sections \
     "${src_files[@]}" test/fuzz/harness/coverage.c test/fuzz/harness/parse.c -o "$reach_bin"
 
-  # Keep reachable static (t) and global (T) functions; exclude harness entrypoints.
-  llvm-nm --defined-only "$reach_bin" | grep " [Tt] " | grep -Ev '[Tt] (main|run_file|run_stdin|setup_signal_handlers|handle_crash_signal|harness|harness_parse|check_node_location)$' | awk '{print $3}' | sed 's/^/fun:/' > "$keeplist"
+  # Keep reachable static (t) and global (T) functions; exclude harness entrypoints and crash-only name helpers.
+  llvm-nm --defined-only "$reach_bin" | grep " [Tt] " | grep -Ev '[Tt] (main|run_file|run_stdin|setup_signal_handlers|handle_crash_signal|harness|harness_parse|check_node_location|fuzz_.*|pm_node_type|pm_diagnostic_type|pm_diagnostic_id_name)$' | awk '{print $3}' | sed 's/^/fun:/' > "$keeplist"
   rm -f "$reach_bin"
 
   echo "Building coverage-instrumented binary..."

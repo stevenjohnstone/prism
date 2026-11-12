@@ -4,8 +4,10 @@
 #include <prism.h>
 #include "prism/internal/buffer.h"
 #include "prism/internal/parser.h"
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,11 +70,199 @@ static void fuzz_shebang_cb(pm_options_t *options, const uint8_t *source, size_t
     (void) shebang_data;
 }
 
-static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) {
-    size_t size = *(const size_t *) data;
-    assert(node->location.start <= size);
-    assert(node->location.length <= size - node->location.start);
+typedef struct {
+    size_t parsed_size;
+    pm_node_type_t parent_type;
+} fuzz_node_check_t;
+
+typedef struct {
+    const uint8_t *source;
+    size_t parsed_size;
+    uint32_t probe;
+    const char *ctx;
+} fuzz_line_offset_ctx_t;
+
+__attribute__((noreturn, noinline, format(printf, 1, 2)))
+static void fuzz_invariant_fail(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fflush(stderr);
+    abort();
+}
+
+static bool fuzz_loc_in_bounds(pm_location_t loc, size_t parsed_size) {
+    return (size_t) loc.start <= parsed_size && (size_t) loc.length <= parsed_size - (size_t) loc.start;
+}
+
+static const char *fuzz_span_violation_kind(uint32_t start, uint32_t length, size_t parsed_size) {
+    if ((size_t) start <= parsed_size && (size_t) length <= parsed_size - (size_t) start) {
+        return NULL;
+    }
+    if ((uint64_t) parsed_size < 0x80000000ULL && start >= 0x80000000U) {
+        return "start_underflow";
+    }
+    if (((uint64_t) parsed_size < 0x80000000ULL && length >= 0x80000000U) ||
+        (uint64_t) start + (uint64_t) length >= 0x100000000ULL) {
+        return "length_underflow";
+    }
+    if ((size_t) start > parsed_size) {
+        return "start_oob";
+    }
+    return "end_oob";
+}
+
+static bool fuzz_heredoc_span_contains(
+    const uint8_t *source,
+    size_t parsed_size,
+    pm_location_t opening_loc,
+    pm_location_t closing_loc,
+    uint32_t probe
+) {
+    if (opening_loc.length < 2 || !fuzz_loc_in_bounds(opening_loc, parsed_size)) {
+        return false;
+    }
+    if (memcmp(source + opening_loc.start, "<<", 2) != 0) {
+        return false;
+    }
+    size_t end_offset = parsed_size;
+    if (closing_loc.length > 0 && fuzz_loc_in_bounds(closing_loc, parsed_size)) {
+        end_offset = (size_t) closing_loc.start + (size_t) closing_loc.length;
+    }
+    return probe >= opening_loc.start && (size_t) probe <= end_offset;
+}
+
+static pm_visit_result_t fuzz_line_offset_visit(const pm_node_t *node, void *data) {
+    fuzz_line_offset_ctx_t *st = (fuzz_line_offset_ctx_t *) data;
+    bool in_node_loc = fuzz_loc_in_bounds(node->location, st->parsed_size) &&
+        st->probe >= node->location.start &&
+        (size_t) st->probe <= (size_t) node->location.start + (size_t) node->location.length;
+
+    switch (PM_NODE_TYPE(node)) {
+        case PM_STRING_NODE: {
+            const pm_string_node_t *cast = (const pm_string_node_t *) node;
+            if (fuzz_heredoc_span_contains(st->source, st->parsed_size, cast->opening_loc, cast->closing_loc, st->probe)) {
+                st->ctx = "heredoc";
+            } else if (in_node_loc) {
+                st->ctx = pm_node_type(node->type);
+            }
+            break;
+        }
+        case PM_INTERPOLATED_STRING_NODE: {
+            const pm_interpolated_string_node_t *cast = (const pm_interpolated_string_node_t *) node;
+            if (fuzz_heredoc_span_contains(st->source, st->parsed_size, cast->opening_loc, cast->closing_loc, st->probe)) {
+                st->ctx = "heredoc";
+            } else if (in_node_loc) {
+                st->ctx = pm_node_type(node->type);
+            }
+            break;
+        }
+        case PM_X_STRING_NODE: {
+            const pm_x_string_node_t *cast = (const pm_x_string_node_t *) node;
+            if (fuzz_heredoc_span_contains(st->source, st->parsed_size, cast->opening_loc, cast->closing_loc, st->probe)) {
+                st->ctx = "heredoc";
+            } else if (in_node_loc) {
+                st->ctx = pm_node_type(node->type);
+            }
+            break;
+        }
+        case PM_INTERPOLATED_X_STRING_NODE: {
+            const pm_interpolated_x_string_node_t *cast = (const pm_interpolated_x_string_node_t *) node;
+            if (fuzz_heredoc_span_contains(st->source, st->parsed_size, cast->opening_loc, cast->closing_loc, st->probe)) {
+                st->ctx = "heredoc";
+            } else if (in_node_loc) {
+                st->ctx = pm_node_type(node->type);
+            }
+            break;
+        }
+        case PM_SYMBOL_NODE:
+        case PM_INTERPOLATED_SYMBOL_NODE:
+        case PM_REGULAR_EXPRESSION_NODE:
+        case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE:
+        case PM_MATCH_LAST_LINE_NODE:
+        case PM_INTERPOLATED_MATCH_LAST_LINE_NODE:
+            if (in_node_loc) {
+                st->ctx = pm_node_type(node->type);
+            }
+            break;
+        case PM_ARRAY_NODE: {
+            const pm_array_node_t *cast = (const pm_array_node_t *) node;
+            if (in_node_loc && cast->opening_loc.length >= 2 &&
+                fuzz_loc_in_bounds(cast->opening_loc, st->parsed_size) &&
+                st->source[cast->opening_loc.start] == '%') {
+                st->ctx = "percent_array";
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
     return PM_VISIT_DESCEND;
+}
+
+static const char *fuzz_line_offset_context(
+    const pm_parser_t *parser,
+    const pm_node_t *root,
+    const uint8_t *source,
+    size_t parsed_size,
+    uint32_t offset
+) {
+    uint32_t probe = (size_t) offset <= parsed_size
+        ? (offset > 0 ? offset - 1 : 0)
+        : (parsed_size > 0 ? (uint32_t) (parsed_size - 1) : 0);
+
+    if (parser->data_loc.length > 0 && fuzz_loc_in_bounds(parser->data_loc, parsed_size) &&
+        probe >= parser->data_loc.start &&
+        (size_t) probe <= (size_t) parser->data_loc.start + (size_t) parser->data_loc.length) {
+        return "data";
+    }
+
+    for (const pm_comment_t *c = pm_parser_comments_first(parser); c != NULL; c = pm_comment_next(c)) {
+        pm_location_t loc = pm_comment_location(c);
+        if (fuzz_loc_in_bounds(loc, parsed_size) &&
+            probe >= loc.start &&
+            (size_t) probe <= (size_t) loc.start + (size_t) loc.length) {
+            return pm_comment_type(c) == PM_COMMENT_EMBDOC ? "embdoc" : "inline_comment";
+        }
+    }
+
+    fuzz_line_offset_ctx_t st = {
+        .source = source,
+        .parsed_size = parsed_size,
+        .probe = probe,
+        .ctx = "default",
+    };
+    if (root != NULL) {
+        pm_visit_node(root, fuzz_line_offset_visit, &st);
+    }
+    return st.ctx;
+}
+
+static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) {
+    const fuzz_node_check_t *ctx = (const fuzz_node_check_t *) data;
+    const char *kind = fuzz_span_violation_kind(node->location.start, node->location.length, ctx->parsed_size);
+    if (kind != NULL) {
+        const char *type_name = pm_node_type(node->type);
+        const char *parent_name = ctx->parent_type == 0 ? "ROOT" : pm_node_type(ctx->parent_type);
+        fuzz_invariant_fail(
+            "INVARIANT[node_location]: type=%s kind=%s [detail: parent=%s start=%u length=%u parsed_size=%zu]\n",
+            type_name[0] != '\0' ? type_name : "UNKNOWN",
+            kind,
+            parent_name[0] != '\0' ? parent_name : "UNKNOWN",
+            node->location.start,
+            node->location.length,
+            ctx->parsed_size
+        );
+    }
+
+    fuzz_node_check_t child_ctx = {
+        .parsed_size = ctx->parsed_size,
+        .parent_type = node->type,
+    };
+    pm_visit_child_nodes(node, check_node_location, &child_ctx);
+    return PM_VISIT_SKIP;
 }
 
 #ifdef PRISM_FUZZ_IJON
@@ -301,7 +491,13 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         stream_src = pm_source_stream_new(&stream_state, fuzz_stream_fgets, fuzz_stream_feof);
         node = pm_parse_stream(&parser, arena, stream_src, options);
         parsed_size = pm_source_length(stream_src);
-        assert(parsed_size <= size);
+        if (parsed_size > size) {
+            fuzz_invariant_fail(
+                "INVARIANT[stream]: kind=parsed_size_oob [detail: parsed_size=%zu size=%zu]\n",
+                parsed_size,
+                size
+            );
+        }
     } else {
         parser = pm_parser_new(arena, source_buf, size, options);
 #ifdef PRISM_FUZZ_IJON
@@ -311,46 +507,150 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         node = pm_parse(parser);
     }
 
-    // Line offsets must start at 0, be strictly monotonically increasing, and not exceed parsed_size
-    // We check the last element in list to make sure it doesn't exceed the parsed source buffer size
+    // Line offsets must start at 0, be strictly monotonically increasing, and not exceed parsed_size.
     const size_t offset_count = parser->line_offsets.size;
-    if (offset_count == 0 || parser->line_offsets.offsets[0] != 0 || parser->line_offsets.offsets[offset_count - 1] > parsed_size) {
-        abort();
+    const int stream_flag = opts->stream_mode ? 1 : 0;
+    const int cmd_x_flag = ((opts->cmd_flags & PM_OPTIONS_COMMAND_LINE_X) != 0) ? 1 : 0;
+    if (offset_count == 0) {
+        fuzz_invariant_fail(
+            "INVARIANT[line_offsets]: kind=empty ctx=default stream=%d cmd_x=%d [detail: parsed_size=%zu]\n",
+            stream_flag,
+            cmd_x_flag,
+            parsed_size
+        );
+    }
+    if (parser->line_offsets.offsets[0] != 0) {
+        fuzz_invariant_fail(
+            "INVARIANT[line_offsets]: kind=nonzero_start ctx=default stream=%d cmd_x=%d [detail: first=%u parsed_size=%zu]\n",
+            stream_flag,
+            cmd_x_flag,
+            parser->line_offsets.offsets[0],
+            parsed_size
+        );
     }
     for (size_t i = 1; i < offset_count; i++) {
-        if (parser->line_offsets.offsets[i] <= parser->line_offsets.offsets[i - 1]) {
-            abort();
+        uint32_t prev = parser->line_offsets.offsets[i - 1];
+        uint32_t curr = parser->line_offsets.offsets[i];
+        const char *lo_kind = NULL;
+        if ((uint64_t) parsed_size < 0x80000000ULL && curr >= 0x80000000U) {
+            lo_kind = "underflow";
+        } else if (curr == prev) {
+            lo_kind = "duplicate";
+        } else if (curr < prev) {
+            lo_kind = "rewind";
+        } else if ((size_t) curr > parsed_size) {
+            lo_kind = "oob";
+        }
+        if (lo_kind != NULL) {
+            const char *lo_ctx = fuzz_line_offset_context(parser, node, source_buf, parsed_size, curr);
+            fuzz_invariant_fail(
+                "INVARIANT[line_offsets]: kind=%s ctx=%s stream=%d cmd_x=%d [detail: idx=%zu prev=%u curr=%u parsed_size=%zu]\n",
+                lo_kind,
+                lo_ctx,
+                stream_flag,
+                cmd_x_flag,
+                i,
+                prev,
+                curr,
+                parsed_size
+            );
         }
     }
 
-    pm_visit_node(node, check_node_location, &parsed_size);
+    fuzz_node_check_t node_check = {
+        .parsed_size = parsed_size,
+        .parent_type = 0,
+    };
+    pm_visit_node(node, check_node_location, &node_check);
 
     for (const pm_diagnostic_t *d = pm_parser_errors_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
         pm_location_t loc = pm_diagnostic_location(d);
-        assert(loc.start <= parsed_size && loc.length <= parsed_size - loc.start);
+        const char *kind = fuzz_span_violation_kind(loc.start, loc.length, parsed_size);
+        if (kind != NULL) {
+            const char *diag_type = pm_diagnostic_type(d);
+            fuzz_invariant_fail(
+                "INVARIANT[diagnostic]: list=error type=%s kind=%s [detail: level=%u start=%u length=%u parsed_size=%zu]\n",
+                diag_type[0] != '\0' ? diag_type : "unknown",
+                kind,
+                (unsigned) pm_diagnostic_error_level(d),
+                loc.start,
+                loc.length,
+                parsed_size
+            );
+        }
     }
     for (const pm_diagnostic_t *d = pm_parser_warnings_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
         pm_location_t loc = pm_diagnostic_location(d);
-        assert(loc.start <= parsed_size && loc.length <= parsed_size - loc.start);
+        const char *kind = fuzz_span_violation_kind(loc.start, loc.length, parsed_size);
+        if (kind != NULL) {
+            const char *diag_type = pm_diagnostic_type(d);
+            fuzz_invariant_fail(
+                "INVARIANT[diagnostic]: list=warning type=%s kind=%s [detail: level=%u start=%u length=%u parsed_size=%zu]\n",
+                diag_type[0] != '\0' ? diag_type : "unknown",
+                kind,
+                (unsigned) pm_diagnostic_warning_level(d),
+                loc.start,
+                loc.length,
+                parsed_size
+            );
+        }
     }
 
     uint32_t prev_comment_start = 0;
+    const char *prev_comment_type = "none";
     bool first_comment = true;
     for (const pm_comment_t *c = pm_parser_comments_first(parser); c != NULL; c = pm_comment_next(c)) {
         pm_location_t loc = pm_comment_location(c);
-        assert(loc.start <= parsed_size && loc.length <= parsed_size - loc.start);
-        if (opts->attach_comments && !first_comment) {
-            assert(loc.start >= prev_comment_start);
+        const char *comment_type = pm_comment_type(c) == PM_COMMENT_EMBDOC ? "embdoc" : "inline";
+        const char *kind = fuzz_span_violation_kind(loc.start, loc.length, parsed_size);
+        if (kind != NULL) {
+            fuzz_invariant_fail(
+                "INVARIANT[comment]: type=%s kind=%s [detail: start=%u length=%u parsed_size=%zu]\n",
+                comment_type,
+                kind,
+                loc.start,
+                loc.length,
+                parsed_size
+            );
+        }
+        if (opts->attach_comments && !first_comment && loc.start < prev_comment_start) {
+            fuzz_invariant_fail(
+                "INVARIANT[comment]: type=%s prev_type=%s kind=unsorted [detail: prev_start=%u start=%u parsed_size=%zu]\n",
+                comment_type,
+                prev_comment_type,
+                prev_comment_start,
+                loc.start,
+                parsed_size
+            );
         }
         prev_comment_start = loc.start;
+        prev_comment_type = comment_type;
         first_comment = false;
     }
 
     for (const pm_magic_comment_t *mc = pm_parser_magic_comments_first(parser); mc != NULL; mc = pm_magic_comment_next(mc)) {
         pm_location_t k = pm_magic_comment_key(mc);
+        const char *k_kind = fuzz_span_violation_kind(k.start, k.length, parsed_size);
+        if (k_kind != NULL) {
+            fuzz_invariant_fail(
+                "INVARIANT[magic_comment]: field=key kind=%s [detail: start=%u length=%u parsed_size=%zu]\n",
+                k_kind,
+                k.start,
+                k.length,
+                parsed_size
+            );
+        }
         pm_location_t v = pm_magic_comment_value(mc);
-        assert(k.start <= parsed_size && k.length <= parsed_size - k.start);
-        assert(v.start <= parsed_size && v.length <= parsed_size - v.start);
+        const char *v_kind = fuzz_span_violation_kind(v.start, v.length, parsed_size);
+        if (v_kind != NULL) {
+            fuzz_invariant_fail(
+                "INVARIANT[magic_comment]: field=value kind=%s [detail: start=%u length=%u parsed_size=%zu]\n",
+                v_kind,
+                v.start,
+                v.length,
+                parsed_size
+            );
+        }
     }
 
 #ifdef SLOW
