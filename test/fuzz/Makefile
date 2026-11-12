@@ -64,7 +64,7 @@ $(FUZZ_AFL_STAMP): test/fuzz/patches/aflplusplus.patch
 	$(Q) touch $@
 
 
-$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
+$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) $(wildcard ext/prism/*) test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN (SLOW)"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
@@ -84,6 +84,9 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) test/fuzz/harn
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
+	$(ECHO) "building workspace Ruby C extension for grammar generator"
+	$(Q) $(MAKEDIRS) build/fuzz-ruby-ext/prism
+	$(Q) cd build/fuzz-ruby-ext/prism && ruby $(CURDIR)/ext/prism/extconf.rb && $(MAKE)
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
 
