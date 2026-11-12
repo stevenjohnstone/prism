@@ -220,12 +220,12 @@ Every fuzz input begins with a **4-byte options header** consumed by `harness()`
 
 | Byte | Bits | Option Mapped to `pm_options_t` |
 | :--- | :--- | :--- |
-| `input[0]` | `0..5` | Boolean flags: `freeze`, `partial_script`, `attach_comments`, `encoding_locked`, `has_frozen_string_literal`, `frozen_string_literal` |
-| `input[1]` | `0..5`, `6` | Command-line flags (`-a`, `-e`, `-l`, `-n`, `-p`, `-x`) and `main_script` |
+| `input[0]` | `0..5`, `6`, `7` | Boolean flags (`freeze`, `partial_script`, `attach_comments`, `encoding_locked`, `has_frozen_string_literal`, `frozen_string_literal`), `stream_mode` (`pm_parse_stream`), and `has_encoding_opts` (`pm_options_encoding_set`, `filepath`, `shebang_callback`, outer-scope forwarding / 0-local scope) |
+| `input[1]` | `0..5`, `6`, `7` | Command-line flags (`-a`, `-e`, `-l`, `-n`, `-p`, `-x`), `main_script`, and `has_limit_opts` (`stack_budget` + extreme `int32_t` `start_line`) |
 | `input[2]` | `0..1`, `2..3`, `4..7` | Ruby syntax version (`3.3`, `3.4`, `3.5`, `4.1`), enclosing `scopes_count` (`0..3`), and parameter forwarding flags (`*`, `**`, `&`, `...`) |
-| `input[3]` | `0..7` (signed) | `start_line` (`-128..127`) |
+| `input[3]` | `0..7` | Signed `start_line` (`-128..127` when `has_limit_opts` is unset) and `aux_byte` selector for `has_encoding_opts` / `has_limit_opts` |
 
-Putting options in the input header lets AFL++ mutate parser configuration alongside Ruby syntax so version-specific grammar rules, magic-comment overrides, command-line loops (`-n`/`-p`), and local scope forwarding are all explored automatically.
+Putting options in the input header lets AFL++ mutate parser configuration alongside Ruby syntax so version-specific grammar rules, streaming input (`pm_parse_stream`), non-UTF-8 initial encodings, shebang callbacks, stack budgets, `int32_t` line boundaries, command-line loops (`-n`/`-p`), and local scope forwarding are all explored automatically.
 
 After `pm_parse()` returns, `harness_parse()` checks two invariants on every run:
 

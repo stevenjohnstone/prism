@@ -821,20 +821,34 @@ else
 end
 
 FUZZ_OPT_VERSIONS = ["3.3", "3.4", "3.5", "4.1"].freeze
+FUZZ_OPT_ENCODINGS = ["UTF-8", "ASCII-8BIT", "US-ASCII", "Windows-31J", "EUC-JP", "UTF-8-MAC", "ISO-8859-1", "Shift_JIS"].freeze
+FUZZ_OPT_EXTREME_LINES = [2_147_483_647, 2_147_483_643, -2_147_483_648, 0].freeze
+FUZZ_OPT_STACK_BUDGETS = ["SIZE_MAX", "0", "512", "4096"].freeze
 
 def decode_fuzz_header(raw)
   return nil if raw.nil? || raw.bytesize < 4
 
   b0, b1, b2, b3 = raw.bytes[0, 4]
   ver = FUZZ_OPT_VERSIONS[b2 & 0x03]
-  start_line = [b3].pack("C").unpack1("c")
+  has_limit_opts = (b1 & 0x80) != 0
+  start_line = has_limit_opts ? FUZZ_OPT_EXTREME_LINES[(b3 >> 4) & 0x03] : [b3].pack("C").unpack1("c")
   scopes = (b2 >> 2) & 0x03
   fwd = (b2 >> 4) & 0x0f
 
   flags = ["v#{ver}"]
+  flags << "stream" if (b0 & 0x40) != 0
   flags << "line=#{start_line}" if start_line != 1
+  if (b0 & 0x80) != 0
+    flags << "enc=#{FUZZ_OPT_ENCODINGS[b3 & 0x07]}"
+    flags << "shebang_cb" if (b3 & 0x08) != 0
+    flags << "scope0_empty" if scopes > 0 && (b3 & 0x10) != 0
+  end
+  flags << "stack_budget=#{FUZZ_OPT_STACK_BUDGETS[(b3 >> 6) & 0x03]}" if has_limit_opts
   flags << "scopes=#{scopes}" if scopes > 0
-  flags << "fwd=0x#{fwd.to_s(16)}" if fwd > 0
+  if fwd > 0
+    fwd_scope = scopes > 0 ? ((b0 & 0x80) != 0 ? (b3 % scopes) : (scopes - 1)) : nil
+    flags << (fwd_scope ? "fwd[#{fwd_scope}]=0x#{fwd.to_s(16)}" : "fwd=0x#{fwd.to_s(16)}")
+  end
   flags << "freeze" if (b0 & 1) != 0
   flags << "partial" if (b0 & 2) != 0
   flags << "comments" if (b0 & 4) != 0

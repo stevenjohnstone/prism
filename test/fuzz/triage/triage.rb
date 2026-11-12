@@ -60,6 +60,7 @@ def c_fuzz_options(input_file)
   opt_flags = b0
   cmd_flags = format_bitmask(b1 & 0x3f, COMMAND_LINE_FLAGS, "0")
   main_script = (b1 & 0x40) != 0
+  has_limit_opts = (b1 & 0x80) != 0
   version = VERSIONS[b2 & 0x03]
   scopes_count = (b2 >> 2) & 0x03
   forwarding = format_bitmask((b2 >> 4) & 0x0f, FORWARDING_FLAGS, "PM_OPTIONS_SCOPE_FORWARDING_NONE")
@@ -79,6 +80,10 @@ def c_fuzz_options(input_file)
       .frozen_string_literal = #{(opt_flags & 32) != 0},
       .scopes_count = #{scopes_count},
       .forwarding = #{forwarding},
+      .stream_mode = #{(opt_flags & 0x40) != 0},
+      .has_encoding_opts = #{(opt_flags & 0x80) != 0},
+      .has_limit_opts = #{has_limit_opts},
+      .aux_byte = #{format("0x%02x", b3)},
     };
   C
 end

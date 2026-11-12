@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#include <limits.h>
 #include <prism.h>
 #include "prism/internal/buffer.h"
 #include "prism/internal/parser.h"
@@ -22,7 +23,50 @@ typedef struct {
     bool frozen_string_literal;
     uint8_t scopes_count;
     uint8_t forwarding;
+    bool stream_mode;
+    bool has_encoding_opts;
+    bool has_limit_opts;
+    uint8_t aux_byte;
 } fuzz_options_t;
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    bool eof;
+} fuzz_stream_t;
+
+static char *fuzz_stream_fgets(char *buf, int n, void *vp) {
+    fuzz_stream_t *s = (fuzz_stream_t *) vp;
+    if (n <= 0) return NULL;
+    if (s->pos >= s->size) {
+        s->eof = true;
+        return NULL;
+    }
+    size_t count = 0;
+    size_t limit = (size_t) (n - 1);
+    while (count < limit && s->pos < s->size) {
+        uint8_t ch = s->data[s->pos++];
+        buf[count++] = (char) ch;
+        if (ch == '\n') break;
+    }
+    if (count < limit && (count == 0 || buf[count - 1] != '\n') && s->pos >= s->size) {
+        s->eof = true;
+    }
+    buf[count] = '\0';
+    return buf;
+}
+
+static int fuzz_stream_feof(void *vp) {
+    return ((const fuzz_stream_t *) vp)->eof ? 1 : 0;
+}
+
+static void fuzz_shebang_cb(pm_options_t *options, const uint8_t *source, size_t length, void *shebang_data) {
+    (void) options;
+    (void) source;
+    (void) length;
+    (void) shebang_data;
+}
 
 static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) {
     size_t size = *(const size_t *) data;
@@ -186,20 +230,51 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         pm_options_frozen_string_literal_set(options, opts->frozen_string_literal);
     }
 
+    if (opts->has_encoding_opts) {
+        static const char * const encodings[8] = {
+            "UTF-8",
+            "ASCII-8BIT",
+            "US-ASCII",
+            "Windows-31J",
+            "EUC-JP",
+            "UTF-8-MAC",
+            "ISO-8859-1",
+            "Shift_JIS",
+        };
+        pm_options_encoding_set(options, encodings[opts->aux_byte & 0x07]);
+        pm_options_filepath_set(options, "fuzz.rb");
+        if ((opts->aux_byte & 0x08) != 0) {
+            pm_options_shebang_callback_set(options, fuzz_shebang_cb, NULL);
+        }
+    }
+
+    if (opts->has_limit_opts) {
+        static const int32_t extreme_lines[4] = { INT32_MAX, INT32_MAX - 4, INT32_MIN, 0 };
+        static const size_t budgets[4] = { SIZE_MAX, 0, 512, 4096 };
+        pm_options_line_set(options, extreme_lines[(opts->aux_byte >> 4) & 0x03]);
+        pm_options_stack_budget_set(options, budgets[(opts->aux_byte >> 6) & 0x03]);
+    }
+
     if (opts->scopes_count > 0 && pm_options_scopes_init(options, opts->scopes_count)) {
         static const char * const scope_locals[][2] = {
             { "a", "foo" },
             { "b", "it" },
             { "c", "_1" },
         };
+        size_t forwarding_scope = opts->has_encoding_opts
+            ? (size_t) (opts->aux_byte % opts->scopes_count)
+            : (size_t) (opts->scopes_count - 1);
 
         for (size_t i = 0; i < opts->scopes_count; i++) {
             pm_options_scope_t *scope = pm_options_scope_mut(options, i);
             size_t locals_count = (i == 0 && size > 0) ? 3 : 2;
+            if (i == 0 && opts->has_encoding_opts && (opts->aux_byte & 0x10) != 0) {
+                locals_count = 0;
+            }
             pm_options_scope_init(scope, locals_count);
-            pm_options_scope_forwarding_set(scope, (i == (size_t) (opts->scopes_count - 1)) ? opts->forwarding : PM_OPTIONS_SCOPE_FORWARDING_NONE);
+            pm_options_scope_forwarding_set(scope, (i == forwarding_scope) ? opts->forwarding : PM_OPTIONS_SCOPE_FORWARDING_NONE);
 
-            for (size_t j = 0; j < 2; j++) {
+            for (size_t j = 0; j < 2 && j < locals_count; j++) {
                 const char *name = scope_locals[i][j];
                 pm_string_init(pm_options_scope_local_mut(scope, j), (const uint8_t *) name, strlen(name));
             }
@@ -211,16 +286,35 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
     }
 
     pm_arena_t *arena = pm_arena_new();
-    pm_parser_t *parser = pm_parser_new(arena, source_buf, size, options);
+    pm_source_t *stream_src = NULL;
+    pm_parser_t *parser = NULL;
+    pm_node_t *node = NULL;
+    size_t parsed_size = size;
+
+    if (opts->stream_mode) {
+        fuzz_stream_t stream_state = {
+            .data = source_buf,
+            .size = size,
+            .pos = 0,
+            .eof = false,
+        };
+        stream_src = pm_source_stream_new(&stream_state, fuzz_stream_fgets, fuzz_stream_feof);
+        node = pm_parse_stream(&parser, arena, stream_src, options);
+        parsed_size = pm_source_length(stream_src);
+        assert(parsed_size <= size);
+    } else {
+        parser = pm_parser_new(arena, source_buf, size, options);
 #ifdef PRISM_FUZZ_IJON
-    fuzz_ijon_state_t ijon_state = { 0 };
-    pm_parser_lex_callback_set(parser, fuzz_ijon_lex_callback, &ijon_state);
+        fuzz_ijon_state_t ijon_state = { 0 };
+        pm_parser_lex_callback_set(parser, fuzz_ijon_lex_callback, &ijon_state);
 #endif
-    pm_node_t *node = pm_parse(parser);
-    // Line offsets must start at 0, be strictly monotonically increasing, and not exceed size
-    // We check the last element in list to make sure it doesn't exceed the input buffer size
+        node = pm_parse(parser);
+    }
+
+    // Line offsets must start at 0, be strictly monotonically increasing, and not exceed parsed_size
+    // We check the last element in list to make sure it doesn't exceed the parsed source buffer size
     const size_t offset_count = parser->line_offsets.size;
-    if (offset_count == 0 || parser->line_offsets.offsets[0] != 0 || parser->line_offsets.offsets[offset_count - 1] > size) {
+    if (offset_count == 0 || parser->line_offsets.offsets[0] != 0 || parser->line_offsets.offsets[offset_count - 1] > parsed_size) {
         abort();
     }
     for (size_t i = 1; i < offset_count; i++) {
@@ -229,14 +323,26 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         }
     }
 
-
-    pm_visit_node(node, check_node_location, &size);
+    pm_visit_node(node, check_node_location, &parsed_size);
 
 #ifdef SLOW
     pm_buffer_t *buffer = pm_buffer_new();
 
     pm_serialize(parser, node, buffer);
     pm_buffer_clear(buffer);
+
+    if (opts->stream_mode) {
+        fuzz_stream_t stream_state2 = {
+            .data = source_buf,
+            .size = size,
+            .pos = 0,
+            .eof = false,
+        };
+        pm_source_t *stream_src2 = pm_source_stream_new(&stream_state2, fuzz_stream_fgets, fuzz_stream_feof);
+        pm_serialize_parse_stream(buffer, stream_src2, NULL);
+        pm_buffer_clear(buffer);
+        pm_source_free(stream_src2);
+    }
 
     if (parser->error_list.size > 0) {
         (void) pm_errors_format(parser, buffer, PM_ERRORS_FORMAT_PLAIN);
@@ -253,6 +359,9 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 #endif
 
     pm_parser_free(parser);
+    if (stream_src != NULL) {
+        pm_source_free(stream_src);
+    }
     pm_arena_free(arena);
     pm_options_free(options);
     free(source);
@@ -282,6 +391,10 @@ __attribute__((noinline)) void harness(const uint8_t *input, size_t size) {
         .frozen_string_literal = (opt_flags & 32) != 0,
         .scopes_count = (input[2] >> 2) & 0x03,
         .forwarding = (input[2] >> 4) & 0x0f,
+        .stream_mode = (opt_flags & 0x40) != 0,
+        .has_encoding_opts = (opt_flags & 0x80) != 0,
+        .has_limit_opts = (input[1] & 0x80) != 0,
+        .aux_byte = input[3],
     };
 
     harness_parse(input + 4, size - 4, &opts);
