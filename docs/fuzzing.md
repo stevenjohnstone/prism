@@ -227,10 +227,12 @@ Every fuzz input begins with a **4-byte options header** consumed by `harness()`
 
 Putting options in the input header lets AFL++ mutate parser configuration alongside Ruby syntax so version-specific grammar rules, streaming input (`pm_parse_stream`), non-UTF-8 initial encodings, shebang callbacks, stack budgets, `int32_t` line boundaries, command-line loops (`-n`/`-p`), and local scope forwarding are all explored automatically.
 
-After `pm_parse()` returns, `harness_parse()` checks two invariants on every run:
+After `pm_parse()` or `pm_parse_stream()` returns, `harness_parse()` checks four post-parse invariants against the parsed source length (`parsed_size`) on every run:
 
-1. **Monotonic line offsets**: Verifies that `parser->line_offsets` is strictly increasing.
-2. **AST location bounds (`check_node_location`)**: Walks the entire AST with `pm_visit_node` and aborts if any node has `start > end`, `start < input`, or `end > input + size`.
+1. **Monotonic line offsets**: Verifies that `parser->line_offsets` starts at `0`, is strictly increasing, and never exceeds `parsed_size`.
+2. **AST location bounds (`check_node_location`)**: Walks the entire AST with `pm_visit_node` and aborts if any node span exceeds `parsed_size`.
+3. **Diagnostic and magic-comment span bounds**: Verifies every error, warning, and magic-comment key/value location fits within `parsed_size`.
+4. **Comment span bounds and `attach_comments` sort order**: Verifies every comment location fits within `parsed_size` and, when `attach_comments` is set, that comments are ordered monotonically by `start` offset.
 
 ### Parse-Only Fast Workers vs. `-DSLOW` Post-Processing
 

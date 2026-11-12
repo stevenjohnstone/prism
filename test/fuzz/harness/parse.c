@@ -325,6 +325,34 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 
     pm_visit_node(node, check_node_location, &parsed_size);
 
+    for (const pm_diagnostic_t *d = pm_parser_errors_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
+        pm_location_t loc = pm_diagnostic_location(d);
+        assert(loc.start <= parsed_size && loc.length <= parsed_size - loc.start);
+    }
+    for (const pm_diagnostic_t *d = pm_parser_warnings_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
+        pm_location_t loc = pm_diagnostic_location(d);
+        assert(loc.start <= parsed_size && loc.length <= parsed_size - loc.start);
+    }
+
+    uint32_t prev_comment_start = 0;
+    bool first_comment = true;
+    for (const pm_comment_t *c = pm_parser_comments_first(parser); c != NULL; c = pm_comment_next(c)) {
+        pm_location_t loc = pm_comment_location(c);
+        assert(loc.start <= parsed_size && loc.length <= parsed_size - loc.start);
+        if (opts->attach_comments && !first_comment) {
+            assert(loc.start >= prev_comment_start);
+        }
+        prev_comment_start = loc.start;
+        first_comment = false;
+    }
+
+    for (const pm_magic_comment_t *mc = pm_parser_magic_comments_first(parser); mc != NULL; mc = pm_magic_comment_next(mc)) {
+        pm_location_t k = pm_magic_comment_key(mc);
+        pm_location_t v = pm_magic_comment_value(mc);
+        assert(k.start <= parsed_size && k.length <= parsed_size - k.start);
+        assert(v.start <= parsed_size && v.length <= parsed_size - v.start);
+    }
+
 #ifdef SLOW
     pm_buffer_t *buffer = pm_buffer_new();
 
