@@ -1,7 +1,12 @@
 # frozen_string_literal: true
 
-require "lrama/fuzz"
+WORKSPACE_LIB = File.expand_path("../../../lib", __dir__)
+WORKSPACE_EXT = File.expand_path("../../../build/fuzz-ruby-ext", __dir__)
+if File.exist?(File.join(WORKSPACE_EXT, "prism", "prism.so"))
+  $LOAD_PATH.unshift(WORKSPACE_EXT, WORKSPACE_LIB)
+end
 require "prism"
+require "lrama/fuzz"
 require "digest"
 require "fileutils"
 require "securerandom"
