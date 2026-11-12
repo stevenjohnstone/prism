@@ -974,6 +974,156 @@ def expand_candidate_variants(code, is_valid, rng, validator, parse_fn, max_payl
   variants
 end
 
+# Patch a Lrama::Fuzz::Generator instance so every derivation:
+# - clears the terminal delimiter stack before expanding
+# - filters avoided symbols upfront in both pick_rule and pick_min_cost_rule
+# - balances valid-coverage exploration against unsatisfiable rules (35% cap)
+# - caches top-level leads_to_uncovered? DFS per coverage size so valid tracking
+#   has negligible overhead
+# - records valid feedback during generate_valid retries
+def configure_generator!(gen, reset_delims)
+  gen.singleton_class.prepend(Module.new do
+    define_method(:generate) { |**kwargs| reset_delims.call; super(**kwargs) }
+    define_method(:generate_from) { |*args| reset_delims.call; super(*args) }
+    define_method(:generate_targeted) { reset_delims.call; super() }
+
+    define_method(:generate_valid) do |max_retries: 100, &validator|
+      raise ArgumentError, "a validator block is required" unless validator
+
+      max_retries.times do
+        code = generate
+        valid = validator.call(code)
+        record_result(valid: valid)
+        return code if valid
+      end
+      nil
+    end
+
+    def cached_safe_rules(rules)
+      (@safe_rules_cache ||= {})[rules.object_id] ||= filter_avoided(rules)
+    end
+
+    def sync_coverage_caches!
+      cov_sz = @coverage.used_rule_ids.size
+      if @cov_epoch_sz != cov_sz
+        @cov_epoch_sz = cov_sz
+        @uncovered_by_rules = {}
+        @promising_by_rules = {}
+        @uncovered_within_cache = {}
+        @cached_explore_rate = @coverage.ratio * 0.3
+      end
+
+      valid_sz = @coverage.valid_rule_ids.size
+      if @valid_epoch_sz != valid_sz
+        @valid_epoch_sz = valid_sz
+        @not_valid_by_rules = {}
+      end
+    end
+
+    def pick_rule(rules)
+      sync_coverage_caches!
+      rid = rules.object_id
+      safe = cached_safe_rules(rules)
+
+      uncovered = (@uncovered_by_rules[rid] ||= safe.reject { |r| @coverage.covered?(r) })
+      return uncovered.sample(random: @random) unless uncovered.empty?
+
+      not_valid = (@not_valid_by_rules[rid] ||= safe.reject { |r| @coverage.valid_covered?(r) })
+      return not_valid.sample(random: @random) if !not_valid.empty? && @random.rand < 0.35
+
+      return safe.sample(random: @random) if @random.rand < @cached_explore_rate
+
+      promising = (@promising_by_rules[rid] ||= safe.select { |r| leads_to_uncovered?(r, 3) })
+      pool = promising.empty? ? safe : promising
+      pool.sample(random: @random)
+    end
+
+    def pick_min_cost_rule(symbol)
+      @safe_min_cost_cache ||= {}
+      candidates = @safe_min_cost_cache[symbol.number] ||= begin
+        min_rules = filter_avoided(@cost.min_cost_rules(symbol))
+        if min_rules.any? { |r| contains_avoided?(r) }
+          safe_all = filter_avoided(@grammar.find_rules_by_symbol!(symbol))
+          unless safe_all.all? { |r| contains_avoided?(r) }
+            min_safe_cost = safe_all.map { |r| @cost.rule_cost(r) }.min
+            min_rules = safe_all.select { |r| @cost.rule_cost(r) == min_safe_cost }
+          end
+        end
+        min_rules
+      end
+
+      uncovered = candidates.reject { |r| @coverage.covered?(r) }
+      (uncovered.empty? ? candidates : uncovered).sample(random: @random)
+    end
+
+    def leads_to_uncovered?(rule, depth)
+      visited = (@dfs_visited ||= Set.new)
+      rule.rhs.any? do |sym|
+        next false if sym.term? || sym.midrule?
+
+        visited.clear
+        has_uncovered_within?(sym, depth, visited)
+      end
+    end
+
+    def has_uncovered_within?(symbol, depth, visited)
+      top_level = visited.empty?
+      if top_level
+        sync_coverage_caches!
+        return @uncovered_within_cache[symbol.number] if @uncovered_within_cache.key?(symbol.number)
+      end
+
+      return false if depth <= 0 || visited.include?(symbol.number)
+
+      visited.add(symbol.number)
+      sub_rules = filter_avoided(@grammar.find_rules_by_symbol(symbol) || [])
+      result = sub_rules.any? { |r| !@coverage.covered?(r) } ||
+        (depth > 1 && sub_rules.any? do |r|
+          r.rhs.any? do |rhs_sym|
+            next false if rhs_sym.term? || rhs_sym.midrule?
+
+            has_uncovered_within?(rhs_sym, depth - 1, visited)
+          end
+        end)
+      visited.delete(symbol.number)
+      @uncovered_within_cache[symbol.number] = result if top_level
+      result
+    end
+  end)
+  gen
+end
+
+# Subclass Evolver so its internal @generator is configured before seed_population
+# runs, and so seed generations record validity feedback and reset delimiter state.
+class GuidedGrammarEvolver < Lrama::Fuzz::Evolver
+  def initialize(*args, reset_delims:, validator:, **kwargs)
+    @reset_delims = reset_delims
+    @seed_validator = validator
+    super(*args, **kwargs)
+  end
+
+  def generate_from_genome(genome)
+    @reset_delims.call
+    super(genome)
+  end
+
+  private
+
+  def seed_population(size)
+    configure_generator!(@generator, @reset_delims)
+    super
+  end
+
+  def generate_seed_genome
+    @reset_delims.call
+    res = super
+    if res && @seed_validator
+      @generator.record_result(valid: @seed_validator.call(res[1]))
+    end
+    res
+  end
+end
+
 def build_evolvers(grammar, rng, fitness, validator)
   classifier = Lrama::Fuzz::Ruby.method(:classifier)
   # Also avoid dsym (tSYMBEG string_contents tSTRING_END emits `:..."` without an
@@ -983,37 +1133,17 @@ def build_evolvers(grammar, rng, fitness, validator)
 
   comp_rng = Random.new(rng.rand(2**32))
   comp_terminals, comp_reset_delims = build_ruby_terminals(comp_rng, allow_invalid: false)
-  comp_gen = Lrama::Fuzz::Generator.new(
-    grammar,
-    terminals: comp_terminals,
-    classifier: classifier,
-    avoid_symbols: avoid,
-    max_depth: rng.rand(8..12),
-    random: comp_rng
+  comp_gen = configure_generator!(
+    Lrama::Fuzz::Generator.new(
+      grammar,
+      terminals: comp_terminals,
+      classifier: classifier,
+      avoid_symbols: avoid,
+      max_depth: rng.rand(8..12),
+      random: comp_rng
+    ),
+    comp_reset_delims
   )
-  # Filter avoided rules upfront in pick_rule so once all non-avoided rules of a
-  # non-terminal are covered, `uncovered` does not fall back to avoided rules,
-  # and clear the delimiter stack at the start of every derivation.
-  comp_gen.singleton_class.prepend(Module.new do
-    define_method(:generate) do |**kwargs|
-      comp_reset_delims.call
-      super(**kwargs)
-    end
-
-    define_method(:generate_from) do |*args|
-      comp_reset_delims.call
-      super(*args)
-    end
-
-    define_method(:generate_targeted) do
-      comp_reset_delims.call
-      super()
-    end
-
-    def pick_rule(rules)
-      super(filter_avoided(rules))
-    end
-  end)
   composed_evolver = Lrama::Fuzz::ComposedEvolver.new(
     comp_gen,
     fitness: fitness,
@@ -1027,7 +1157,7 @@ def build_evolvers(grammar, rng, fitness, validator)
 
   gram_rng = Random.new(rng.rand(2**32))
   gram_terminals, gram_reset_delims = build_ruby_terminals(gram_rng, allow_invalid: true)
-  grammar_evolver = Lrama::Fuzz::Evolver.new(
+  grammar_evolver = GuidedGrammarEvolver.new(
     grammar,
     terminals: gram_terminals,
     fitness: fitness,
@@ -1037,14 +1167,10 @@ def build_evolvers(grammar, rng, fitness, validator)
     population_size: POPULATION_SIZE,
     genome_length: 220,
     mutation_rate: 0.05 + rng.rand * 0.10,
-    random: gram_rng
+    random: gram_rng,
+    reset_delims: gram_reset_delims,
+    validator: validator
   )
-  grammar_evolver.singleton_class.prepend(Module.new do
-    define_method(:generate_from_genome) do |genome|
-      gram_reset_delims.call
-      super(genome)
-    end
-  end)
 
   [composed_evolver, grammar_evolver]
 end
