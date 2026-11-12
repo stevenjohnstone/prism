@@ -388,6 +388,12 @@ module GrammarBench
   def run_simulation(grammar, opts, in_flight_io, showmap_dir: nil)
     avoid = Lrama::Fuzz::Ruby::AVOID_SYMBOLS + Set["dsym", "END_OF_INPUT"]
     avoided_rule_ids = Set.new(grammar.rules.select { |r| ([r.lhs] + r.rhs).any? { |s| avoid.include?(s.id.s_value) } }.map(&:id))
+    # Avoided rules where `lhs` also has at least one non-avoided alternative rule.
+    avoidable_rule_ids = Set.new(grammar.rules.select do |r|
+      next false unless r.rhs.any? { |s| avoid.include?(s.id.s_value) }
+
+      (grammar.find_rules_by_symbol(r.lhs) || []).any? { |sr| sr.rhs.none? { |s| avoid.include?(s.id.s_value) } }
+    end.map(&:id))
     reachable_rules = Lrama::Fuzz::Coverage.new(grammar).total_count
 
     rng = Random.new(opts[:seed])
@@ -409,6 +415,7 @@ module GrammarBench
     peak_cov = { comp_used: 0, comp_valid: 0, gram_seed_used: 0, gram_seed_valid: 0, combined_used: 0 }
     last_cov = peak_cov.dup
     comp_avoided_hits = 0; gram_avoided_hits = 0
+    comp_avoidable_hits = 0; gram_avoidable_hits = 0
     showmap_written = 0
     gens_completed = 0
     timed_out = false
@@ -510,6 +517,8 @@ module GrammarBench
       last_cov.each { |k, v| peak_cov[k] = [peak_cov[k], v].max }
       comp_avoided_hits = [comp_avoided_hits, (c_used & avoided_rule_ids).size].max
       gram_avoided_hits = [gram_avoided_hits, (g_used & avoided_rule_ids).size].max
+      comp_avoidable_hits = [comp_avoidable_hits, (c_used & avoidable_rule_ids).size].max
+      gram_avoidable_hits = [gram_avoidable_hits, (g_used & avoidable_rule_ids).size].max
       break if timed_out
     end
 
@@ -583,7 +592,9 @@ module GrammarBench
         "peak_combined_used" => peak_cov[:combined_used],
         "last_comp_used" => last_cov[:comp_used],
         "comp_avoided_hits" => comp_avoided_hits,
-        "gram_seed_avoided_hits" => gram_avoided_hits
+        "gram_seed_avoided_hits" => gram_avoided_hits,
+        "comp_avoidable_hits" => comp_avoidable_hits,
+        "gram_seed_avoidable_hits" => gram_avoidable_hits
       },
       "headers" => {
         "distinct_count" => distinct_headers.size,
@@ -602,9 +613,10 @@ module GrammarBench
     failures << "heredoc pass2_valid_pct=#{report["heredoc_audit"]["pass2_valid_pct"]} (expected >=90%)" if report["heredoc_audit"]["pass2_valid_pct"] < 90.0
     failures << "heredoc pass1_valid_pct=#{report["heredoc_audit"]["pass1_valid_pct"]} (expected >=98%)" if report["heredoc_audit"]["pass1_valid_pct"] < 98.0
     failures << "oversized_pct=#{sim["oversized"]["total_pct"]} (expected 0%)" if sim["oversized"]["total_pct"] > 0.0
-    failures << "comp_avoided_hits=#{sim["coverage"]["comp_avoided_hits"]} (expected 0)" if sim["coverage"]["comp_avoided_hits"] > 0
-    failures << "gram_seed_avoided_hits=#{sim["coverage"]["gram_seed_avoided_hits"]} (expected 0)" if sim["coverage"]["gram_seed_avoided_hits"] > 0
+    failures << "comp_avoidable_hits=#{sim["coverage"]["comp_avoidable_hits"]} (expected 0)" if sim["coverage"]["comp_avoidable_hits"] > 0
+    failures << "gram_seed_avoidable_hits=#{sim["coverage"]["gram_seed_avoidable_hits"]} (expected 0)" if sim["coverage"]["gram_seed_avoidable_hits"] > 0
     failures << "comp_valid=#{sim["coverage"]["peak_comp_valid"]} (expected >0)" if sim["coverage"]["peak_comp_valid"] <= 0
+    failures << "gram_seed_valid=#{sim["coverage"]["peak_gram_seed_valid"]} (expected >0)" if sim["coverage"]["peak_gram_seed_valid"] <= 0
     failures << "header features=#{sim["headers"]["features_covered_count"]}/#{sim["headers"]["features_total"]} (expected >=6)" if sim["headers"]["features_covered_count"] < 6
     failures
   end
@@ -663,10 +675,10 @@ module GrammarBench
       sim["oversized"]["unique"], sim["oversized"]["unique_pct"], sim["oversized"]["by_source"].inspect)
     puts format("  in_flight writes: init=%d comp/gen=%.1f gram/gen=%.1f total=%d",
       sim["in_flight_writes"]["init_total"], sim["in_flight_writes"]["comp_per_gen"], sim["in_flight_writes"]["gram_per_gen"], sim["in_flight_writes"]["total"])
-    puts format("  Coverage (%d reachable/%d total): peak comp=%d (valid=%d) gram_seed=%d (valid=%d) combined=%d | avoided_hits comp=%d gram_seed=%d",
+    puts format("  Coverage (%d reachable/%d total): peak comp=%d (valid=%d) gram_seed=%d (valid=%d) combined=%d | avoided comp=%d (avoidable=%d) gram_seed=%d (avoidable=%d)",
       cov["reachable_rules"], cov["total_rules"], cov["peak_comp_used"], cov["peak_comp_valid"],
       cov["peak_gram_seed_used"], cov["peak_gram_seed_valid"], cov["peak_combined_used"],
-      cov["comp_avoided_hits"], cov["gram_seed_avoided_hits"])
+      cov["comp_avoided_hits"], cov["comp_avoidable_hits"], cov["gram_seed_avoided_hits"], cov["gram_seed_avoidable_hits"])
     puts format("  Headers: %d distinct | %d/%d option features active (%s)",
       hdr["distinct_count"], hdr["features_covered_count"], hdr["features_total"],
       hdr["features"].select { |_, v| v }.keys.join(", "))
