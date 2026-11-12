@@ -592,6 +592,68 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   clang_format("#{sections.join("\n\n")}\n")
 end
 
+def build_script(input_file, crash_output: "", reason: "unknown", executable: "")
+  raw = File.binread(input_file)
+  source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
+
+  is_native_only = executable.end_with?("ijon", "native")
+  is_invariant = crash_output.include?("INVARIANT[")
+  is_arith_ub = reason == "undefined-behavior" && !crash_output.include?("arena")
+  has_long_decimal = source.scan(/[0-9][0-9_]*/n).any? { |s| s.delete("_").bytesize >= 73 }
+
+  defines = []
+  defines << "-DPM_ARENA_INITIAL_SIZE=0" unless is_native_only || is_invariant || is_arith_ub
+  defines << "-DPM_INTEGER_DIVIDE_THRESHOLD=8" if has_long_decimal || crash_output.match?(/\b(?:pm_integer|pm_bignum)_|(?:integer|bignum)\.c\b/)
+  defines << "-DPRISM_DEPTH_MAXIMUM=128" if source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep")
+  defines << "-DPRISM_BUILD_DEBUG" if crash_output.match?(/fuzz_(free|realloc)_sized/)
+
+  sanitizers = if executable.end_with?("msan") || reason == "use-of-uninitialized-value"
+                 ["-fsanitize=memory", "-fsanitize-memory-track-origins", "-fno-sanitize-recover=all"]
+               elsif executable.end_with?("lsan") || reason == "memory-leak"
+                 ["-fsanitize=leak"]
+               elsif reason == "undefined-behavior"
+                 ["-fsanitize=undefined", "-fno-sanitize-recover=undefined"]
+               else
+                 ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+               end
+
+  flag_lines = ['  -I"$REPO_ROOT/include" \\']
+  flag_lines << "  #{defines.join(' ')} \\" unless defines.empty?
+  flag_lines << "  #{sanitizers.join(' ')} \\"
+
+  <<~SH
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    REPO_ROOT="${PRISM_ROOT:-}"
+    if [ -z "$REPO_ROOT" ]; then
+      dir="$SCRIPT_DIR"
+      while [ "$dir" != "/" ]; do
+        if [ -f "$dir/include/prism.h" ] && [ -d "$dir/src" ]; then
+          REPO_ROOT="$dir"
+          break
+        fi
+        dir="$(dirname "$dir")"
+      done
+    fi
+    if [ -z "$REPO_ROOT" ]; then
+      echo "Error: could not locate Prism root (set PRISM_ROOT=/path/to/prism)" >&2
+      exit 1
+    fi
+
+    shopt -s nullglob
+    srcs=("$REPO_ROOT"/src/*.c "$REPO_ROOT"/src/*/*.c)
+
+    exec "${CC:-clang}" -O1 -fno-omit-frame-pointer -ggdb3 -std=c99 \\
+    #{flag_lines.join("\n")}
+      "${srcs[@]}" \\
+      "$SCRIPT_DIR/testcase.c" \\
+      -o "$SCRIPT_DIR/testcase" \\
+      "$@"
+  SH
+end
+
 def testcase_output_signature(testcase_output, siglines = 10)
   o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, "./test/fuzz/triage/signature.sh", stdin_data: testcase_output)
   o.strip
@@ -880,15 +942,25 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
                 else
                   "Crash: #{crash}\n#{testcase_output}"
                 end
+      effective_output = unreproducible ? "" : testcase_output
       c_testcase = c_program(
         minimized_input,
         details,
-        crash_output: unreproducible ? "" : testcase_output,
+        crash_output: effective_output,
+        reason: reason,
+        executable: executable
+      )
+      c_build = build_script(
+        minimized_input,
+        crash_output: effective_output,
         reason: reason,
         executable: executable
       )
 
       File.write(File.join(staging_dir, "testcase.c"), c_testcase)
+      build_path = File.join(staging_dir, "build.sh")
+      File.write(build_path, c_build)
+      File.chmod(0o755, build_path)
       FileUtils.cp(crash, File.join(staging_dir, File.basename(crash)))
       File.chmod(0o777 & ~File.umask, staging_dir)
 
