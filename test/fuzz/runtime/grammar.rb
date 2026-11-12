@@ -12,9 +12,58 @@ require "fileutils"
 require "securerandom"
 
 # 4-byte options header consumed by harness() in test/fuzz/harness/parse.c
+def pack_seed_header(opt_flags: 0, cmd_flags: 0, version: 3, scopes_count: 0, forwarding: 0, start_line: 1)
+  b2 = (version & 0x03) | ((scopes_count & 0x03) << 2) | ((forwarding & 0x0f) << 4)
+  [opt_flags & 0xff, cmd_flags & 0xff, b2 & 0xff, start_line & 0xff].pack("C4")
+end
+
 DEFAULT_HEADER = "\x00\x00\x03\x01".b
 ATTACH_COMMENTS_HEADER = "\x04\x00\x03\x01".b
 MAIN_SCRIPT_COMMENTS_HEADER = "\x04\x40\x03\x01".b
+FREEZE_COMMENTS_HEADER = pack_seed_header(opt_flags: 0x05)
+ENCODING_LOCKED_COMMENTS_HEADER = pack_seed_header(opt_flags: 0x0c)
+FSL_TRUE_COMMENTS_HEADER = pack_seed_header(opt_flags: 0x34)
+STREAM_COMMENTS_HEADER = pack_seed_header(opt_flags: 0x44)
+MAIN_SCRIPT_CMD_X_HEADER = pack_seed_header(opt_flags: 0x04, cmd_flags: 0x60)
+MAIN_SCRIPT_STREAM_CMD_X_HEADER = pack_seed_header(opt_flags: 0x44, cmd_flags: 0x60)
+MAIN_SCRIPT_SHEBANG_CB_HEADER = pack_seed_header(opt_flags: 0x84, cmd_flags: 0x40, start_line: 0x08)
+
+# Curated valid pm_options_t headers covering all 15 harness() option features.
+OPTION_SEED_HEADERS = [
+  pack_seed_header(opt_flags: 0x01),                                                      # freeze
+  FREEZE_COMMENTS_HEADER,                                                                 # freeze + attach_comments
+  pack_seed_header(opt_flags: 0x02),                                                      # partial_script
+  pack_seed_header(opt_flags: 0x08),                                                      # encoding_locked
+  pack_seed_header(opt_flags: 0x10),                                                      # frozen_string_literal=false
+  pack_seed_header(opt_flags: 0x30),                                                      # frozen_string_literal=true
+  FSL_TRUE_COMMENTS_HEADER,                                                               # frozen_string_literal=true + attach_comments
+  pack_seed_header(opt_flags: 0x40),                                                      # stream_mode
+  STREAM_COMMENTS_HEADER,                                                                 # stream_mode + attach_comments
+  pack_seed_header(opt_flags: 0x43, start_line: 0xfe),                                    # stream_mode + freeze + partial + start_line=-2
+  pack_seed_header(opt_flags: 0x80, start_line: 0x00),                                    # has_encoding_opts (UTF-8, filepath) + start_line=0
+  pack_seed_header(opt_flags: 0x84, start_line: 0x0c),                                    # has_encoding_opts (EUC-JP, shebang_cb) + attach_comments
+  pack_seed_header(opt_flags: 0x88, start_line: 0x03),                                    # has_encoding_opts (Windows-31J) + encoding_locked
+  pack_seed_header(opt_flags: 0x00, cmd_flags: 0x08),                                     # cmd_flags: -n
+  pack_seed_header(opt_flags: 0x00, cmd_flags: 0x1d),                                     # cmd_flags: -a -l -n -p
+  pack_seed_header(opt_flags: 0x04, cmd_flags: 0x20),                                     # cmd_flags: -x
+  MAIN_SCRIPT_COMMENTS_HEADER,                                                            # main_script + attach_comments
+  MAIN_SCRIPT_CMD_X_HEADER,                                                               # main_script + -x + attach_comments
+  pack_seed_header(opt_flags: 0x00, version: 0),                                          # Ruby 3.3
+  pack_seed_header(opt_flags: 0x00, version: 1),                                          # Ruby 3.4
+  pack_seed_header(opt_flags: 0x00, version: 2),                                          # Ruby 3.5
+  pack_seed_header(opt_flags: 0x00, scopes_count: 1, forwarding: 0x01),                   # scope forwarding *
+  pack_seed_header(opt_flags: 0x00, scopes_count: 2, forwarding: 0x06),                   # scope forwarding ** + &
+  pack_seed_header(opt_flags: 0x00, scopes_count: 2, forwarding: 0x08),                   # scope forwarding ...
+  pack_seed_header(opt_flags: 0x00, scopes_count: 3, forwarding: 0x0f),                   # 3 scopes, all forwarding
+  pack_seed_header(opt_flags: 0x80, scopes_count: 3, forwarding: 0x0f, start_line: 0x18), # has_encoding_opts + empty scope 0 + shebang_cb
+  pack_seed_header(opt_flags: 0x00, start_line: 0x00),                                    # start_line=0
+  pack_seed_header(opt_flags: 0x00, start_line: 0x7f),                                    # start_line=127
+  pack_seed_header(opt_flags: 0x00, start_line: 0x80),                                    # start_line=-128
+  pack_seed_header(opt_flags: 0x00, cmd_flags: 0x80, start_line: 0x01),                   # has_limit_opts: INT32_MAX, SIZE_MAX
+  pack_seed_header(opt_flags: 0x40, cmd_flags: 0x80, start_line: 0xa1),                   # stream_mode + has_limit_opts: INT32_MIN, budget=512
+  pack_seed_header(opt_flags: 0x00, cmd_flags: 0x80, start_line: 0xd1),                   # has_limit_opts: INT32_MAX-4, budget=4096
+  pack_seed_header(opt_flags: 0x00, cmd_flags: 0x80, start_line: 0x71)                    # has_limit_opts: line=0, budget=0
+].freeze
 MAX_INPUT_SIZE = Integer(ENV.fetch("FUZZ_MAX_INPUT_SIZE", "1024"))
 MAX_SEED_PAYLOAD_BYTES = [MAX_INPUT_SIZE - 4, 1].max
 MAX_PENDING_SEEDS = Integer(ENV.fetch("FUZZ_GRAMMAR_MAX_PENDING", "50000"))
@@ -934,7 +983,40 @@ def inject_heredocs(code, rng, parse_fn)
 end
 
 def default_seed_header(rng)
-  rng.rand < 0.5 ? ATTACH_COMMENTS_HEADER : DEFAULT_HEADER
+  r = rng.rand
+  if r < 0.35
+    DEFAULT_HEADER
+  elsif r < 0.65
+    ATTACH_COMMENTS_HEADER
+  else
+    OPTION_SEED_HEADERS.sample(random: rng)
+  end
+end
+
+def encoding_variant_header(rng)
+  case rng.rand(4)
+  when 0 then STREAM_COMMENTS_HEADER
+  when 1 then ENCODING_LOCKED_COMMENTS_HEADER
+  else ATTACH_COMMENTS_HEADER
+  end
+end
+
+def comment_variant_header(is_main_script, rng)
+  if is_main_script
+    case rng.rand(5)
+    when 0 then MAIN_SCRIPT_CMD_X_HEADER
+    when 1 then MAIN_SCRIPT_STREAM_CMD_X_HEADER
+    when 2 then MAIN_SCRIPT_SHEBANG_CB_HEADER
+    else MAIN_SCRIPT_COMMENTS_HEADER
+    end
+  else
+    case rng.rand(5)
+    when 0 then FREEZE_COMMENTS_HEADER
+    when 1 then STREAM_COMMENTS_HEADER
+    when 2 then FSL_TRUE_COMMENTS_HEADER
+    else ATTACH_COMMENTS_HEADER
+    end
+  end
 end
 
 # Expand a single evolved [code, is_valid] candidate into the exact
@@ -958,7 +1040,7 @@ def expand_candidate_variants(code, is_valid, rng, validator, parse_fn, max_payl
   if rng.rand < 0.18
     enc_code = inject_encoding_variant(code, rng)
     if enc_code.bytesize <= max_payload_bytes
-      variants << [ATTACH_COMMENTS_HEADER, enc_code, validator.call(enc_code), :encoding]
+      variants << [encoding_variant_header(rng), enc_code, validator.call(enc_code), :encoding]
     end
   end
 
@@ -966,8 +1048,7 @@ def expand_candidate_variants(code, is_valid, rng, validator, parse_fn, max_payl
   if rng.rand < 0.25
     comment_code, is_main_script = inject_comments_variant(code, rng)
     if comment_code.bytesize <= max_payload_bytes
-      hdr = is_main_script ? MAIN_SCRIPT_COMMENTS_HEADER : ATTACH_COMMENTS_HEADER
-      variants << [hdr, comment_code, validator.call(comment_code), :comments]
+      variants << [comment_variant_header(is_main_script, rng), comment_code, validator.call(comment_code), :comments]
     end
   end
 
