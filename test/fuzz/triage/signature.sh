@@ -8,6 +8,7 @@ sed -E \
   -e '/^Execution successful\.$/d' \
   -e 's#^([^ :]+/)?fuzz(\.[A-Za-z0-9_.-]+)*:#fuzz_bin:#g' \
   -e 's#(/?[^ ("'\'']+/)?build/fuzz(\.[A-Za-z0-9_.-]+)*#fuzz_bin#g' \
+  -e 's/ \[detail: .*\]$//' \
   -e 's/0x[0-9a-fA-F]+//g' \
   -e ':u' \
   -e 's/(: runtime error: .*[^A-Za-z0-9_])-?[0-9]+/\1/' \
@@ -19,4 +20,14 @@ sed -E \
   -e 's/[0-9]+ object\(s\)//g' \
   -e 's/[0-9]+ bytes//g' \
   -e 's/[0-9]+-byte//g' \
-  | awk -v n="$SIGLINES" 'NR <= n { print }' | xxh64sum - | cut -d' ' -f 1
+  | awk -v n="$SIGLINES" '
+      /^INVARIANT\[/ && !inv { inv = $0 }
+      !inv && NR <= n { lines[++c] = $0 }
+      END {
+        if (inv) {
+          print inv
+        } else {
+          for (i = 1; i <= c; i++) print lines[i]
+        }
+      }
+    ' | xxh64sum - | cut -d' ' -f 1

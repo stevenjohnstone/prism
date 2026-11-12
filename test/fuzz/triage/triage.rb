@@ -348,7 +348,7 @@ def process_crash(crash_dir, crash, executable, harness_code, semaphore, in_prog
           reason = "memory-leak"
         elsif testcase_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
           reason = "allocation-size-too-big"
-        elsif testcase_output.include?("Assertion `")
+        elsif testcase_output.include?("Assertion `") || testcase_output.include?("INVARIANT[")
           reason = "ABRT"
         end
       end
