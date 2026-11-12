@@ -722,27 +722,47 @@ def inject_encoding_variant(code, rng)
   extra.empty? ? (prefix + code.b) : (prefix + code.b + "\n".b + extra + "\n".b)
 end
 
-# Collect double-quoted StringNode and InterpolatedStringNode spans from a Prism AST.
-def collect_double_quoted_strings(root)
+# Collect double-quoted string rewrite candidates and existing heredocs from a
+# Prism AST in a single iterative walk.
+def collect_heredoc_targets(root, src)
   candidates = []
+  heredocs_by_line = Hash.new { |h, k| h[k] = [] }
+  used_tags = Set.new
   stack = [[root, false]]
+
   while (entry = stack.pop)
     node, in_concat = entry
     is_concat = node.is_a?(::Prism::InterpolatedStringNode) && node.opening_loc.nil?
-    if !in_concat &&
-       (node.is_a?(::Prism::StringNode) || node.is_a?(::Prism::InterpolatedStringNode)) &&
-       node.opening_loc && node.closing_loc &&
-       node.opening_loc.slice == '"' && node.closing_loc.slice == '"'
-      candidates << node
+
+    if node.respond_to?(:opening_loc) && node.opening_loc && node.closing_loc
+      open_slice = node.opening_loc.slice
+      if open_slice.start_with?("<<")
+        used_tags << open_slice.delete_prefix("<<").delete_prefix("-").delete_prefix("~").gsub(/\A["'`]|["'`]\z/, "")
+        close_end = node.closing_loc.end_offset
+        body_end_nl = (src.byteindex("\n", close_end) || (src.bytesize - 1)) + 1
+        heredocs_by_line[node.opening_loc.start_line] << {
+          opener_start: node.opening_loc.start_offset,
+          body_end_nl: body_end_nl
+        }
+      elsif !in_concat &&
+            (node.is_a?(::Prism::StringNode) || node.is_a?(::Prism::InterpolatedStringNode)) &&
+            open_slice == '"' && node.closing_loc.slice == '"'
+        candidates << node
+      end
     end
+
     node.child_nodes.each { |child| stack << [child, is_concat] if child }
   end
-  candidates.sort_by { |n| n.location.start_offset }
+
+  heredocs_by_line.each_value { |list| list.sort_by! { |h| h[:opener_start] } }
+  candidates.sort_by! { |n| n.location.start_offset }
+  [candidates, heredocs_by_line, used_tags]
 end
 
 # Rewrite 1..3 non-overlapping double-quoted string literals into heredocs on a
 # single pass (`<<H`, `<<-H`, `<<~H`, `<<"H"`, `<<'H'`, or `<<\`H\``), splicing
-# each heredoc body + terminator immediately after the physical line's `\n`.
+# each heredoc body + terminator immediately after the physical line's `\n` (or
+# after the closing line of any preceding heredoc opened earlier on that line).
 # Running a second pass produces nested heredocs inside `#{...}` interpolations.
 def rewrite_heredocs_pass(code, rng, parse_fn, id_offset = 0)
   src = code.b
@@ -750,7 +770,15 @@ def rewrite_heredocs_pass(code, rng, parse_fn, id_offset = 0)
   result = parse_fn.call(src)
   return nil unless result&.value
 
-  all_strings = collect_double_quoted_strings(result.value)
+  all_strings, heredocs_by_line, used_tags = collect_heredoc_targets(result.value, src)
+  return nil if all_strings.empty?
+
+  # Skip multi-line strings whose replacement would merge physical lines containing existing heredocs
+  all_strings.select! do |node|
+    s_line = node.location.start_line
+    e_line = node.location.end_line
+    s_line == e_line || ((s_line + 1)..e_line).none? { |ln| heredocs_by_line.key?(ln) }
+  end
   return nil if all_strings.empty?
 
   # Pick up to 3 disjoint string spans (preferring shuffled variety, then sorted by offset)
@@ -769,9 +797,16 @@ def rewrite_heredocs_pass(code, rng, parse_fn, id_offset = 0)
 
   inline_replacements = []
   line_insertions = Hash.new { |h, k| h[k] = +"".b }
+  next_tag_id = id_offset
 
-  chosen.each_with_index do |node, idx|
-    tag = "H#{id_offset + idx}"
+  chosen.each do |node|
+    while used_tags.include?("H#{next_tag_id}")
+      next_tag_id += 1
+    end
+    tag = "H#{next_tag_id}"
+    used_tags << tag
+    next_tag_id += 1
+
     open_start = node.location.start_offset
     close_end = node.location.end_offset
     inner = src.byteslice(node.opening_loc.end_offset...node.closing_loc.start_offset)
@@ -787,12 +822,16 @@ def rewrite_heredocs_pass(code, rng, parse_fn, id_offset = 0)
       else        ["<<'#{tag}'", "", ""]
       end
 
-    line_nl = src.byteindex("\n", close_end) || (src.bytesize - 1)
+    line_nl = (src.byteindex("\n", close_end) || (src.bytesize - 1)) + 1
+    same_line_heredocs = heredocs_by_line[node.location.start_line]
+    preceding = same_line_heredocs.select { |h| h[:opener_start] < open_start }
+    insert_pos = preceding.empty? ? line_nl : preceding.last[:body_end_nl]
+
     body_line = inner.empty? ? "" : "#{indent_body}#{inner}\n"
     heredoc_block = "#{body_line}#{indent_term}#{tag}\n".b
 
     inline_replacements << [open_start, close_end, opener.b]
-    line_insertions[line_nl + 1] << heredoc_block
+    line_insertions[insert_pos] << heredoc_block
   end
 
   # Apply inline string->opener replacements and after-newline body insertions
