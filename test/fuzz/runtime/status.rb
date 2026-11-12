@@ -105,7 +105,29 @@ rescue StandardError
   {}
 end
 
-def compute_contributions(afl_dir)
+def parse_queue_entry(fuzzer, fname)
+  raw_id = fname[/\Aid:(\d+),/, 1]
+  return :skip unless raw_id
+
+  id = raw_id.to_i.to_s
+  if fname =~ /\Aid:\d+,sync:([^,]+),src:(?:id:)?([^,+]+)/
+    peer = normalize_origin(Regexp.last_match(1))
+    src_ref = Regexp.last_match(2)
+    if peer == "grammar"
+      [:grammar_sync, id, src_ref].freeze
+    else
+      src_key = src_ref =~ /\A\d+\z/ ? src_ref.to_i.to_s : src_ref
+      [:peer_sync, id, peer, src_key].freeze
+    end
+  elsif fname =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:/
+    [:seed, id].freeze
+  else
+    srcs = (fname[/\Aid:\d+,src:([0-9+]+)/, 1]&.split("+") || []).map { |s| s.to_i.to_s }.freeze
+    [:local, id, srcs].freeze
+  end
+end
+
+def compute_contributions(afl_dir, queue_entry_cache = (@queue_entry_cache ||= {}))
   origin = Hash.new { |h, k| h[k] = {} }
   sync_items = []
   local_items = []
@@ -115,29 +137,29 @@ def compute_contributions(afl_dir)
     next if File.symlink?(qdir)
 
     fuzzer = File.basename(File.dirname(qdir))
-    entries = Dir.children(qdir).sort rescue next
-    entries.each do |f|
-      raw_id = f[/\Aid:(\d+),/, 1]
-      next unless raw_id
+    entries = Dir.children(qdir) rescue next
+    fuzzer_cache = (queue_entry_cache[fuzzer] ||= {})
+    if fuzzer_cache.size > entries.size + 1024
+      present = entries.each_with_object({}) { |fn, h| h[fn] = true }
+      fuzzer_cache.select! { |fn, _| present[fn] }
+    end
 
-      id = raw_id.to_i.to_s
-      if f =~ /\Aid:\d+,sync:([^,]+),src:(?:id:)?([^,+]+)/
-        peer = normalize_origin(Regexp.last_match(1))
-        src_ref = Regexp.last_match(2)
-        if peer == "grammar"
-          origin[fuzzer][id] = "grammar"
-          grammar_shared_srcs[src_ref] = true
-        else
-          src_key = src_ref =~ /\A\d+\z/ ? src_ref.to_i.to_s : src_ref
-          origin[fuzzer][id] = peer
-          sync_items << [fuzzer, id, peer, src_key]
-        end
-      elsif f =~ /\Aid:\d+(?:,time:\d+,execs:\d+)?,orig:/
-        origin[fuzzer][id] = :seed
-      else
-        srcs = (f[/\Aid:\d+,src:([0-9+]+)/, 1]&.split("+") || []).map { |s| s.to_i.to_s }
-        origin[fuzzer][id] = fuzzer
-        local_items << [fuzzer, id, srcs]
+    entries.each do |f|
+      parsed = (fuzzer_cache[f] ||= parse_queue_entry(fuzzer, f))
+      next if parsed == :skip
+
+      case parsed[0]
+      when :grammar_sync
+        origin[fuzzer][parsed[1]] = "grammar"
+        grammar_shared_srcs[parsed[2]] = true
+      when :peer_sync
+        origin[fuzzer][parsed[1]] = parsed[2]
+        sync_items << [fuzzer, parsed[1], parsed[2], parsed[3]]
+      when :seed
+        origin[fuzzer][parsed[1]] = :seed
+      when :local
+        origin[fuzzer][parsed[1]] = fuzzer
+        local_items << [fuzzer, parsed[1], parsed[2]]
       end
     end
   end

@@ -238,7 +238,10 @@ def parse_synced_cursors(fuzzer_dir)
     next if fname.start_with?(".") || fname.end_with?(".max")
 
     raw = File.binread(File.join(synced_dir, fname))
-    cursors[fname] = raw.bytesize >= 4 ? raw.unpack1("V") : 0
+    val = raw.bytesize >= 4 ? raw.unpack1("V") : 0
+    cursors[fname] = val
+    norm = normalize_sync_source(fname)
+    cursors[norm] = [cursors[norm].to_i, val].max
   end
   cursors
 rescue StandardError
@@ -637,9 +640,14 @@ fuzzers.each do |f|
     if intake_fuzzer.nil? || lookup_prefix(intake_fuzzer[:origins][:by_source][peer_name] || [], intake_fuzzer[:corpus_count]).zero?
       intake_fuzzer = afl_fuzzers.find { |af| af[:name] == "ijon" } || main_fuzzer
     end
-    peer_total = f[:files_created]
+    peer_total = [f[:files_created].to_i, 0].max
     imported_count = lookup_prefix(intake_fuzzer[:origins][:by_source][peer_name] || [], intake_fuzzer[:corpus_count])
-    tested_count = [peer_total, imported_count].max
+    pending = [f[:pending_files].to_i, 0].max
+    scanned = [peer_total - pending, imported_count].max
+    peer_total = [peer_total, scanned].max
+    backlog = [peer_total - scanned, 0].max
+    sync_pct = peer_total > 0 ? (scanned * 100.0 / peer_total) : 100.0
+    tested_count = [scanned, imported_count].max
     rejected_count = [tested_count - imported_count, 0].max
     yield_pct = tested_count > 0 ? (imported_count * 100.0 / tested_count) : 0.0
     peer_sync_by_name[peer_name] = {
@@ -648,15 +656,15 @@ fuzzers.each do |f|
       intake_fuzzer: intake_fuzzer,
       intake_name: intake_fuzzer[:name],
       consumer_name: intake_fuzzer[:name],
-      peer_total: tested_count,
-      watermark: tested_count,
-      cursor: tested_count,
+      peer_total: peer_total,
+      watermark: scanned,
+      cursor: scanned,
       skipped_from_main: 0,
       tested_by_main: tested_count,
       imported_by_main: imported_count,
       rejected_by_main: rejected_count,
-      unsynced_backlog: 0,
-      sync_pct: 100.0,
+      unsynced_backlog: backlog,
+      sync_pct: sync_pct,
       yield_pct: yield_pct,
       peer_from_main_cursor: 0,
       peer_from_main_pct: 0.0
@@ -664,13 +672,21 @@ fuzzers.each do |f|
     next
   end
 
-  is_foreign_queue = File.expand_path(File.dirname(f[:dir])) != expanded_afl_dir
+  is_isolated_root = File.expand_path(File.dirname(f[:dir])) != expanded_afl_dir
+  shadow_synced_path = peer_name == "ijon" ? File.join(main_fuzzer[:dir], ".synced", "ijon_peer") : nil
+  has_shadow_peer = !!(shadow_synced_path && File.file?(shadow_synced_path))
+  is_foreign_queue = is_isolated_root && !has_shadow_peer
   peer_total = f[:corpus_count]
   watermark = main_synced_cursors[peer_name] || 0
+  if has_shadow_peer
+    raw_cursor = File.binread(shadow_synced_path) rescue "".b
+    shadow_wm = raw_cursor.bytesize >= 4 ? raw_cursor.unpack1("V") : 0
+    watermark = [watermark, shadow_wm].max
+  end
   in_flight = main_max_src[peer_name] || 0
   if is_foreign_queue && in_flight > 0
-    # Foreign-synced fuzzer (-F, e.g. ijon -> main): main scanned every peer queue file
-    # whose mtime was <= the mtime of the highest imported peer item during that -F pass.
+    # Foreign-synced fuzzer (-F, legacy fallback when .synced/ijon_peer is absent):
+    # main scanned every peer queue file whose mtime was <= the mtime of the highest imported peer item.
     qdir = File.join(f[:dir], "queue")
     last_imp_prefix = format("id:%06d", in_flight - 1)
     if Dir.exist?(qdir)
@@ -688,7 +704,7 @@ fuzzers.each do |f|
   cursor = [[watermark, in_flight].max, peer_total].min
 
   # Items in peer's queue[0...cursor] that originally came from `main` (sync:main) are skipped by `main` without running
-  skipped_from_main = is_foreign_queue ? 0 : lookup_prefix(f[:origins][:by_source][main_name] || [], cursor)
+  skipped_from_main = is_isolated_root ? 0 : lookup_prefix(f[:origins][:by_source][main_name] || [], cursor)
   tested_by_main = [cursor - skipped_from_main, 0].max
   imported_by_main = lookup_prefix(main_by_source[peer_name] || [], main_fuzzer[:corpus_count])
   rejected_by_main = [tested_by_main - imported_by_main, 0].max
@@ -704,7 +720,7 @@ fuzzers.each do |f|
 
   peer_sync_by_name[peer_name] = {
     is_generator: false,
-    sync_mode: is_foreign_queue ? :foreign_queue : :peer,
+    sync_mode: has_shadow_peer ? :shadow_peer : (is_foreign_queue ? :foreign_queue : :peer),
     consumer_name: main_name,
     peer_total: peer_total,
     watermark: watermark,
@@ -732,12 +748,20 @@ peer_sync_rows_html = fuzzers.reject { |f| f[:name] == main_name }.map do |f|
   tip = case ps[:sync_mode]
         when :foreign_seeds
           "#{f[:name]} → #{consumer} (-F foreign seeds, created: #{format_int(ps[:peer_total])}) — " \
-          "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
+          "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
           "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
-          "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])}"
+          "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])} | " \
+          "Pending backlog: #{format_int(ps[:unsynced_backlog])}"
         when :foreign_queue
           "#{f[:name]} → #{consumer} (-F foreign queue: #{format_int(ps[:peer_total])}) — " \
           "Scanned (mtime watermark): #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
+          "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
+          "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
+          "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])} | " \
+          "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
+        when :shadow_peer
+          "#{f[:name]} → #{consumer} (#{consumer}/.synced/ijon_peer, queue: #{format_int(ps[:peer_total])}) — " \
+          "Cursor: #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
           "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
           "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \
           "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])} | " \
@@ -751,7 +775,7 @@ peer_sync_rows_html = fuzzers.reject { |f| f[:name] == main_name }.map do |f|
           "Skipped (sync:#{consumer}): #{format_int(ps[:skipped_from_main])} | " \
           "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
         end
-  route_suffix = ps[:sync_mode] == :peer ? "" : " (-F)"
+  route_suffix = (ps[:sync_mode] == :foreign_seeds || ps[:sync_mode] == :foreign_queue) ? " (-F)" : ""
   <<~HTML
     <div class="sync-row" title="#{CGI.escapeHTML(tip)}" onclick="selectTab('#{CGI.escapeHTML(f[:name])}')">
       <div class="sync-peer">
@@ -853,7 +877,7 @@ def decode_fuzz_header(raw)
   flags << "partial" if (b0 & 2) != 0
   flags << "comments" if (b0 & 4) != 0
   flags << "enc_lock" if (b0 & 8) != 0
-  flags << "frozen_lit" if (b0 & 16) != 0 && (b0 & 32) != 0
+  flags << ((b0 & 32) != 0 ? "frozen_lit=true" : "frozen_lit=false") if (b0 & 16) != 0
   cmd = []
   cmd << "-a" if (b1 & 0x01) != 0
   cmd << "-e" if (b1 & 0x02) != 0
@@ -1277,7 +1301,7 @@ def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix
                  end
 
     <<~ROW
-      <tr class="clickable-row lineage-row" data-lineage-Prefix="#{id_prefix}" data-lineage-tags="#{row_tags.join(' ')}" onclick="toggleHunkDrawer('#{drawer_id}')">
+      <tr class="clickable-row lineage-row" data-lineage-prefix="#{id_prefix}" data-lineage-tags="#{row_tags.join(' ')}" onclick="toggleHunkDrawer('#{drawer_id}')">
         <td>
           <span id="caret-#{drawer_id}" class="muted" style="display:inline-block;width:14px;">&#9656;</span>
           #{render_pathway_pills(p[:hops], color_by_name)}
@@ -1315,13 +1339,13 @@ def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix
                         <button class="cov-btn" onclick="filterLineageRows('#{id_prefix}', 'all', this)">All Pathways (#{pathways.size})</button>
                         <button class="cov-btn cov-btn-secondary" onclick="filterLineageRows('#{id_prefix}', 'grammar', this)">&#9733; Grammar Rooted</button>
                         <button class="cov-btn cov-btn-secondary" onclick="filterLineageRows('#{id_prefix}', 'multihop', this)">Multi-Fuzzer Hops (&ge;2)</button>
-                        <button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, '#{id_prefix}-drawer-')">Expand All Evolution Chains</button>
+                        <button class="cov-btn cov-btn-secondary" data-expand-label="Expand All Evolution Chains" data-collapse-label="Collapse All Evolution Chains" onclick="toggleAllHunks(this, '#{id_prefix}-drawer-')">Expand All Evolution Chains</button>
                       </div>
                     CTRL
                   else
                     <<~CTRL
                       <div>
-                        <button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, '#{id_prefix}-drawer-')">Expand All Evolution Chains</button>
+                        <button class="cov-btn cov-btn-secondary" data-expand-label="Expand All Evolution Chains" data-collapse-label="Collapse All Evolution Chains" onclick="toggleAllHunks(this, '#{id_prefix}-drawer-')">Expand All Evolution Chains</button>
                       </div>
                     CTRL
                   end
@@ -1466,7 +1490,7 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
           </p>
         </div>
         <div>
-          <button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, 'gram-seed-crash-')">Expand All Seed Crash Chains</button>
+          <button class="cov-btn cov-btn-secondary" data-expand-label="Expand All Seed Crash Chains" data-collapse-label="Collapse All Seed Crash Chains" onclick="toggleAllHunks(this, 'gram-seed-crash-')">Expand All Seed Crash Chains</button>
         </div>
       </div>
       <div style="padding: 12px 16px; border-bottom: 1px solid var(--panel-border);">
@@ -1744,6 +1768,7 @@ def render_worker_cov_files_table(origin_cov, color)
   files = origin_cov["files"] || []
   return "" if files.empty?
   origin_name = origin_cov["name"].to_s
+  safe_origin_id = origin_name.gsub(/[^a-zA-Z0-9_-]/, "_")
 
   # Sort files with exclusive coverage first, then by gain vs corpus, then by filename
   sorted_files = files.sort_by do |f|
@@ -1769,7 +1794,7 @@ def render_worker_cov_files_table(origin_cov, color)
     ex_b = f.dig("exclusive", "branches", "covered").to_i
     ex_r = f.dig("exclusive", "regions", "covered").to_i
     hunks = f["exclusive_hunks"] || []
-    drawer_id = "w-hunk-#{origin_name.gsub(/[^a-zA-Z0-9_-]/, '_')}-#{idx}"
+    drawer_id = "w-hunk-#{safe_origin_id}-#{idx}"
 
     vc_str = if vc_l > 0 || vc_b > 0
                "<span class=\"cov-gain\">+#{format_int(vc_l)}L / +#{format_int(vc_b)}B</span>"
@@ -1822,7 +1847,7 @@ def render_worker_cov_files_table(origin_cov, color)
     ROW
   end.compact.join("\n")
 
-  toggle_all_btn = has_any_hunks ? %(<button class="cov-btn cov-btn-secondary" onclick="toggleAllHunks(this, '#{CGI.escapeHTML(origin_name)}')">Collapse Exclusive Code Hunks</button>) : ""
+  toggle_all_btn = has_any_hunks ? %(<button class="cov-btn cov-btn-secondary" data-expand-label="Expand Exclusive Code Hunks" data-collapse-label="Collapse Exclusive Code Hunks" onclick="toggleAllHunks(this, 'w-hunk-#{safe_origin_id}-')">Collapse Exclusive Code Hunks</button>) : ""
   report_link = origin_cov["report_rel_path"] ? %(<a class="cov-btn" href="#{CGI.escapeHTML(origin_cov['report_rel_path'])}" target="_blank" rel="noopener">Open #{CGI.escapeHTML(origin_name)} llvm-cov HTML &nearr;</a>) : ""
 
   <<~HTML
@@ -2317,7 +2342,7 @@ if combined_cov
             <p class="chart-sub">Combined coverage per source file alongside initial corpus baseline, grammar generator coverage, and workers holding exclusive lines/branches (click any exclusive pill or row to inspect exact C source code)</p>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="cov-btn" onclick="toggleAllHunks(this, 'covfile-hunks-')">Expand All Exclusive Hunks</button>
+            <button class="cov-btn" data-expand-label="Expand All Exclusive Hunks" data-collapse-label="Collapse All Exclusive Hunks" onclick="toggleAllHunks(this, 'cov-file-hunks-')">Expand All Exclusive Hunks</button>
             <a class="cov-btn" href="#{CGI.escapeHTML(combined_cov["report_rel_path"].to_s)}" target="_blank" rel="noopener">Browse Annotated Source (HTML) &nearr;</a>
           </div>
         </div>
@@ -2668,7 +2693,7 @@ fuzzers.each do |f|
           <div class="kpi-sub"> Peak RSS: #{f[:stats]['peak_rss_mb'] || '-'} MB</div>
         </div>
         #{if (ps = peer_sync_by_name[f[:name]])
-            if ps[:sync_mode] == :foreign_queue
+            if ps[:sync_mode] == :foreign_queue || ps[:sync_mode] == :shadow_peer
               upstream_gen_entry = peer_sync_by_name.find { |_gn, gps| gps[:is_generator] && gps[:consumer_name] == f[:name] }
               intake_kpi = if upstream_gen_entry
                              gen_name, gen_ps = upstream_gen_entry
@@ -2688,11 +2713,13 @@ fuzzers.each do |f|
                                </div>
                              INTAKE_KPI
                            end
+              sync_to_label = ps[:sync_mode] == :shadow_peer ? "Sync to #{CGI.escapeHTML(main_name)}" : "Foreign Sync to #{CGI.escapeHTML(main_name)} (-F)"
+              cursor_word = ps[:sync_mode] == :shadow_peer ? "cursor" : "scanned"
               <<~SYNC_KPI
                 <div class="kpi-card">
-                  <div class="kpi-label">Foreign Sync to #{CGI.escapeHTML(main_name)} (-F)</div>
+                  <div class="kpi-label">#{sync_to_label}</div>
                   <div class="kpi-value">+#{format_int(ps[:imported_by_main])} <span class="muted">(#{format("%.1f%%", ps[:yield_pct])})</span></div>
-                  <div class="kpi-sub">#{format_int(ps[:tested_by_main])} tested &bull; scanned #{format_int(ps[:cursor])}/#{format_int(ps[:peer_total])} (#{format("%.0f%%", ps[:sync_pct])})</div>
+                  <div class="kpi-sub">#{format_int(ps[:tested_by_main])} tested &bull; #{cursor_word} #{format_int(ps[:cursor])}/#{format_int(ps[:peer_total])} (#{format("%.0f%%", ps[:sync_pct])})</div>
                 </div>
                 #{intake_kpi}
               SYNC_KPI
@@ -3880,7 +3907,9 @@ html = <<~HTML
           if (caret) caret.innerHTML = anyHidden ? '&#9662;' : '&#9656;';
         });
         if (btn) {
-          btn.textContent = anyHidden ? 'Collapse All Exclusive Hunks' : 'Expand All Exclusive Hunks';
+          const collapseLabel = (btn.dataset && btn.dataset.collapseLabel) || 'Collapse All Exclusive Hunks';
+          const expandLabel = (btn.dataset && btn.dataset.expandLabel) || 'Expand All Exclusive Hunks';
+          btn.textContent = anyHidden ? collapseLabel : expandLabel;
         }
       }
 
