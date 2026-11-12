@@ -644,7 +644,7 @@ class PrismComposer < Lrama::Fuzz::Ruby::Composer
   end
 end
 
-MAGIC_COMMENT_PREAMBLES = [
+VALID_MAGIC_COMMENT_PREAMBLES = [
   "# frozen_string_literal: true\n",
   "# frozen_string_literal: false\n",
   "# frozen_string_literal: invalid_bool\n",
@@ -661,65 +661,126 @@ MAGIC_COMMENT_PREAMBLES = [
   "# -*- unclosed emacs marker: true\n",
   "# vim: set fileencoding=utf-8 :\n",
   "# custom header coding = utf-8\n",
-  "# custom header coding: unknown_encoding_xyz\n",
   "#!/usr/bin/env ruby\n# coding: utf-8\n",
   "#!/usr/bin/env ruby\r\n# frozen_string_literal: true\n",
   "#!/bin/sh\necho wrapper\n#!/usr/bin/env ruby\n# warn_indent: true\n"
 ].freeze
 
-COMMENT_SUFFIXES = [
+ERROR_MAGIC_COMMENT_PREAMBLES = [
+  "# custom header coding: unknown_encoding_xyz\n"
+].freeze
+
+VALID_COMMENT_SUFFIXES = [
   "\n# trailing comment with newline\n",
   "\n# trailing EOF comment without newline",
   "\n# frozen_string_literal: true\n",
   "\n_scv = 1 # shareable_constant_value: literal\n",
   "\n=begin\nembedded doc line 1\n=endnot_end_yet\n=end\n",
   "\n=begin label\nembedded doc with trailing =end text\n=end extra info\n",
-  "\n=begin\nembedded doc at EOF without newline\n=end",
+  "\n=begin\nembedded doc at EOF without newline\n=end"
+].freeze
+
+ERROR_COMMENT_SUFFIXES = [
   "\n=begin\nunterminated embdoc for error recovery\n",
   "\n=begin"
 ].freeze
 
+ENCODING_PROFILES = {
+  "euc-jp" => [
+    "/abc\xA4\xA2/e".b,
+    "/(?#\xA4\xA2\\)ok)[\xA4\xA2]/e".b,
+    "/\\p{Alpha}\\p{Hiragana}/e".b,
+    "".b
+  ].freeze,
+  "windows-31j" => [
+    "/abc\x82\xA0/s".b,
+    "/(?#\x82\xA0\\)ok)[\x82\xA0]/s".b,
+    "/\\p{Alpha}\\p{Hiragana}/s".b,
+    "".b
+  ].freeze,
+  "utf-8" => [
+    "/abc\xE3\x81\x82/u".b,
+    "/(?#\xE3\x81\x82\\)ok)[\xE3\x81\x82]/u".b,
+    "/\\p{Hiragana}\\p{Lu}/u".b,
+    "/\\u{3042}\\xE3\\x81\\x82/u".b,
+    "".b
+  ].freeze,
+  "ascii-8bit" => [
+    "/abc\xFF/n".b,
+    "/(?#\xFF\\)ok)[\xFF]/n".b,
+    "/\\p{Alpha}\\M-a\\xFE/n".b,
+    "".b
+  ].freeze,
+  "iso-8859-1" => [
+    "/abc\xE9/".b,
+    "/\\p{Alpha}/".b,
+    "".b
+  ].freeze,
+  "us-ascii" => [
+    "/\\p{ASCII}\\C-a\\cb/".b,
+    "/[[:alpha:]]+/".b,
+    "".b
+  ].freeze
+}.freeze
+
+def code_requires_utf8?(raw_code)
+  return true unless raw_code.ascii_only?
+
+  raw_code.scan(/\\u(?:([0-9a-fA-F]{4})|\{([^}]+)\})/).any? do |single, braced|
+    tokens = braced ? braced.split : [single]
+    tokens.any? { |hex| hex.to_i(16) > 0x7f }
+  end
+end
+
 # Prepend magic/shebang comments and append inline/embdoc/EOF comments.
+# Keeps ~90% valid comment combinations while preserving ~10% error recovery.
 # Returns [mutated_code, main_script_flag].
 def inject_comments_variant(code, rng)
-  preamble = MAGIC_COMMENT_PREAMBLES.sample(random: rng)
-  suffix = COMMENT_SUFFIXES.sample(random: rng)
+  raw = code.b
+  preamble = if rng.rand < 0.05
+               ERROR_MAGIC_COMMENT_PREAMBLES.sample(random: rng)
+             elsif code_requires_utf8?(raw)
+               VALID_MAGIC_COMMENT_PREAMBLES.reject { |p| p.include?("ascii-8bit") }.sample(random: rng)
+             else
+               VALID_MAGIC_COMMENT_PREAMBLES.sample(random: rng)
+             end
+  suffix = if rng.rand < 0.05
+             ERROR_COMMENT_SUFFIXES.sample(random: rng)
+           else
+             VALID_COMMENT_SUFFIXES.sample(random: rng)
+           end
   has_shebang = preamble.start_with?("#!")
-  out = preamble.b + code.b + suffix.b
+  out = preamble.b + raw + suffix.b
   [out, has_shebang]
 end
 
 # Emit an encoding / multibyte regexp variant to exercise parser->encoding_changed
 # paths in src/regexp.c (US-ASCII, ASCII-8BIT, EUC-JP, Windows-31J, ISO-8859-1, UTF-8).
+# Matches the payload/regexp modifiers to the source encoding ~90% of the time and
+# reserves ~10% for intentional tier/encoding/syntax error recovery cases.
 def inject_encoding_variant(code, rng)
-  enc = MAGIC_ENCODINGS.sample(random: rng)
-  extra = case rng.rand(6)
-          when 0
-            # Valid EUC-JP / SJIS / UTF-8 / single-byte raw multibyte (with ASCII prefix) under /n, /e, /s, /u
-            mod = %w[n e s u].sample(random: rng)
-            raw_seq = ["abc\xA4\xA2".b, "abc\x82\xA0".b, "abc\xE3\x81\x82".b, "abc\xFF".b].sample(random: rng)
-            "/#{raw_seq}/#{mod}".b
-          when 1
-            # Multibyte inline comment `(?#...)` slow path + invalid multibyte inside `[...]`
-            raw_seq = ["\xA4\xA2\\)ok".b, "\xFF".b].sample(random: rng)
-            "/(?##{raw_seq})[#{raw_seq}]/".b
-          when 2
-            # Property escape tier mismatches (/n rejects Script+Unicode; /e,/s reject Unicode-only)
-            prop = %w[\p{Hiragana} \p{Lu} \p{Alpha} \p{^Katakana}].sample(random: rng)
-            mod = %w[n e s u].sample(random: rng)
-            "/#{prop}/#{mod}".b
-          when 3
-            # Unicode & hex escapes (mixed and standalone) across encoding modifiers
-            seq = ['\u{3042}', '\u{3042}\x80', '\x80\u{3042}', '\xE3\x81\x82', '\x82\xA0', '\xFE'].sample(random: rng)
-            mod = ["", "n", "e", "s", "u"].sample(random: rng)
-            "/#{seq}/#{mod}".b
-          when 4
-            "/#{REGEXP_ERROR_FRAGMENTS.sample(random: rng)}/".b
-          else
-            "".b
-          end
+  raw = code.b
+  if rng.rand < 0.10
+    enc = MAGIC_ENCODINGS.sample(random: rng)
+    extra = case rng.rand(3)
+            when 0
+              prop = %w[\p{Hiragana} \p{Lu} \p{^Katakana}].sample(random: rng)
+              mod = %w[n e s].sample(random: rng)
+              "/#{prop}/#{mod}".b
+            when 1
+              seq = ['\u{3042}\x80', '\x80\u{3042}', '\xFE'].sample(random: rng)
+              mod = ["", "u"].sample(random: rng)
+              "/#{seq}/#{mod}".b
+            else
+              "/#{REGEXP_ERROR_FRAGMENTS.sample(random: rng)}/".b
+            end
+  else
+    enc = code_requires_utf8?(raw) ? "utf-8" : MAGIC_ENCODINGS.sample(random: rng)
+    extra = ENCODING_PROFILES.fetch(enc).sample(random: rng)
+  end
+
   prefix = "# encoding: #{enc}\n".b
-  extra.empty? ? (prefix + code.b) : (prefix + code.b + "\n".b + extra + "\n".b)
+  extra.empty? ? (prefix + raw) : (prefix + raw + "\n".b + extra + "\n".b)
 end
 
 # Collect double-quoted string rewrite candidates and existing heredocs from a
