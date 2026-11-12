@@ -87,10 +87,24 @@ def encode_loupe_scope_local(bytes)
   end
 end
 
-def build_prism_loupe_url(raw)
+def sanitizer_loupe_crash?(reason, crash_output)
+  return false if crash_output.include?("INVARIANT[") || crash_output.include?("Assertion `")
+  return true if reason == "undefined-behavior"
+  return true if crash_output.match?(/SUMMARY: (?:Address|UndefinedBehavior)Sanitizer:/)
+  return true if crash_output.match?(/:\d+:\d+: runtime error: |fuzz_(?:free|realloc)_sized/)
+
+  %w[
+    heap-buffer-overflow stack-buffer-overflow global-buffer-overflow
+    heap-use-after-free stack-use-after-return stack-use-after-scope
+    attempting-double-free bad-free alloc-dealloc-mismatch SEGV
+  ].include?(reason)
+end
+
+def build_prism_loupe_url(raw, sanitize: false)
   return nil if raw.nil? || raw.empty?
   if raw.bytesize < 4
-    return "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(raw))}"
+    san_part = sanitize ? "&san=1" : ""
+    return "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(raw))}#{san_part}"
   end
 
   b0, b1, b2, b3 = raw.bytes[0, 4]
@@ -99,6 +113,7 @@ def build_prism_loupe_url(raw)
   has_limit_opts = (b1 & 0x80) != 0
 
   params = [["code", Base64.strict_encode64(source)]]
+  params << ["san", "1"] if sanitize
   params << ["enc", ENCODINGS[b3 & 0x07]] if has_encoding_opts
   params << ["ruby_ver", VERSIONS[b2 & 0x03]]
 
@@ -344,7 +359,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   padded_raw = raw.bytesize >= 4 ? raw : (raw + ("\x00".b * (4 - raw.bytesize)))
   b0, b1, b2, b3 = padded_raw.bytes[0, 4]
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
-  loupe_url = build_prism_loupe_url(padded_raw)
+  loupe_url = build_prism_loupe_url(padded_raw, sanitize: sanitizer_loupe_crash?(reason, crash_output))
 
   freeze = (b0 & 0x01) != 0
   partial_script = (b0 & 0x02) != 0
