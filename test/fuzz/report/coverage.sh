@@ -275,6 +275,7 @@ ruby -rdigest -rjson -rfileutils -e '
     rd_flags = File::RDONLY | (defined?(File::NOATIME) ? File::NOATIME : 0)
     pending_paths = Dir.children(live_seeds_dir)
       .reject { |f| f.start_with?(".") }
+      .sort
       .first(5000)
       .map { |f| File.join(live_seeds_dir, f) }
     pending_paths.each_with_index do |full, idx|
@@ -493,12 +494,33 @@ llvm-cov report ./build/fuzz.coverage \
   | tee "$SUMMARY_FILE"
 
 # Assemble tmp/fuzz/coverage/coverage.json for plot.rb and external tooling
-ruby -rjson -rtime -e '
+ruby -retc -rjson -rtime -e '
   work_dir, origins_meta_path, out_json_path, lcov_path, coverage_dir, profdata_path, ignore_regex = ARGV
   origins_meta = JSON.parse(File.read(origins_meta_path))
   combined_raw = JSON.parse(File.read(File.join(work_dir, "combined.json"))).dig("data", 0) || {}
 
   METRICS = %w[lines functions instantiations regions branches].freeze
+  C_KEYWORDS = %w[if for while switch return sizeof].freeze
+  C_RETURN_TYPE_LINE_RE = /\A(?:static|inline|extern|const|struct|enum|union|PRISM_\w+|[a-zA-Z_]\w*)[\w\s\*]*\z/
+
+  def run_parallel_map(items, max_workers = [Etc.nprocessors, 1].max)
+    return [] if items.empty?
+    return items.map { |item| yield(item) } if items.size == 1 || max_workers <= 1
+
+    results = Array.new(items.size)
+    queue = Queue.new
+    items.each_with_index { |item, idx| queue << [item, idx] }
+    workers = [max_workers, items.size].min.times.map do
+      Thread.new do
+        while (pair = queue.pop(true) rescue nil)
+          item, idx = pair
+          results[idx] = yield(item)
+        end
+      end
+    end
+    workers.each(&:join)
+    results
+  end
 
   def parse_lcov(path)
     lines = Hash.new { |h, k| h[k] = {} }
@@ -526,12 +548,22 @@ ruby -rjson -rtime -e '
     SOURCE_CACHE[fname] ||= File.exist?(fname) ? File.readlines(fname, chomp: true) : []
   end
 
-  def export_profile_branches(profdata_file, ignore_regex)
+  def export_profile_branches(profdata_file, ignore_regex, only_files = nil)
     return nil unless profdata_file && File.exist?(profdata_file)
-    raw = IO.popen(
-      ["llvm-cov", "export", "./build/fuzz.coverage", "-instr-profile=#{profdata_file}", "--skip-functions", "--ignore-filename-regex=#{ignore_regex}"],
-      &:read
-    )
+    return {} if only_files && only_files.empty?
+
+    cmd = [
+      "llvm-cov", "export", "./build/fuzz.coverage",
+      "-instr-profile=#{profdata_file}",
+      "--skip-functions",
+      "--ignore-filename-regex=#{ignore_regex}"
+    ]
+    if only_files && only_files.any?
+      cmd << "--path-equivalence=.,#{Dir.pwd}"
+      cmd << "--sources"
+      cmd.concat(only_files)
+    end
+    raw = IO.popen(cmd, &:read)
     return nil if raw.to_s.empty?
     data = JSON.parse(raw)
     res = {}
@@ -647,9 +679,12 @@ ruby -rjson -rtime -e '
     idx = [line_no - 1, src_lines.size - 1].min
     idx.downto(0) do |i|
       ln = src_lines[i].to_s
-      if ln =~ /\A(?:static\s+|inline\s+|extern\s+|const\s+|struct\s+|\w+\s+\*?\s*)*([a-zA-Z_]\w*)\s*\([^;]*\z/ &&
-         !%w[if for while switch return sizeof].include?($1)
-        return $1
+      if ln =~ /\A(?:static\s+|inline\s+|extern\s+|const\s+|struct\s+|enum\s+|union\s+|\w+\s+\**\s*)+([a-zA-Z_]\w*)\s*\([^;]*\z/
+        fn = $1
+        return fn unless C_KEYWORDS.include?(fn)
+      elsif i > 0 && ln =~ /\A([a-zA-Z_]\w*)\s*\([^;]*\z/
+        fn = $1
+        return fn if !C_KEYWORDS.include?(fn) && src_lines[i - 1].to_s.strip =~ C_RETURN_TYPE_LINE_RE
       elsif i > 0 && ln.start_with?("{") && src_lines[i - 1].to_s =~ /\A([a-zA-Z_]\w*)\s*\(/
         return $1
       end
@@ -839,7 +874,6 @@ ruby -rjson -rtime -e '
   end
 
   comb_da, comb_brda = parse_lcov(lcov_path)
-  comb_full_branches = nil
   combined_totals = extract_summary(combined_raw["totals"])
   combined_files = extract_files_map(combined_raw)
 
@@ -848,7 +882,7 @@ ruby -rjson -rtime -e '
   corpus_totals = corpus_raw ? extract_summary(corpus_raw["totals"]) : nil
   corpus_files = corpus_raw ? extract_files_map(corpus_raw) : {}
 
-  origins_out = origins_meta.map do |meta|
+  prepared_origins = origins_meta.map do |meta|
     name = meta["name"]
     o_work = File.join(work_dir, "origins", name)
     st_path = File.join(o_work, "standalone.json")
@@ -857,39 +891,89 @@ ruby -rjson -rtime -e '
     wo_lcov_path = File.join(o_work, "without.lcov")
     wo_pf_path = File.join(o_work, "without.profdata")
 
-    if File.exist?(st_path)
-      st_raw = JSON.parse(File.read(st_path)).dig("data", 0) || {}
-      st_totals = extract_summary(st_raw["totals"])
-      st_files = extract_files_map(st_raw)
+    next { meta: meta, present: false } unless File.exist?(st_path)
 
-      wc_raw = File.exist?(wc_path) ? (JSON.parse(File.read(wc_path)).dig("data", 0) || {}) : nil
-      wc_totals = wc_raw ? extract_summary(wc_raw["totals"]) : nil
-      wc_files = wc_raw ? extract_files_map(wc_raw) : {}
+    st_raw = JSON.parse(File.read(st_path)).dig("data", 0) || {}
+    st_totals = extract_summary(st_raw["totals"])
+    st_files = extract_files_map(st_raw)
 
-      wo_raw = File.exist?(wo_path) ? (JSON.parse(File.read(wo_path)).dig("data", 0) || {}) : nil
-      wo_totals = wo_raw ? extract_summary(wo_raw["totals"]) : nil
-      wo_files = wo_raw ? extract_files_map(wo_raw) : {}
+    wc_raw = File.exist?(wc_path) ? (JSON.parse(File.read(wc_path)).dig("data", 0) || {}) : nil
+    wc_totals = wc_raw ? extract_summary(wc_raw["totals"]) : nil
+    wc_files = wc_raw ? extract_files_map(wc_raw) : {}
+
+    wo_raw = File.exist?(wo_path) ? (JSON.parse(File.read(wo_path)).dig("data", 0) || {}) : nil
+    wo_totals = wo_raw ? extract_summary(wo_raw["totals"]) : nil
+    wo_files = wo_raw ? extract_files_map(wo_raw) : {}
+
+    vs_corpus = if name == "corpus"
+                  {}
+                elsif wc_totals && corpus_totals
+                  diff_summaries(wc_totals, corpus_totals)
+                else
+                  {}
+                end
+
+    exclusive = if wo_totals
+                  diff_summaries(combined_totals, wo_totals)
+                else
+                  diff_summaries(combined_totals, {})
+                end
+
+    excl_branch_files = if exclusive.dig("branches", "covered").to_i > 0 && File.exist?(wo_pf_path)
+                          st_files.keys.sort.select do |fname|
+                            f_comb = combined_files[fname] || st_files[fname]
+                            f_wo = wo_files[fname]
+                            f_wo && diff_summaries(f_comb, f_wo).dig("branches", "covered").to_i > 0
+                          end
+                        else
+                          []
+                        end
+
+    {
+      meta: meta,
+      present: true,
+      name: name,
+      st_totals: st_totals,
+      st_files: st_files,
+      wc_files: wc_files,
+      wo_files: wo_files,
+      wo_lcov_path: wo_lcov_path,
+      wo_pf_path: wo_pf_path,
+      vs_corpus: vs_corpus,
+      exclusive: exclusive,
+      excl_branch_files: excl_branch_files
+    }
+  end
+
+  branch_jobs = []
+  union_excl_branch_files = prepared_origins.select { |o| o[:present] }.flat_map { |o| o[:excl_branch_files] }.uniq.sort
+  if union_excl_branch_files.any?
+    branch_jobs << [:combined, profdata_path, union_excl_branch_files]
+    prepared_origins.each do |o|
+      next unless o[:present] && o[:excl_branch_files].any?
+      branch_jobs << [o[:name], o[:wo_pf_path], o[:excl_branch_files]]
+    end
+  end
+
+  branch_exports = {}
+  run_parallel_map(branch_jobs) { |key, pf, files| [key, export_profile_branches(pf, ignore_regex, files)] }.each do |key, res|
+    branch_exports[key] = res
+  end
+  comb_full_branches = branch_exports[:combined]
+
+  origins_out = prepared_origins.map do |o|
+    meta = o[:meta]
+    if o[:present]
+      name = o[:name]
+      st_totals = o[:st_totals]
+      st_files = o[:st_files]
+      wc_files = o[:wc_files]
+      wo_files = o[:wo_files]
+      wo_lcov_path = o[:wo_lcov_path]
+      vs_corpus = o[:vs_corpus]
+      exclusive = o[:exclusive]
       wo_da, wo_brda = parse_lcov(wo_lcov_path)
-
-      vs_corpus = if name == "corpus"
-                    {}
-                  elsif wc_totals && corpus_totals
-                    diff_summaries(wc_totals, corpus_totals)
-                  else
-                    {}
-                  end
-
-      exclusive = if wo_totals
-                    diff_summaries(combined_totals, wo_totals)
-                  else
-                    diff_summaries(combined_totals, {})
-                  end
-
-      wo_full_branches = nil
-      if exclusive.dig("branches", "covered").to_i > 0 && File.exist?(wo_pf_path)
-        comb_full_branches ||= export_profile_branches(profdata_path, ignore_regex)
-        wo_full_branches = export_profile_branches(wo_pf_path, ignore_regex) if comb_full_branches
-      end
+      wo_full_branches = comb_full_branches ? branch_exports[name] : nil
 
       per_file = st_files.keys.sort.map do |fname|
         f_st = st_files[fname]

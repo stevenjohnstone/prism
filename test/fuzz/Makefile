@@ -151,7 +151,7 @@ define FUZZ_RUN_COVERAGE
 	if [ -n "$$(docker ps -q -f name="^/$(FUZZ_CONTAINER_NAME)$$" 2>/dev/null)" ]; then \
 		mkdir -p $(FUZZ_DIR); \
 		LIVE_SEEDS_TAR="tmp/fuzz/.live-seeds.$$$$.tar"; \
-		docker exec $(FUZZ_CONTAINER_NAME) bash -c 'test -d /tmp/afl-tmpdir/grammar/seeds && find /tmp/afl-tmpdir/grammar/seeds -maxdepth 1 -type f ! -name ".*" -printf "%f\0" | head -z -n 5000 | tar --atime-preserve=system --ignore-failed-read --warning=no-file-changed --warning=no-file-removed -C /tmp/afl-tmpdir/grammar/seeds --null -T - -cf -' > "$$LIVE_SEEDS_TAR" 2>/dev/null || { rm -f "$$LIVE_SEEDS_TAR"; LIVE_SEEDS_TAR=""; }; \
+		docker exec $(FUZZ_CONTAINER_NAME) bash -c 'test -d /tmp/afl-tmpdir/grammar/seeds && find /tmp/afl-tmpdir/grammar/seeds -maxdepth 1 -type f ! -name ".*" -printf "%f\0" | sort -z | head -z -n 5000 | tar --atime-preserve=system --ignore-failed-read --warning=no-file-changed --warning=no-file-removed -C /tmp/afl-tmpdir/grammar/seeds --null -T - -cf -' > "$$LIVE_SEEDS_TAR" 2>/dev/null || { rm -f "$$LIVE_SEEDS_TAR"; LIVE_SEEDS_TAR=""; }; \
 	fi; \
 	docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_FLAGS)" -e FUZZ_LIVE_SEEDS_TAR="$$LIVE_SEEDS_TAR" -v $(CURDIR):/prism prism/fuzz ./test/fuzz/report/coverage.sh \
 )
