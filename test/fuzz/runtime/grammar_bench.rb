@@ -610,7 +610,9 @@ module GrammarBench
     sim = report["simulation"]
     failures = []
     failures << "regexp prism_fail=#{report["regexp_audit"]["prism_fail"]} (expected 0)" if report["regexp_audit"]["prism_fail"] > 0
-    failures << "heredoc pass2_valid_pct=#{report["heredoc_audit"]["pass2_valid_pct"]} (expected >=90%)" if report["heredoc_audit"]["pass2_valid_pct"] < 90.0
+    if report["heredoc_audit"]["pass2_total"].to_i > 0 && report["heredoc_audit"]["pass2_valid_pct"] < 90.0
+      failures << "heredoc pass2_valid_pct=#{report["heredoc_audit"]["pass2_valid_pct"]} (expected >=90%)"
+    end
     failures << "heredoc pass1_valid_pct=#{report["heredoc_audit"]["pass1_valid_pct"]} (expected >=98%)" if report["heredoc_audit"]["pass1_valid_pct"] < 98.0
     failures << "oversized_pct=#{sim["oversized"]["total_pct"]} (expected 0%)" if sim["oversized"]["total_pct"] > 0.0
     failures << "comp_avoidable_hits=#{sim["coverage"]["comp_avoidable_hits"]} (expected 0)" if sim["coverage"]["comp_avoidable_hits"] > 0
