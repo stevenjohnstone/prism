@@ -28,6 +28,10 @@ SANITIZER_ENV = {
 FileUtils.mkdir_p(TESTCASES_PROCESSED_DIR)
 
 VERSIONS = ["3.3", "3.4", "3.5", "4.1"].freeze
+ENCODINGS = ["UTF-8", "ASCII-8BIT", "US-ASCII", "Windows-31J", "EUC-JP", "UTF-8-MAC", "ISO-8859-1", "Shift_JIS"].freeze
+EXTREME_LINES = [2_147_483_647, 2_147_483_643, -2_147_483_648, 0].freeze
+STACK_BUDGETS = ["SIZE_MAX", "0", "512", "4096"].freeze
+SCOPE_BASE_LOCALS = [["a", "foo"], ["b", "it"], ["c", "_1"]].freeze
 
 COMMAND_LINE_FLAGS = [
   [0x01, "PM_OPTIONS_COMMAND_LINE_A"],
@@ -38,11 +42,27 @@ COMMAND_LINE_FLAGS = [
   [0x20, "PM_OPTIONS_COMMAND_LINE_X"]
 ].freeze
 
+COMMAND_LINE_CHARS = [
+  [0x01, "a"],
+  [0x02, "e"],
+  [0x04, "l"],
+  [0x08, "n"],
+  [0x10, "p"],
+  [0x20, "x"]
+].freeze
+
 FORWARDING_FLAGS = [
   [0x01, "PM_OPTIONS_SCOPE_FORWARDING_POSITIONALS"],
   [0x02, "PM_OPTIONS_SCOPE_FORWARDING_KEYWORDS"],
   [0x04, "PM_OPTIONS_SCOPE_FORWARDING_BLOCK"],
   [0x08, "PM_OPTIONS_SCOPE_FORWARDING_ALL"]
+].freeze
+
+FORWARDING_CHARS = [
+  [0x01, "p"],
+  [0x02, "k"],
+  [0x04, "b"],
+  [0x08, "a"]
 ].freeze
 
 def escape_c_comment(text)
@@ -88,10 +108,84 @@ def c_fuzz_options(input_file)
   C
 end
 
+def encode_loupe_scope_local(bytes)
+  if bytes.match?(/\A[A-Za-z0-9_]+\z/n)
+    bytes
+  else
+    "~#{Base64.urlsafe_encode64(bytes, padding: false)}"
+  end
+end
+
+def build_prism_loupe_url(raw)
+  return nil if raw.nil? || raw.empty?
+  if raw.bytesize < 4
+    return "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(raw))}"
+  end
+
+  b0, b1, b2, b3 = raw.bytes[0, 4]
+  source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
+  has_encoding_opts = (b0 & 0x80) != 0
+  has_limit_opts = (b1 & 0x80) != 0
+
+  params = [["code", Base64.strict_encode64(source)]]
+  params << ["enc", ENCODINGS[b3 & 0x07]] if has_encoding_opts
+  params << ["ruby_ver", VERSIONS[b2 & 0x03]]
+
+  start_line = has_limit_opts ? EXTREME_LINES[(b3 >> 4) & 0x03] : [b3].pack("C").unpack1("c")
+  params << ["line", start_line.to_s] if start_line != 1
+
+  cmd = COMMAND_LINE_CHARS.filter_map { |bit, ch| ch if (b1 & bit) != 0 }.join
+  params << ["cmd", cmd] unless cmd.empty?
+
+  params << ["main", "1"] if (b1 & 0x40) != 0
+  params << ["partial", "1"] if (b0 & 0x02) != 0
+  params << ["freeze", "1"] if (b0 & 0x01) != 0
+  params << ["comments", "1"] if (b0 & 0x04) != 0
+  params << ["enc_lock", "1"] if (b0 & 0x08) != 0
+  params << ["frozen_lit", (b0 & 0x20) != 0 ? "1" : "0"] if (b0 & 0x10) != 0
+  params << ["stream", "1"] if (b0 & 0x40) != 0
+
+  if has_encoding_opts
+    params << ["filepath", "fuzz.rb"]
+    params << ["shebang_cb", "1"] if (b3 & 0x08) != 0
+  end
+
+  if has_limit_opts
+    budget = STACK_BUDGETS[(b3 >> 6) & 0x03]
+    params << ["budget", budget] unless budget == "SIZE_MAX"
+  end
+
+  scopes_count = (b2 >> 2) & 0x03
+  if scopes_count > 0
+    fwd_bits = (b2 >> 4) & 0x0f
+    fwd_chars = FORWARDING_CHARS.filter_map { |bit, ch| ch if (fwd_bits & bit) != 0 }.join
+    forwarding_scope = has_encoding_opts ? (b3 % scopes_count) : (scopes_count - 1)
+
+    scope_segments = (0...scopes_count).map do |i|
+      locals_count = (i == 0 && source.bytesize > 0) ? 3 : 2
+      locals_count = 0 if i == 0 && has_encoding_opts && (b3 & 0x10) != 0
+      locals = (0...[2, locals_count].min).map { |j| SCOPE_BASE_LOCALS[i][j].b }
+      locals << source.byteslice(0, [source.bytesize, 4].min) if locals_count == 3
+      encoded_locals = locals.map { |loc| encode_loupe_scope_local(loc) }
+      fwd = (i == forwarding_scope) ? fwd_chars : ""
+      if encoded_locals.empty?
+        fwd.empty? ? ":" : "#{fwd}:"
+      else
+        fwd.empty? ? encoded_locals.join(",") : "#{fwd}:#{encoded_locals.join(",")}"
+      end
+    end
+    params << ["scopes", scope_segments.join(";")]
+  end
+
+  query = params.map { |k, v| "#{k}=#{CGI.escape(v)}" }.join("&")
+  "#{PRISM_LOUPE_BASE_URL}?#{query}"
+end
+
 def c_array(input_file)
   raw = File.binread(input_file)
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
-  loupe_url = "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(source))}"
+  padded_raw = raw.bytesize >= 4 ? raw : (raw + ("\x00".b * (4 - raw.bytesize)))
+  loupe_url = build_prism_loupe_url(padded_raw)
   bytes = source.bytes.map { |c| format("0x%02x", c) }.join(",")
   bytes = "0x00" if bytes.empty?
   <<~C.chomp

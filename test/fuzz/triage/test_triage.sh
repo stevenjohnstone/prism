@@ -164,11 +164,26 @@ harness_code = File.read("test/fuzz/harness/parse.c")
 
 nonempty_in = File.join(workdir, "repro_nonempty.bin")
 empty_in = File.join(workdir, "repro_empty.bin")
+enc_oob_in = File.join(workdir, "repro_enc_oob.bin")
 File.binwrite(nonempty_in, "\x2a\x05\x1b\xff1 + 2\n".b)
 File.binwrite(empty_in, "\x00\x00\x03\x01".b)
+File.binwrite(enc_oob_in, "\xa3\xc5\x28\x31/\\M".b)
 
-File.write(File.join(workdir, "tc_nonempty.c"), c_program(nonempty_in, harness_code, "test */ nonempty"))
-File.write(File.join(workdir, "tc_empty.c"), c_program(empty_in, harness_code, "test empty"))
+tc_nonempty_c = c_program(nonempty_in, harness_code, "test */ nonempty")
+tc_empty_c = c_program(empty_in, harness_code, "test empty")
+tc_enc_oob_c = c_program(enc_oob_in, harness_code, "test enc oob")
+
+expected_nonempty_url = "https://stevenjohnstone.github.io/prism-loupe/?code=MSArIDIK&ruby_ver=4.1&line=-1&cmd=al&partial=1&enc_lock=1&scopes=a%2Cfoo%2C~MSArIA%3Bp%3Ab%2Cit"
+raise "unexpected Loupe URL in tc_nonempty.c:\n#{tc_nonempty_c}" unless tc_nonempty_c.include?("Prism Loupe: #{expected_nonempty_url}")
+
+expected_empty_url = "https://stevenjohnstone.github.io/prism-loupe/?code=&ruby_ver=4.1"
+raise "unexpected Loupe URL in tc_empty.c:\n#{tc_empty_c}" unless tc_empty_c.include?("Prism Loupe: #{expected_empty_url}")
+
+expected_enc_oob_url = "https://stevenjohnstone.github.io/prism-loupe/?code=L1xN&enc=ASCII-8BIT&ruby_ver=3.3&line=0&cmd=al&main=1&partial=1&freeze=1&filepath=fuzz.rb&scopes=%3A%3Bk%3Ab%2Cit"
+raise "unexpected Loupe URL in tc_enc_oob.c:\n#{tc_enc_oob_c}" unless tc_enc_oob_c.include?("Prism Loupe: #{expected_enc_oob_url}")
+
+File.write(File.join(workdir, "tc_nonempty.c"), tc_nonempty_c)
+File.write(File.join(workdir, "tc_empty.c"), tc_empty_c)
 EOF
 
 awk '/#define _GNU_SOURCE/ { found=1; exit } /^#include/ { exit 1 } END { exit !found }' "$WORKDIR/tc_nonempty.c" \

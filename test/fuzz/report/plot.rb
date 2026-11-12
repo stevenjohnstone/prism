@@ -848,6 +848,9 @@ FUZZ_OPT_VERSIONS = ["3.3", "3.4", "3.5", "4.1"].freeze
 FUZZ_OPT_ENCODINGS = ["UTF-8", "ASCII-8BIT", "US-ASCII", "Windows-31J", "EUC-JP", "UTF-8-MAC", "ISO-8859-1", "Shift_JIS"].freeze
 FUZZ_OPT_EXTREME_LINES = [2_147_483_647, 2_147_483_643, -2_147_483_648, 0].freeze
 FUZZ_OPT_STACK_BUDGETS = ["SIZE_MAX", "0", "512", "4096"].freeze
+FUZZ_OPT_SCOPE_BASE_LOCALS = [["a", "foo"], ["b", "it"], ["c", "_1"]].freeze
+FUZZ_OPT_CMD_CHARS = [[0x01, "a"], [0x02, "e"], [0x04, "l"], [0x08, "n"], [0x10, "p"], [0x20, "x"]].freeze
+FUZZ_OPT_FWD_CHARS = [[0x01, "p"], [0x02, "k"], [0x04, "b"], [0x08, "a"]].freeze
 
 def decode_fuzz_header(raw)
   return nil if raw.nil? || raw.bytesize < 4
@@ -890,11 +893,77 @@ def decode_fuzz_header(raw)
   flags.join(", ")
 end
 
-def build_prism_loupe_url(ruby_bytes)
-  return nil if ruby_bytes.nil? || ruby_bytes.empty?
+def encode_loupe_scope_local(bytes)
+  if bytes.match?(/\A[A-Za-z0-9_]+\z/n)
+    bytes
+  else
+    "~#{Base64.urlsafe_encode64(bytes, padding: false)}"
+  end
+end
 
-  b64 = Base64.strict_encode64(ruby_bytes)
-  "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(b64)}"
+def build_prism_loupe_url(raw)
+  return nil if raw.nil? || raw.empty?
+  if raw.bytesize < 4
+    return "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(raw))}"
+  end
+
+  b0, b1, b2, b3 = raw.bytes[0, 4]
+  source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
+  has_encoding_opts = (b0 & 0x80) != 0
+  has_limit_opts = (b1 & 0x80) != 0
+
+  params = [["code", Base64.strict_encode64(source)]]
+  params << ["enc", FUZZ_OPT_ENCODINGS[b3 & 0x07]] if has_encoding_opts
+  params << ["ruby_ver", FUZZ_OPT_VERSIONS[b2 & 0x03]]
+
+  start_line = has_limit_opts ? FUZZ_OPT_EXTREME_LINES[(b3 >> 4) & 0x03] : [b3].pack("C").unpack1("c")
+  params << ["line", start_line.to_s] if start_line != 1
+
+  cmd = FUZZ_OPT_CMD_CHARS.filter_map { |bit, ch| ch if (b1 & bit) != 0 }.join
+  params << ["cmd", cmd] unless cmd.empty?
+
+  params << ["main", "1"] if (b1 & 0x40) != 0
+  params << ["partial", "1"] if (b0 & 0x02) != 0
+  params << ["freeze", "1"] if (b0 & 0x01) != 0
+  params << ["comments", "1"] if (b0 & 0x04) != 0
+  params << ["enc_lock", "1"] if (b0 & 0x08) != 0
+  params << ["frozen_lit", (b0 & 0x20) != 0 ? "1" : "0"] if (b0 & 0x10) != 0
+  params << ["stream", "1"] if (b0 & 0x40) != 0
+
+  if has_encoding_opts
+    params << ["filepath", "fuzz.rb"]
+    params << ["shebang_cb", "1"] if (b3 & 0x08) != 0
+  end
+
+  if has_limit_opts
+    budget = FUZZ_OPT_STACK_BUDGETS[(b3 >> 6) & 0x03]
+    params << ["budget", budget] unless budget == "SIZE_MAX"
+  end
+
+  scopes_count = (b2 >> 2) & 0x03
+  if scopes_count > 0
+    fwd_bits = (b2 >> 4) & 0x0f
+    fwd_chars = FUZZ_OPT_FWD_CHARS.filter_map { |bit, ch| ch if (fwd_bits & bit) != 0 }.join
+    forwarding_scope = has_encoding_opts ? (b3 % scopes_count) : (scopes_count - 1)
+
+    scope_segments = (0...scopes_count).map do |i|
+      locals_count = (i == 0 && source.bytesize > 0) ? 3 : 2
+      locals_count = 0 if i == 0 && has_encoding_opts && (b3 & 0x10) != 0
+      locals = (0...[2, locals_count].min).map { |j| FUZZ_OPT_SCOPE_BASE_LOCALS[i][j].b }
+      locals << source.byteslice(0, [source.bytesize, 4].min) if locals_count == 3
+      encoded_locals = locals.map { |loc| encode_loupe_scope_local(loc) }
+      fwd = (i == forwarding_scope) ? fwd_chars : ""
+      if encoded_locals.empty?
+        fwd.empty? ? ":" : "#{fwd}:"
+      else
+        fwd.empty? ? encoded_locals.join(",") : "#{fwd}:#{encoded_locals.join(",")}"
+      end
+    end
+    params << ["scopes", scope_segments.join(";")]
+  end
+
+  query = params.map { |k, v| "#{k}=#{CGI.escape(v)}" }.join("&")
+  "#{PRISM_LOUPE_BASE_URL}?#{query}"
 end
 
 def parse_testcase_file(path, max_preview_bytes = 512)
@@ -903,7 +972,7 @@ def parse_testcase_file(path, max_preview_bytes = 512)
   raw = File.binread(path) || "".b
   opts_desc = decode_fuzz_header(raw)
   ruby_bytes = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
-  loupe_url = build_prism_loupe_url(ruby_bytes)
+  loupe_url = build_prism_loupe_url(raw)
 
   slice = ruby_bytes.bytesize > max_preview_bytes ? ruby_bytes.byteslice(0, max_preview_bytes) : ruby_bytes
   formatted = slice.bytes.map do |b|
@@ -1244,10 +1313,10 @@ def render_evolution_chain_steps(chain, color_by_name)
                else
                  "evo-step"
                end
-    opts_badge = s[:opts_desc] ? %(<span class="sched-pill" title="4-byte fuzz_options_t header (stripped for Prism Loupe)">opts: #{CGI.escapeHTML(s[:opts_desc])}</span>) : ""
+    opts_badge = s[:opts_desc] ? %(<span class="sched-pill" title="4-byte fuzz_options_t header (decoded into pm_options_t query params for Prism Loupe)">opts: #{CGI.escapeHTML(s[:opts_desc])}</span>) : ""
     size_badge = s[:size] ? %(<span class="evo-size">#{format_int(s[:size])} B</span>) : ""
     loupe_btn = if s[:loupe_url]
-                  %(<a class="cov-link" href="#{CGI.escapeHTML(s[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate this step's Ruby parse in Prism Loupe (4-byte fuzz header stripped)">Animate in Prism Loupe &nearr;</a>)
+                  %(<a class="cov-link" href="#{CGI.escapeHTML(s[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate this step's Ruby parse in Prism Loupe with its exact pm_options_t">Animate in Prism Loupe &nearr;</a>)
                 else
                   ""
                 end
