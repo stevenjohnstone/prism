@@ -15,6 +15,8 @@ require "securerandom"
 DEFAULT_HEADER = "\x00\x00\x03\x01".b
 ATTACH_COMMENTS_HEADER = "\x04\x00\x03\x01".b
 MAIN_SCRIPT_COMMENTS_HEADER = "\x04\x40\x03\x01".b
+MAX_INPUT_SIZE = Integer(ENV.fetch("FUZZ_MAX_INPUT_SIZE", "1024"))
+MAX_SEED_PAYLOAD_BYTES = [MAX_INPUT_SIZE - 4, 1].max
 MAX_PENDING_SEEDS = Integer(ENV.fetch("FUZZ_GRAMMAR_MAX_PENDING", "50000"))
 MAX_SEEN_DIGESTS = 500_000
 PRUNE_INTERVAL_SEC = 10.0
@@ -183,18 +185,19 @@ NUMERIC_ERROR_FRAGMENTS = %w[
   1__2 1_ 1.2.3 1.2e 1.2e+ 1.2e1_ 1.2e__1
 ].freeze
 
-# Pre-built large bignum & long-mantissa float literals exercising:
+# Pre-built large bignum & long-mantissa float literals sized within MAX_SEED_PAYLOAD_BYTES
+# while exercising (with -DPM_INTEGER_DIVIDE_THRESHOLD=8 in test/fuzz/Makefile):
 # - pm_integer_string_divide (> 48 binary words, including zero low-split words and
 #   18x18 decimal-word schoolbook column overflow PM_BIGNUM_DECIMAL_PRODUCTS)
-# - pm_integer_parse_decimal_divide (> 224 chunks = 2,016 digits)
-# - Binary & decimal Karatsuba in src/bignum.c (balanced, unbalanced left >= 2*right,
-#   left < right swap, and multi-word ripple carry / borrow)
+# - pm_integer_parse_decimal_divide (> 8 chunks = 72 digits; Karatsuba >= 24 words)
+# - Binary & decimal Karatsuba in src/bignum.c (balanced, unbalanced splits, and
+#   zero middle words / multi-word carry)
 # - pm_double_exact truncation past PM_DOUBLE_DIGITS (768 digits)
 LARGE_BIGNUM_LITERALS = [
   "0x1" + ("89abcdef" * 52),
   "0x1" + ("0" * 256) + ("fedcba98" * 32) + ("0" * 256),
-  ("987654321" * 115) + ("999999999" * 116),
-  ("999999999" * 152) + ("000000000" * 80) + ("123456789" * 74)
+  ("987654321" * 18) + ("999999999" * 19),
+  ("999999999" * 34) + ("000000000" * 18) + ("123456789" * 18)
 ].freeze
 
 LONG_FLOAT_LITERAL = ("0." + ("123456789" * 87) + "e10").freeze
@@ -405,7 +408,9 @@ def build_guarded_evaluators(in_flight_io)
 
     if result.success?
       node_count = count_prism_nodes(result.value)
-      1.0 + Math.log(node_count + 1) * 0.1
+      score = 1.0 + Math.log(node_count + 1) * 0.1
+      # Preserve `>= 1.0` validity signal while penalizing bloat past AFL++'s seed size cap.
+      code.bytesize > MAX_SEED_PAYLOAD_BYTES ? [1.0, score * (MAX_SEED_PAYLOAD_BYTES.to_f / code.bytesize)].max : score
     else
       error_count = result.errors.size
       [0.0, 0.5 - error_count * 0.05].max
@@ -933,15 +938,18 @@ def default_seed_header(rng)
 end
 
 # Expand a single evolved [code, is_valid] candidate into the exact
-# [header, payload, valid, variant_kind] tuples emitted to the seed queue.
-def expand_candidate_variants(code, is_valid, rng, validator, parse_fn)
+# [header, payload, valid, variant_kind] tuples emitted to the seed queue,
+# skipping variants that would exceed AFL++'s max_length payload budget.
+def expand_candidate_variants(code, is_valid, rng, validator, parse_fn, max_payload_bytes: MAX_SEED_PAYLOAD_BYTES)
+  return [] if code.bytesize > max_payload_bytes
+
   variants = [[default_seed_header(rng), code, is_valid, :raw]]
 
   # Rewrite double-quoted strings into heredocs (including multi-heredoc lines
   # and nested heredocs in interpolation) on ~35% of string-bearing candidates.
   if code.include?('"') && rng.rand < 0.35
     heredoc_code = inject_heredocs(code, rng, parse_fn)
-    if heredoc_code
+    if heredoc_code && heredoc_code.bytesize <= max_payload_bytes
       variants << [default_seed_header(rng), heredoc_code, validator.call(heredoc_code), :heredoc]
     end
   end
@@ -949,14 +957,18 @@ def expand_candidate_variants(code, is_valid, rng, validator, parse_fn)
   # Emit magic `# encoding:` + multibyte/modifier regexp variants on ~18% of candidates.
   if rng.rand < 0.18
     enc_code = inject_encoding_variant(code, rng)
-    variants << [ATTACH_COMMENTS_HEADER, enc_code, validator.call(enc_code), :encoding]
+    if enc_code.bytesize <= max_payload_bytes
+      variants << [ATTACH_COMMENTS_HEADER, enc_code, validator.call(enc_code), :encoding]
+    end
   end
 
   # Emit magic/shebang/embdoc/inline comment variants with attach_comments enabled on ~25% of candidates.
   if rng.rand < 0.25
     comment_code, is_main_script = inject_comments_variant(code, rng)
-    hdr = is_main_script ? MAIN_SCRIPT_COMMENTS_HEADER : ATTACH_COMMENTS_HEADER
-    variants << [hdr, comment_code, validator.call(comment_code), :comments]
+    if comment_code.bytesize <= max_payload_bytes
+      hdr = is_main_script ? MAIN_SCRIPT_COMMENTS_HEADER : ATTACH_COMMENTS_HEADER
+      variants << [hdr, comment_code, validator.call(comment_code), :comments]
+    end
   end
 
   variants
@@ -1021,7 +1033,7 @@ def build_evolvers(grammar, rng, fitness, validator)
     fitness: fitness,
     classifier: classifier,
     avoid_symbols: avoid,
-    max_depth: rng.rand(8..14),
+    max_depth: rng.rand(7..10),
     population_size: POPULATION_SIZE,
     genome_length: 220,
     mutation_rate: 0.05 + rng.rand * 0.10,

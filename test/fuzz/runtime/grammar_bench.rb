@@ -459,7 +459,8 @@ module GrammarBench
               raw_sizes[:gram] << code.bytesize
             end
 
-            expand_candidate_variants(code, is_valid, rng, validator, parse_fn).each do |hdr, payload, valid, kind|
+            payload_cap = [opts[:max_input_size] - 4, 1].max
+            expand_candidate_variants(code, is_valid, rng, validator, parse_fn, max_payload_bytes: payload_cap).each do |hdr, payload, valid, kind|
               payload_b = payload.b
               attempts += 1
               distinct_headers << hdr
