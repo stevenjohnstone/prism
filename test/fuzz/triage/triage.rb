@@ -7,6 +7,7 @@ require "digest"
 require "fileutils"
 require "open3"
 require "set"
+require "tempfile"
 require "tmpdir"
 
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
@@ -820,8 +821,17 @@ def minimize(crash, reason, minimized_input, executable, sig_lines)
   puts "#{crash} minimized #{pre_min_size} => #{post_min_size}"
 end
 
+def normalize_ijon_crash_bytes(raw)
+  return nil unless raw.bytesize >= 4 && (raw.getbyte(0) & 0x40) != 0
+
+  out = raw.b.dup
+  out.setbyte(0, out.getbyte(0) & ~0x40)
+  out
+end
+
 def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels)
-  crash_hash = Digest::SHA2.hexdigest(File.binread(crash))
+  raw_crash = File.binread(crash)
+  crash_hash = Digest::SHA2.hexdigest(raw_crash)
   sentinel = File.join(TESTCASES_PROCESSED_DIR, crash_hash)
 
   claimed = semaphore.synchronize do
@@ -829,12 +839,25 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
   end
   return unless claimed
 
+  normalized_crash_file = nil
   begin
+    crash_input = crash
+    if executable.end_with?("ijon")
+      normalized_bytes = normalize_ijon_crash_bytes(raw_crash)
+      if normalized_bytes
+        normalized_crash_file = Tempfile.new(["ijon-crash-", ".bin"])
+        normalized_crash_file.binmode
+        normalized_crash_file.write(normalized_bytes)
+        normalized_crash_file.close
+        crash_input = normalized_crash_file.path
+      end
+    end
+
     reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
     timed_out = false
 
     if reason == "hang"
-      testcase_output, crashed, timed_out = run_testcase(executable, crash)
+      testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
       if !crashed && !timed_out
         puts "Skipping #{crash} (transient timeout)"
         semaphore.synchronize { FileUtils.touch(sentinel) }
@@ -847,15 +870,15 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
       # they deduplicate with main; next try ./build/fuzz.lsan for memory leaks;
       # finally fall back to executable for cumulative allocation limit assertions
       # in PRISM_XALLOCATOR.
-      testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash)
+      testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
       if crashed
         executable = "./build/fuzz"
       else
-        testcase_output, crashed, timed_out = run_testcase("./build/fuzz.lsan", crash)
+        testcase_output, crashed, timed_out = run_testcase("./build/fuzz.lsan", crash_input)
         if crashed
           executable = "./build/fuzz.lsan"
         else
-          testcase_output, crashed, timed_out = run_testcase(executable, crash)
+          testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
         end
       end
     elsif executable.end_with?("msan")
@@ -864,14 +887,14 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
       # classification, minimization, and deduplication against main/grammar;
       # otherwise fall back to MSAN for read issues (uninitialized or out-of-bounds
       # reads, since ./build/fuzz has ASAN read instrumentation disabled).
-      testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash)
+      testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
       if crashed
         executable = "./build/fuzz"
       else
-        testcase_output, crashed, timed_out = run_testcase(executable, crash)
+        testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
       end
     else
-      testcase_output, crashed, timed_out = run_testcase(executable, crash)
+      testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
     end
 
     unreproducible = !crashed && !(reason == "hang" && timed_out)
@@ -943,9 +966,9 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
       minimized_input = File.join(staging_dir, "input.min")
 
       if ENV["TRIAGE_MINIMIZE"] == "0" || unreproducible
-        FileUtils.cp(crash, minimized_input)
+        FileUtils.cp(crash_input, minimized_input)
       else
-        minimize(crash, reason, minimized_input, executable, sig_lines)
+        minimize(crash_input, reason, minimized_input, executable, sig_lines)
         if reason != "hang"
           min_output, min_crashed, = run_testcase(executable, minimized_input)
           testcase_output = min_output if min_crashed
@@ -994,6 +1017,7 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
     end
     puts "#{crash} complete => #{target_directory}"
   ensure
+    normalized_crash_file&.close!
     semaphore.synchronize { in_progress.delete(crash_hash) }
   end
 end

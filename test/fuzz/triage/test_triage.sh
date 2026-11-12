@@ -331,6 +331,9 @@ bignum_build = build_script(
 )
 raise "bignum/native build.sh unexpected flags:\n#{bignum_build}" unless bignum_build.include?("-DPM_INTEGER_DIVIDE_THRESHOLD=8") && bignum_build.include?("-DPRISM_DEPTH_MAXIMUM=128") && bignum_build.include?("-DPRISM_BUILD_DEBUG") && !bignum_build.include?("-DPM_ARENA_INITIAL_SIZE=0")
 
+raise "expected nil when stream bit unset" unless normalize_ijon_crash_bytes("\x2a\x11\x22\x33abc".b).nil?
+raise "expected stream bit cleared" unless normalize_ijon_crash_bytes("\x6a\x11\x22\x33abc".b) == "\x2a\x11\x22\x33abc".b
+
 repro_dir = File.join(workdir, "standalone_repro")
 FileUtils.mkdir_p(repro_dir)
 File.write(File.join(repro_dir, "testcase.c"), tc_min_oob_c)

@@ -31,6 +31,7 @@ typedef struct {
     uint8_t aux_byte;
 } fuzz_options_t;
 
+#if !defined(PRISM_FUZZ_IJON) || defined(SLOW)
 typedef struct {
     const uint8_t *data;
     size_t size;
@@ -62,6 +63,7 @@ static char *fuzz_stream_fgets(char *buf, int n, void *vp) {
 static int fuzz_stream_feof(void *vp) {
     return ((const fuzz_stream_t *) vp)->eof ? 1 : 0;
 }
+#endif
 
 static void fuzz_shebang_cb(pm_options_t *options, const uint8_t *source, size_t length, void *shebang_data) {
     (void) options;
@@ -476,11 +478,14 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
     }
 
     pm_arena_t *arena = pm_arena_new();
+#ifndef PRISM_FUZZ_IJON
     pm_source_t *stream_src = NULL;
+#endif
     pm_parser_t *parser = NULL;
     pm_node_t *node = NULL;
     size_t parsed_size = size;
 
+#ifndef PRISM_FUZZ_IJON
     if (opts->stream_mode) {
         fuzz_stream_t stream_state = {
             .data = source_buf,
@@ -498,7 +503,9 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
                 size
             );
         }
-    } else {
+    } else
+#endif
+    {
         parser = pm_parser_new(arena, source_buf, size, options);
 #ifdef PRISM_FUZZ_IJON
         fuzz_ijon_state_t ijon_state = { 0 };
@@ -687,9 +694,11 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 #endif
 
     pm_parser_free(parser);
+#ifndef PRISM_FUZZ_IJON
     if (stream_src != NULL) {
         pm_source_free(stream_src);
     }
+#endif
     pm_arena_free(arena);
     pm_options_free(options);
     free(source);
@@ -719,7 +728,11 @@ __attribute__((noinline)) void harness(const uint8_t *input, size_t size) {
         .frozen_string_literal = (opt_flags & 32) != 0,
         .scopes_count = (input[2] >> 2) & 0x03,
         .forwarding = (input[2] >> 4) & 0x0f,
+#ifdef PRISM_FUZZ_IJON
+        .stream_mode = false,
+#else
         .stream_mode = (opt_flags & 0x40) != 0,
+#endif
         .has_encoding_opts = (opt_flags & 0x80) != 0,
         .has_limit_opts = (input[1] & 0x80) != 0,
         .aux_byte = input[3],
