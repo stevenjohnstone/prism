@@ -5,11 +5,13 @@
 # 2. halfempty.sh + halfempty_compare.sh minimization, strict 4-byte options
 #    header preservation, crash-signature drift rejection, empty-stderr SIGSEGV
 #    safety, non-crashing input rejection, and 0-byte Ruby body handling.
-# 3. triage.rb standalone C reproducer generation (#define _GNU_SOURCE ordering,
-#    explicit input_size for non-empty and 4-byte inputs) compiled under strict
-#    C99 (-Wall -Wextra -Wstrict-prototypes -Werror) with ASAN+UBSAN.
-# 4. Concurrent triage.rb deduplication, in-flight minimization coalescing,
-#    transient hang / sig:09 filtering, and atomic staging + .processed sentinels.
+# 3. triage.rb standalone <prism.h> C reproducer synthesis (no harness noise,
+#    public headers only via -Iinclude, active options & targeted checks only)
+#    compiled under strict C99 (-Wall -Wextra -Wconversion -Wstrict-prototypes -Werror)
+#    with ASAN+UBSAN.
+# 4. Concurrent triage.rb deduplication, 4-byte options header minimization,
+#    in-flight minimization coalescing, transient hang / sig:09 filtering, and
+#    atomic staging + .processed sentinels.
 
 set -euo pipefail
 
@@ -218,24 +220,46 @@ ruby -e '
 ' "$WORKDIR/inv.in" "$WORKDIR/inv.min"
 echo "  halfempty.sh header preservation, drift protection, INVARIANT symmetry breaking, SIGSEGV, and 4-byte checks passed"
 
-echo "[3/4] Checking triage.rb standalone C reproducer generation and strict C99 build..."
+echo "[3/4] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
 ruby - "$WORKDIR" << 'EOF'
 workdir = ARGV.fetch(0)
 code = File.read("test/fuzz/triage/triage.rb")
-defs = code.split(/^harness_code = /).first
+defs = code.split(/^pool = /).first
 eval(defs)
-harness_code = File.read("test/fuzz/harness/parse.c")
 
 nonempty_in = File.join(workdir, "repro_nonempty.bin")
 empty_in = File.join(workdir, "repro_empty.bin")
 enc_oob_in = File.join(workdir, "repro_enc_oob.bin")
+min_oob_in = File.join(workdir, "repro_min_oob.bin")
+stream_slow_in = File.join(workdir, "repro_stream_slow.bin")
+node_loc_in = File.join(workdir, "repro_node_loc.bin")
+
 File.binwrite(nonempty_in, "\x2a\x05\x1b\xff1 + 2\n".b)
 File.binwrite(empty_in, "\x00\x00\x03\x01".b)
 File.binwrite(enc_oob_in, "\xa3\xc5\x28\x31/\\M".b)
+File.binwrite(min_oob_in, "\x80\x00\x03\x01/\\M".b)
+File.binwrite(stream_slow_in, "\xc8\x80\x00\xa91 + 2\n".b)
+File.binwrite(node_loc_in, "\x00\x00\x03\x011 + 2\n".b)
 
-tc_nonempty_c = c_program(nonempty_in, harness_code, "test */ nonempty")
-tc_empty_c = c_program(empty_in, harness_code, "test empty")
-tc_enc_oob_c = c_program(enc_oob_in, harness_code, "test enc oob")
+tc_nonempty_c = c_program(nonempty_in, "test */ nonempty")
+tc_empty_c = c_program(empty_in, "test empty")
+tc_enc_oob_c = c_program(enc_oob_in, "test enc oob")
+tc_min_oob_c = c_program(
+  min_oob_in,
+  "test min oob",
+  crash_output: "INVARIANT[diagnostic]: list=error type=escape_invalid_meta kind=end_oob [detail: level=0 start=1 length=3 parsed_size=3]\n"
+)
+tc_stream_slow_c = c_program(
+  stream_slow_in,
+  "test stream slow",
+  crash_output: "    #0 0x1234 in pm_prettyprint /prism/src/prettyprint.c:10:5\n",
+  executable: "./build/fuzz.msan"
+)
+tc_node_loc_c = c_program(
+  node_loc_in,
+  "test node loc",
+  crash_output: "INVARIANT[node_location]: type=PM_CALL_NODE kind=end_oob\n"
+)
 
 expected_nonempty_url = "https://stevenjohnstone.github.io/prism-loupe/?code=MSArIDIK&ruby_ver=4.1&line=-1&cmd=al&partial=1&enc_lock=1&scopes=a%2Cfoo%2C~MSArIA%3Bp%3Ab%2Cit"
 raise "unexpected Loupe URL in tc_nonempty.c:\n#{tc_nonempty_c}" unless tc_nonempty_c.include?("Prism Loupe: #{expected_nonempty_url}")
@@ -246,25 +270,52 @@ raise "unexpected Loupe URL in tc_empty.c:\n#{tc_empty_c}" unless tc_empty_c.inc
 expected_enc_oob_url = "https://stevenjohnstone.github.io/prism-loupe/?code=L1xN&enc=ASCII-8BIT&ruby_ver=3.3&line=0&cmd=al&main=1&partial=1&freeze=1&filepath=fuzz.rb&scopes=%3A%3Bk%3Ab%2Cit"
 raise "unexpected Loupe URL in tc_enc_oob.c:\n#{tc_enc_oob_c}" unless tc_enc_oob_c.include?("Prism Loupe: #{expected_enc_oob_url}")
 
+[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c].each do |src|
+  %w[harness( harness_parse fuzz_options_t PRISM_FUZZ_IJON prism/internal/ #ifdef\ SLOW].each do |forbidden|
+    raise "forbidden harness noise #{forbidden.inspect} found in:\n#{src}" if src.include?(forbidden)
+  end
+end
+
+raise "expected NULL options in tc_empty.c:\n#{tc_empty_c}" unless tc_empty_c.include?("pm_parser_new(arena, source_buf, input_size, NULL)")
+raise "expected <= 35 lines in tc_empty.c, got #{tc_empty_c.lines.size}:\n#{tc_empty_c}" unless tc_empty_c.lines.size <= 35
+raise "expected error diagnostic loop only in tc_min_oob.c:\n#{tc_min_oob_c}" unless tc_min_oob_c.include?("pm_parser_errors_first(parser)") && !tc_min_oob_c.include?("pm_parser_warnings_first")
+raise "expected INT32_MIN + stack_budget + shebang_cb + pm_prettyprint in tc_stream_slow.c:\n#{tc_stream_slow_c}" unless tc_stream_slow_c.include?("INT32_MIN") && tc_stream_slow_c.include?("pm_options_stack_budget_set(options, 512)") && tc_stream_slow_c.include?("shebang_cb") && tc_stream_slow_c.include?("pm_prettyprint") && !tc_stream_slow_c.include?("pm_dump_json")
+
 File.write(File.join(workdir, "tc_nonempty.c"), tc_nonempty_c)
 File.write(File.join(workdir, "tc_empty.c"), tc_empty_c)
+File.write(File.join(workdir, "tc_min_oob.c"), tc_min_oob_c)
+File.write(File.join(workdir, "tc_stream_slow.c"), tc_stream_slow_c)
+File.write(File.join(workdir, "tc_node_loc.c"), tc_node_loc_c)
 EOF
 
-awk '/#define _GNU_SOURCE/ { found=1; exit } /^#include/ { exit 1 } END { exit !found }' "$WORKDIR/tc_nonempty.c" \
-    || fail "#define _GNU_SOURCE did not precede #include directives in generated testcase.c"
 grep -q "static const size_t input_size = 6;" "$WORKDIR/tc_nonempty.c" || fail "missing input_size = 6 in tc_nonempty.c"
 grep -q "static const size_t input_size = 0;" "$WORKDIR/tc_empty.c" || fail "missing input_size = 0 in tc_empty.c"
 
-prism_srcs=$(find src -name '*.c')
-clang -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror -DPRISM_EXPORT_SYMBOLS \
-    -fsanitize=address,undefined -Iinclude -Isrc "$WORKDIR/tc_nonempty.c" $prism_srcs -o "$WORKDIR/tc_nonempty"
-clang -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror -DPRISM_EXPORT_SYMBOLS \
-    -fsanitize=address,undefined -Iinclude -Isrc "$WORKDIR/tc_empty.c" $prism_srcs -o "$WORKDIR/tc_empty"
+repo_root="$PWD"
+mkdir -p "$WORKDIR/prism_objs"
+(
+    cd "$WORKDIR/prism_objs"
+    clang -O1 -std=c99 -DPRISM_EXPORT_SYMBOLS -fsanitize=address,undefined \
+        -I"$repo_root/include" -I"$repo_root/src" $(find "$repo_root/src" -name '*.c') -c
+)
+ar rcs "$WORKDIR/libprism_test.a" "$WORKDIR/prism_objs/"*.o
+
+for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc; do
+    clang -O1 -c -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror \
+        -fsanitize=address,undefined -Iinclude "$WORKDIR/$name.c" -o "$WORKDIR/$name.o"
+    clang -fsanitize=address,undefined "$WORKDIR/$name.o" "$WORKDIR/libprism_test.a" -o "$WORKDIR/$name"
+done
+
 "$WORKDIR/tc_nonempty"
 "$WORKDIR/tc_empty"
-echo "  standalone testcase.c compiled cleanly under -std=c99 -Werror and passed ASAN+UBSAN"
+"$WORKDIR/tc_stream_slow"
+"$WORKDIR/tc_node_loc"
+if sh -c '"$1"' _ "$WORKDIR/tc_min_oob" >/dev/null 2>&1; then
+    fail "tc_min_oob did not reproduce the escape_invalid_meta diagnostic OOB assertion"
+fi
+echo "  minimal <prism.h> testcase.c compiled with -Iinclude only under -std=c99 -Werror and reproduced diagnostic OOB"
 
-echo "[4/4] Checking concurrent triage.rb deduplication, coalescing, and sentinels..."
+echo "[4/4] Checking concurrent triage.rb deduplication, header minimization, coalescing, and sentinels..."
 mkdir -p "$WORKDIR/afl/w1/crashes" "$WORKDIR/afl/w2/crashes" "$WORKDIR/afl/w1/hangs"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w1/cmdline"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w2/cmdline"
@@ -316,20 +367,24 @@ tokens_found = []
 abrt_dirs.each do |abrt_dir|
   mode = File.stat(abrt_dir).mode & 0o777
   raise "expected world-readable/traversable dir mode, got #{format('%#o', mode)}" unless (mode & 0o755) == 0o755
-  raise "missing testcase.c in #{abrt_dir}" unless File.file?(File.join(abrt_dir, "testcase.c"))
+  tc_path = File.join(abrt_dir, "testcase.c")
+  raise "missing testcase.c in #{abrt_dir}" unless File.file?(tc_path)
+  tc = File.read(tc_path)
 
   min_data = File.binread(File.join(abrt_dir, "input.min"))
   body = min_data.byteslice(4..)
   if body.include?("BOOM".b)
-    raise "header mutated for BOOM: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x2a\x11\x22\x33".b
+    raise "expected BOOM header minimized to \\x02\\x00\\x03\\x01, got #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x02\x00\x03\x01".b
     raise "unexpected BOOM input.min size: #{min_data.dump}" unless min_data.bytesize <= 12
+    raise "expected only partial_script option in BOOM testcase.c:\n#{tc}" unless tc.include?("pm_options_partial_script_set(options, true);") && !tc.include?("pm_options_command_line_set") && !tc.include?("pm_options_scopes_init") && !tc.include?("pm_parser_errors_first")
     tokens_found << "BOOM"
   elsif body.include?("INV_TARGET".b)
-    raise "header mutated for INV_TARGET: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x44\x55\x66".b
+    raise "expected INV_TARGET header minimized to \\x10\\x00\\x03\\x01, got #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x00\x03\x01".b
     raise "unexpected INV_TARGET input.min size: #{min_data.dump}" unless min_data.bytesize <= 18
+    raise "expected frozen_string_literal + error invariant in INV_TARGET testcase.c:\n#{tc}" unless tc.include?("pm_options_frozen_string_literal_set(options, false);") && tc.include?("pm_parser_errors_first(parser)")
     tokens_found << "INV_TARGET"
   elsif body.include?("INV_DECOY".b)
-    raise "header mutated for INV_DECOY: #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x44\x55\x66".b
+    raise "expected INV_DECOY header minimized to \\x10\\x00\\x03\\x01, got #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x00\x03\x01".b
     raise "unexpected INV_DECOY input.min size: #{min_data.dump}" unless min_data.bytesize <= 18
     tokens_found << "INV_DECOY"
   else
@@ -349,6 +404,6 @@ raise "expected exactly 3 minimization runs across duplicates, got #{min_runs}:\
 sentinels = Dir.glob(File.join(triage_dir, ".processed", "*"))
 raise "expected 10 .processed sentinels (4 BOOM + 2 INV_TARGET + 1 INV_DECOY + 1 unrepro + 1 sig:09 + 1 hang), got #{sentinels.size}" unless sentinels.size == 10
 EOF
-echo "  concurrent deduplication, coalescing, and sentinel checks passed"
+echo "  concurrent deduplication, header minimization, coalescing, and sentinel checks passed"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."
