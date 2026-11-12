@@ -270,6 +270,15 @@ raise "unexpected Loupe URL in tc_empty.c:\n#{tc_empty_c}" unless tc_empty_c.inc
 expected_enc_oob_url = "https://stevenjohnstone.github.io/prism-loupe/?code=L1xN&enc=ASCII-8BIT&ruby_ver=3.3&line=0&cmd=al&main=1&partial=1&freeze=1&filepath=fuzz.rb&scopes=%3A%3Bk%3Ab%2Cit"
 raise "unexpected Loupe URL in tc_enc_oob.c:\n#{tc_enc_oob_c}" unless tc_enc_oob_c.include?("Prism Loupe: #{expected_enc_oob_url}")
 
+tc_ubsan_c = c_program(
+  empty_in,
+  "test ubsan",
+  crash_output: "src/line_offset_list.c:85:58: runtime error: signed integer overflow\nSUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/line_offset_list.c:85:58\n",
+  reason: "undefined-behavior"
+)
+expected_ubsan_url = "https://stevenjohnstone.github.io/prism-loupe/?code=&san=1&ruby_ver=4.1"
+raise "expected san=1 in UBSAN Loupe URL:\n#{tc_ubsan_c}" unless tc_ubsan_c.include?("Prism Loupe: #{expected_ubsan_url}")
+
 [tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c].each do |src|
   %w[harness( harness_parse fuzz_options_t PRISM_FUZZ_IJON prism/internal/ #ifdef\ SLOW].each do |forbidden|
     raise "forbidden harness noise #{forbidden.inspect} found in:\n#{src}" if src.include?(forbidden)
