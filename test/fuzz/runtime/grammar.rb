@@ -28,8 +28,9 @@ STRING_FRAGMENTS = [
 
 WORD_LIST_FRAGMENTS = %w[alpha beta gamma delta foo_bar item_1].freeze
 
-# Valid Onigmo / Prism regexp fragments (no unescaped `/` or `"` so they are valid
-# inside both `/.../` and `%r"..."`, and compatible with `/`, `/i`, `/m`, `/x`, `/o`, `/u`).
+# Valid Onigmo / Prism regexp fragments (balanced `{}` and no unescaped `/` or `"`
+# so they are valid inside `/.../`, `%r"..."`, and `%r{...}`, and compatible
+# with `/`, `/i`, `/m`, `/x`, `/o`, `/u`).
 REGEXP_VALID_FRAGMENTS = [
   # Named captures (<name> and 'name'), backrefs, and subexp calls
   '(?<foo>\w+)(?:\s+(?\'bar\'\d+))?\k<foo>',
@@ -50,19 +51,19 @@ REGEXP_VALID_FRAGMENTS = [
   'foo # trailing comment without newline',
   # Range quantifiers `{n}`, `{n,}`, `{n,m}`, `{,m}` (single & multi-digit) + backtracked `{...}` forms
   'a{12}b{10,}c{2,15}d{,12}',
-  'a{foo}b{2x}c{,x}d{2,3x}e{2,',
+  'a{foo}b{2x}c{,x}d{2,3x}e{2,x}',
   # POSIX bracket classes, negated POSIX classes, nested character set intersections, backtracked `[[:`
   '[[:alpha:]][[:digit:]][[:xdigit:]][[:^space:]][[:^cntrl:]]',
   '[a-z&&[^aeiou]][[a-f][0-9]]',
-  '[[:unclosed_posix]',
+  '[[:unclosed_posix]]',
   # All 3 Onigmo property escape tiers: POSIX, Script, and Unicode-only + non-brace `\p`
   '\p{Alpha}\p{ASCII}\p{Blank}\p{Cntrl}\p{Print}\p{Punct}\p{Upper}\p{Word}\p{XDigit}\P{Space}\p{^Digit}',
   '\p{Han}\p{Greek}\p{Latin}\p{Hiragana}\p{^Katakana}\p{Cyrillic}',
   '\p{Lu}\P{Nd}\p{^Assigned}\pa',
-  # Unicode escapes (`\uNNNN` and `\u{...}` >= 0x80 with whitespace), valid UTF-8 `\x` groups, meta/control
+  # Unicode escapes (`\uNNNN` and `\u{...}` >= 0x80 with whitespace), valid UTF-8 `\x` groups, ASCII control escapes
   '\u3042\u00e9\u{ 3042 3044 0041 }',
   '\xE3\x81\x82a\xC3\xA9',
-  '\M-a\C-b\cc\M-\C-d\C-\M-e\M-\cf\c\M-g',
+  '\C-a\cb\C-x\cx\c?\C-?',
   # Non-ASCII UTF-8 literals (both outside and inside character sets)
   '(?:あいう|λ)+[あ-ん]'
 ].freeze
@@ -72,6 +73,7 @@ REGEXP_VALID_FRAGMENTS = [
 REGEXP_ERROR_FRAGMENTS = [
   '(?<>empty_name)',
   '[]empty_char_class',
+  '[[:unclosed_posix]',
   '(?z:undef_opt)',
   '(?-d:non_removable_opt)',
   '(?-z:invalid_remove_opt)',
@@ -88,6 +90,7 @@ REGEXP_ERROR_FRAGMENTS = [
   '(?-x',
   '(?',
   '\Ma\Cb',
+  '\M-a\C-b\cc\M-\C-d\C-\M-e\M-\cf\c\M-g',
   '\uD800',
   '\u{110000}',
   '\u{1234567}',
@@ -564,10 +567,13 @@ class PrismComposer < Lrama::Fuzz::Ruby::Composer
   def regexp_literal
     body = REGEXP_VALID_FRAGMENTS.sample(random: @random)
     flags = REGEXP_SAFE_MODIFIERS.sample(random: @random)
-    if @random.rand < 0.8
+    r = @random.rand
+    if r < 0.70
       "/#{body}/#{flags}"
-    else
+    elsif r < 0.85
       "%r\"#{body}\"#{flags}"
+    else
+      "%r{#{body}}#{flags}"
     end
   end
 
