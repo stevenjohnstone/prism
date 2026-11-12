@@ -277,32 +277,55 @@ end
 
 # On tmpfs (relatime), newly created seed files have st.atime == st.mtime until
 # AFL++'s read_foreign_testcases() opens and mmaps them (setting st.atime > st.mtime)
-# and advances foreign_syncs[0].mtime to the max st_mtime it scanned.
-# Unlink files already read by the foreign-sync intake worker, as well as any
-# older files behind its mtime watermark that it will never revisit.
+# and advances foreign_syncs[0].mtime to the max whole-second st_mtime it scanned.
+# Unread seeds created later within that same whole second would otherwise stay at
+# st_mtime <= foreign_syncs[0].mtime and never be revisited; instead of deleting
+# them, bump their mtime forward (with sentinel atime=1 so relatime updates atime
+# immediately upon read) unless pending files exceed MAX_PENDING_SEEDS.
+@max_synced_mtime = nil
+
+def seed_was_read?(st)
+  st.atime.to_i > 1 && st.atime != st.mtime
+end
+
 def prune_synced_seeds(queue_dir)
   now = Time.now
   entries = []
-  max_read_mtime = nil
 
   Dir.children(queue_dir).each do |fname|
     next if fname.start_with?(".")
 
     path = File.join(queue_dir, fname)
     st = File.stat(path) rescue next
-    was_read = st.atime > st.mtime
+    was_read = seed_was_read?(st)
     mtime_i = st.mtime.to_i
-    if was_read && (max_read_mtime.nil? || mtime_i > max_read_mtime)
-      max_read_mtime = mtime_i
+    if was_read && (@max_synced_mtime.nil? || mtime_i > @max_synced_mtime)
+      @max_synced_mtime = mtime_i
     end
     entries << [path, was_read, st.mtime]
   end
 
   pruned = 0
-  entries.each do |path, was_read, mtime|
-    next if (now - mtime) < 2.0
+  stranded_unread = []
 
-    if was_read || (max_read_mtime && mtime.to_i < max_read_mtime - 1)
+  entries.each do |path, was_read, mtime|
+    if was_read && (now - mtime) >= 2.0
+      begin
+        File.unlink(path)
+        pruned += 1
+      rescue Errno::ENOENT
+        # ignore
+      end
+    elsif !was_read && @max_synced_mtime && mtime.to_i <= @max_synced_mtime && (now - mtime) >= 2.0
+      stranded_unread << [path, mtime]
+    end
+  end
+
+  remaining = entries.size - pruned
+  if remaining > MAX_PENDING_SEEDS && stranded_unread.any?
+    excess = remaining - MAX_PENDING_SEEDS
+    stranded_unread.sort_by! { |_, mtime| mtime }
+    stranded_unread.shift(excess).each do |path, _|
       begin
         File.unlink(path)
         pruned += 1
@@ -312,21 +335,39 @@ def prune_synced_seeds(queue_dir)
     end
   end
 
+  if stranded_unread.any?
+    bump_mtime = Time.at([now.to_i, (@max_synced_mtime || 0) + 1].max)
+    read_sentinel_atime = Time.at(1)
+    stranded_unread.each do |path, _|
+      File.utime(read_sentinel_atime, bump_mtime, path) rescue nil
+    end
+  end
+
   [entries.size - pruned, pruned]
 rescue StandardError
   [0, 0]
 end
 
-# Nudge the isolated ijon master via SIGUSR2 (AFL++'s handle_syncreq -> sync_requested = 1)
-# so it imports newly generated foreign seeds promptly without waiting for AFL_SYNC_TIME.
+# Nudge the foreign-sync intake master via SIGUSR2 (AFL++'s handle_syncreq ->
+# sync_requested = 1), preferring isolated ijon and falling back to main when
+# FUZZ_WORKERS < 4.
 def notify_intake_sync(afl_dir)
-  ijon_stats_path = File.join("#{afl_dir}-ijon", "ijon", "fuzzer_stats")
-  return unless File.exist?(ijon_stats_path)
+  [
+    File.join("#{afl_dir}-ijon", "ijon", "fuzzer_stats"),
+    File.join(afl_dir, "main", "fuzzer_stats")
+  ].each do |stats_path|
+    next unless File.exist?(stats_path)
 
-  pid = parse_kv_file(ijon_stats_path)["fuzzer_pid"].to_i
-  Process.kill("USR2", pid) if pid > 0
+    pid = parse_kv_file(stats_path)["fuzzer_pid"].to_i
+    next unless pid > 0
+
+    Process.kill("USR2", pid)
+    return
+  rescue Errno::ESRCH
+    next
+  end
 rescue StandardError
-  # ignore if ijon is not running yet or already exited
+  # ignore if intake fuzzer is not running yet or already exited
 end
 
 # Iterative AST node count to avoid SystemStackError on deeply nested trees.
@@ -867,7 +908,23 @@ def build_evolvers(grammar, rng, fitness, validator)
   [composed_evolver, grammar_evolver]
 end
 
-def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:, queue_dir:, staging_dir:, in_flight_path:, stats_path:, stats_tmp_path:, plot_path:)
+def last_plot_relative_time(plot_path)
+  return 0 unless File.exist?(plot_path)
+
+  last_rel = 0
+  File.foreach(plot_path) do |line|
+    s = line.strip
+    next if s.empty? || s.start_with?("#")
+
+    rel = s.split(",", 2).first.to_i
+    last_rel = rel if rel > last_rel
+  end
+  last_rel
+rescue StandardError
+  0
+end
+
+def run_worker(grammar:, supervisor_pid:, start_time:, prior_elapsed:, saved_crashes:, afl_dir:, queue_dir:, staging_dir:, in_flight_path:, stats_path:, stats_tmp_path:, plot_path:)
   prev_stats = parse_kv_file(stats_path)
   start_ts = start_time.to_i
 
@@ -877,14 +934,15 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
     seen_digests[[fname].pack("H*")] = true if fname.length == 40
   end
 
-  resumed = prev_stats["start_time"].to_i == start_ts
-  files_created = resumed ? prev_stats["files_created"].to_i : existing_files.size
-  files_pruned = resumed ? prev_stats["files_pruned"].to_i : 0
-  files_valid = resumed ? prev_stats["files_valid"].to_i : 0
-  files_invalid = resumed ? prev_stats["files_invalid"].to_i : 0
-  duplicates_skipped = resumed ? prev_stats["duplicates_skipped"].to_i : 0
-  attempts_done = resumed ? prev_stats["attempts_done"].to_i : existing_files.size
-  last_find_ts = resumed ? prev_stats["last_find"].to_i : start_ts
+  has_prev = prev_stats.key?("files_created")
+  same_supervisor = prev_stats["start_time"].to_i == start_ts
+  files_created = has_prev ? [prev_stats["files_created"].to_i, existing_files.size].max : existing_files.size
+  files_pruned = has_prev ? prev_stats["files_pruned"].to_i : 0
+  files_valid = has_prev ? prev_stats["files_valid"].to_i : 0
+  files_invalid = has_prev ? prev_stats["files_invalid"].to_i : 0
+  duplicates_skipped = has_prev ? prev_stats["duplicates_skipped"].to_i : 0
+  attempts_done = has_prev ? [prev_stats["attempts_done"].to_i, files_created].max : existing_files.size
+  last_find_ts = has_prev && prev_stats["last_find"].to_i > 0 ? prev_stats["last_find"].to_i : start_ts
   pending_files = existing_files.size
 
   now_f = Time.now.to_f
@@ -902,19 +960,20 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
   flush_telemetry = lambda do |force_plot: false|
     now = Time.now.to_f
     now_i = now.to_i
-    elapsed = [now - start_time, 0.001].max
+    total_elapsed = prior_elapsed + [now - start_time, 0.001].max
     dt_stats = now - last_stats_flush
     if dt_stats >= 0.25
       inst_rate = (files_created - prev_stats_files) / dt_stats
       prev_stats_files = files_created
       last_stats_flush = now
     end
-    avg_rate = files_created / elapsed
+    avg_rate = files_created / total_elapsed
+    total_run_time = prior_elapsed + [now_i - start_ts, 0].max
 
     stats_content = <<~STATS
       start_time        : #{start_ts}
       last_update       : #{now_i}
-      run_time          : #{(now_i - start_ts)}
+      run_time          : #{total_run_time}
       fuzzer_pid        : #{supervisor_pid}
       fuzzer_role       : generator
       power_mode        : evolve
@@ -943,8 +1002,8 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
 
     dt_plot = now - last_plot_flush
     if force_plot || dt_plot >= 5.0
-      plot_rate = dt_plot > 0 ? (files_created - prev_plot_files) / dt_plot : avg_rate
-      rel_time = [now_i - start_ts, 0].max
+      plot_rate = dt_plot >= 0.25 ? (files_created - prev_plot_files) / dt_plot : avg_rate
+      rel_time = total_run_time
       File.open(plot_path, "a") do |f|
         f.puts("#{rel_time}, #{files_created}, #{format('%.2f', plot_rate)}, #{format('%.2f', avg_rate)}, #{attempts_done}, #{files_valid}, #{files_invalid}")
       end
@@ -973,10 +1032,10 @@ def run_worker(grammar:, supervisor_pid:, start_time:, saved_crashes:, afl_dir:,
     exit!(0)
   end
 
-  flush_telemetry.call(force_plot: !resumed)
+  flush_telemetry.call(force_plot: !same_supervisor)
 
   # Optional fault-injection hook for testing supervisor crash capture:
-  if (fault_sig = ENV["FUZZ_GRAMMAR_TEST_CRASH_SIG"]) && !resumed
+  if (fault_sig = ENV["FUZZ_GRAMMAR_TEST_CRASH_SIG"]) && !same_supervisor
     in_flight_io.rewind
     in_flight_io.write(DEFAULT_HEADER + "def crash_test; end\n".b)
     in_flight_io.truncate(24)
@@ -1077,7 +1136,13 @@ grammar = Lrama::Fuzz.parse_ruby(
   id_def_path: File.join(ruby_src_dir, "defs", "id.def")
 )
 
-File.write(plot_path, "# relative_time, files_created, files_per_sec, avg_files_per_sec, attempts_done, files_valid, files_invalid\n")
+initial_prev_stats = parse_kv_file(stats_path)
+prior_elapsed = if File.exist?(stats_path) && File.exist?(plot_path)
+                  [initial_prev_stats["run_time"].to_i, last_plot_relative_time(plot_path)].max
+                else
+                  File.write(plot_path, "# relative_time, files_created, files_per_sec, avg_files_per_sec, attempts_done, files_valid, files_invalid\n")
+                  0
+                end
 File.unlink(in_flight_path) if File.exist?(in_flight_path)
 
 supervisor_pid = Process.pid
@@ -1106,6 +1171,7 @@ until stopping
       grammar: grammar,
       supervisor_pid: supervisor_pid,
       start_time: start_time,
+      prior_elapsed: prior_elapsed,
       saved_crashes: saved_crashes,
       afl_dir: afl_dir,
       queue_dir: queue_dir,

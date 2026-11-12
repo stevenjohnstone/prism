@@ -126,7 +126,7 @@ ruby -rdigest -rjson -rfileutils -e '
 
   def normalize_source(src)
     return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
-    return "ijon" if src =~ /\Aijon(?:_\d+)?\z/
+    return "ijon" if src =~ /\Aijon(?:_\d+|_peer)?\z/
     src
   end
 
@@ -136,7 +136,7 @@ ruby -rdigest -rjson -rfileutils -e '
     next unless Dir.exist?(root)
     Dir.glob(File.join(root, "*")).sort.each do |d|
       w = File.basename(d)
-      next if w.start_with?(".") || !File.directory?(d) || seen_workers[w]
+      next if w.start_with?(".") || !File.directory?(d) || File.symlink?(File.join(d, "queue")) || seen_workers[w]
       seen_workers[w] = d
       worker_dirs << d
     end

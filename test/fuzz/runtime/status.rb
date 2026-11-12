@@ -64,7 +64,7 @@ end
 
 def normalize_origin(origin)
   return "grammar" if origin =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
-  return "ijon" if origin =~ /\Aijon(?:_\d+)?\z/
+  return "ijon" if origin =~ /\Aijon(?:_\d+|_peer)?\z/
 
   origin
 end
@@ -112,6 +112,8 @@ def compute_contributions(afl_dir)
   grammar_shared_srcs = {}
 
   worker_root_dirs(afl_dir).flat_map { |r| Dir.glob(File.join(r, "*/queue")) }.each do |qdir|
+    next if File.symlink?(qdir)
+
     fuzzer = File.basename(File.dirname(qdir))
     entries = Dir.children(qdir).sort rescue next
     entries.each do |f|

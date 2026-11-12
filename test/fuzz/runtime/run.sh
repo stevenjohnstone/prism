@@ -42,7 +42,7 @@ cleanup() {
             next if f.start_with?(".")
             p = File.join(src, f)
             st = File.stat(p) rescue next
-            unread << p if st.file? && st.atime <= st.mtime
+            unread << p if st.file? && (st.atime.to_i <= 1 || st.atime == st.mtime)
             break if unread.size >= 5000
           end
           if unread.any?
@@ -114,19 +114,25 @@ fi
 
 # When ijon (worker 3) is active, run ijon as a standalone master (-M ijon) in its
 # own sync directory ($AFL_IJON_DIR) with grammar seeds as its foreign queue (-F),
-# and expose ijon's queue to main as a foreign source (-F $AFL_IJON_DIR/.foreign/ijon).
-# That keeps each sync directory single-master so ijon never scans secondary queues
-# before ingesting grammar seeds; fall back to main directly when < 4 workers.
+# and expose ijon's queue to main via a one-way shadow peer directory
+# ($AFL_DIR/ijon_peer/queue -> ../../$(basename "$AFL_IJON_DIR")/ijon/queue) without
+# an is_main_node marker. That lets -M main sync every id:%06u entry sequentially via
+# .synced/ijon_peer (with zero 1-second st_mtime foreign-sync loss) while -S
+# secondaries skip ijon_peer; fall back to main directly when < 4 workers.
 if [ "$FUZZ_WORKERS" -ge 4 ]; then
-    mkdir -p "$AFL_IJON_DIR/.foreign"
-    if [ -d "$AFL_DIR/ijon" ] && [ ! -e "$AFL_IJON_DIR/ijon" ]; then
+    if [ -f "$AFL_DIR/ijon/fuzzer_stats" ] && [ ! -e "$AFL_IJON_DIR/ijon" ]; then
+        mkdir -p "$AFL_IJON_DIR"
         mv "$AFL_DIR/ijon" "$AFL_IJON_DIR/ijon"
     fi
-    ln -sfn ../ijon/queue "$AFL_IJON_DIR/.foreign/ijon"
-    MAIN_FOREIGN_FLAGS="-F $AFL_IJON_DIR/.foreign/ijon"
+    rm -rf "$AFL_IJON_DIR/.foreign"
+    mkdir -p "$AFL_IJON_DIR/ijon/queue" "$AFL_DIR/ijon_peer"
+    ln -sfn "../../$(basename "$AFL_IJON_DIR")/ijon/queue" "$AFL_DIR/ijon_peer/queue"
+    rm -f "$AFL_DIR/ijon_peer/is_main_node"
+    MAIN_FOREIGN_FLAGS=""
     IJON_OUT_DIR="$AFL_IJON_DIR"
     IJON_SYNC_FLAGS="-M ijon -F /tmp/afl-tmpdir/grammar/seeds"
 else
+    rm -rf "$AFL_DIR/ijon_peer"
     MAIN_FOREIGN_FLAGS="-F /tmp/afl-tmpdir/grammar/seeds"
     IJON_OUT_DIR="$AFL_DIR"
     IJON_SYNC_FLAGS="-S ijon"
@@ -135,14 +141,14 @@ fi
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
-            add_worker "main" "ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
+            add_worker "main" "AFL_FUZZER_LOOPCOUNT=2000 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
             ;;
         1)
             add_worker "grammar" "ulimit -v 4194304 && ruby ./test/fuzz/runtime/grammar.rb '$AFL_DIR' '/tmp/afl-tmpdir/grammar/seeds'"
             ;;
         2)
             prepare_seed_shard "msan" 0
-            add_worker "msan" "AFL_DISABLE_TRIM=1 AFL_CRASH_EXITCODE=23 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
+            add_worker "msan" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
             ;;
         3)
             prepare_seed_shard "ijon" 1
