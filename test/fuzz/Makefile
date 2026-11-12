@@ -169,9 +169,9 @@ fuzz-plot: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "generating AFL++ plots"
 	$(Q) ruby ./test/fuzz/report/plot.rb $(FUZZ_AFL_DIR) $(FUZZ_PLOTS_DIR)/index.html $(FUZZ_COVERAGE_DIR)/coverage.json
 
-fuzz-test: fuzz-docker-build
-	$(ECHO) "testing AFL++ instrumentation patch"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh"
+fuzz-test: fuzz-docker-build fuzz-gen-templates
+	$(ECHO) "testing AFL++ instrumentation patch and crash triage"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh && ./test/fuzz/triage/test_triage.sh"
 
 define FUZZ_CLEAN_CONFIRM
 @if [ -t 1 ]; then \
