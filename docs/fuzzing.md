@@ -28,15 +28,17 @@ test/fuzz
 │   ├── run.sh                    launches the parallel fuzzing fleet in tmux
 │   └── status.rb                 live terminal dashboard for the fuzzer fleet
 └── triage
-    ├── halfempty.sh              minimizes crash inputs with Google Project Zero's halfempty
-    ├── halfempty_compare.sh      identifies similar backtraces during minimization
-    ├── signature.sh              hashes stack traces into a crash signature
-    ├── test_triage.sh            verifies signature normalization, minimization, triage, and verification
-    ├── triage.md                 implementation details for triage, metadata schemas, and verification
-    ├── triage.rb                 deduplicates, minimizes, archives raw crashes, and writes C reproducers
-    ├── verify.rb                 sweeps triaged buckets after a fix (PASS / PARTIAL / FAIL)
-    ├── verify_bucket.sh          compiles verify_runner.<profile> and runs a bucket's archived inputs
-    └── verify_runner.c           fast forked C batch runner for archived crashers
+    ├── cluster.rb                  groups triaged buckets into root-cause clusters (clusters.json)
+    ├── clustering.md               mathematical specification and calibration for cluster.rb
+    ├── halfempty.sh                minimizes crash inputs with Google Project Zero's halfempty
+    ├── halfempty_compare.sh        identifies similar backtraces during minimization
+    ├── signature.sh                hashes stack traces into a crash signature
+    ├── test_triage.sh              verifies signature normalization, minimization, triage, and verification
+    ├── triage.md                   implementation details for triage, metadata schemas, and verification
+    ├── triage.rb                   deduplicates, minimizes, archives raw crashes, and writes C reproducers
+    ├── verify.rb                   sweeps triaged buckets or root-cause clusters after a fix (PASS / PARTIAL / FAIL)
+    ├── verify_bucket.sh            compiles verify_runner.<profile> and runs a bucket's archived inputs
+    └── verify_runner.c             fast forked C batch runner for archived crashers
 ```
 
 ## Requirements
@@ -69,6 +71,7 @@ Everything needed to build the fuzzers, run a campaign, and triage crashes is se
 
 ```
 tmp/fuzz/triage
+├── clusters.json                     <-- root-cause bucket clusters derived from metadata.json
 ├── metadata.json                     <-- global index of buckets, counts, and corpus/bucket coverage
 └── ABRT                              <-- crash category (e.g., ABRT, SEGV, heap-buffer-overflow, memory-leak)
     └── 14a9275da317ddd6              <-- hash of the normalized backtrace
@@ -129,15 +132,29 @@ Every bucket therefore archives all of its unique raw crash inputs in `inputs.ta
 After editing C files under `src/` (and running `bundle exec rake templates` if you modified `.erb` templates under `templates/`):
 
 ```bash
+# Verify all buckets belonging to a root-cause cluster (cluster ID, index, or any member bucket):
+make fuzz-verify CLUSTER=cluster-01
+make fuzz-verify CLUSTER=1
+make fuzz-verify CLUSTER=ABRT/14a9275da317ddd6
+
 # Verify a single bucket (tests input.min plus every archived crasher in inputs.tar.gz):
 make fuzz-verify BUCKET=ABRT/14a9275da317ddd6
 
 # Verify all buckets in a category (e.g., ABRT or undefined-behavior):
 make fuzz-verify REASON=ABRT
 
-# Verify every triaged bucket at once:
+# Verify every triaged bucket at once (add BY_CLUSTER=1 to group output and rollups by cluster):
 make fuzz-verify
+make fuzz-verify BY_CLUSTER=1
 ```
+
+To inspect available clusters first:
+
+```bash
+make fuzz-verify VERIFY_ARGS=--list-clusters
+```
+
+When `clusters.json` is absent or older than `metadata.json`, `make fuzz-verify CLUSTER=...` / `BY_CLUSTER=1` automatically refreshes it via [`cluster.rb`](../test/fuzz/triage/cluster.rb) and tests each cluster's canonical representative bucket first.
 
 `make fuzz-verify` incrementally compiles only the lightweight C batch verifier (`build/verify/verify_runner.<profile>`) for the required sanitizer profiles (`asan_ubsan`, `msan_slow`, `lsan_slow`, `xallocator`)—it does **not** trigger a slow rebuild of the full AFL++ instrumentation suite. When working inside `make fuzz-debug`, you can also execute a bucket's `verify.sh` directly:
 
@@ -145,8 +162,12 @@ make fuzz-verify
 ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/verify.sh
 ```
 
-Useful verification options (pass as env vars to `make fuzz-verify` or CLI flags to `verify.sh`):
+Useful verification options (pass as env vars to `make fuzz-verify` or CLI flags to `verify.sh` / `verify.rb`):
 
+- `CLUSTER=...` (`--cluster PATTERN`): Verify all buckets in matching root-cause cluster(s) (accepts cluster ID `cluster-01`, numeric shorthand `1`, or any member `bucket_id`/signature; comma-separated or repeatable). Exits non-zero if no cluster matches.
+- `BY_CLUSTER=1` (`--by-cluster`): Group verification order, progress headers, and summary rollups by root-cause cluster.
+- `CLUSTERS_FILE=...` (`--clusters-file PATH`): Override the default `<triage_dir>/clusters.json` file.
+- `TRIAGE_DIR=...` (`--triage-dir DIR`): Verify against an alternate triage directory (default `tmp/fuzz/triage`).
 - `VERIFY_SYMBOLIZE=1` (`--symbolize`): Enable external `llvm-symbolizer` output on failing inputs. Disabled by default so large buckets verify in seconds while still printing `INVARIANT[...]` descriptors and UBSAN `file:line:col` locations; turn on when you want symbolized stack traces on surviving crashes.
 - `VERIFY_VERBOSE=1` (`--verbose`): Print every still-failing archived filename and failure headline rather than just the first few.
 - `VERIFY_MAX_FAILURES=1` (`--max-failures 1`): Stop checking a bucket on its first failing archived input for quick `PASS` vs `PARTIAL`/`FAIL` checks.

@@ -528,6 +528,10 @@ index_path = File.join(triage_dir, "metadata.json")
 raise "missing consolidated metadata.json" unless File.file?(index_path)
 index = JSON.parse(File.read(index_path))
 raise "unexpected metadata summary: #{index["summary"].inspect}" unless index.dig("summary", "bucket_count") == 4 && index.dig("summary", "total_occurrences") == 8
+clusters_path = File.join(triage_dir, "clusters.json")
+raise "missing consolidated clusters.json" unless File.file?(clusters_path)
+clusters = JSON.parse(File.read(clusters_path))
+raise "expected schema_version 1 in clusters.json" unless clusters["schema_version"] == 1
 EOF
 echo "  concurrent deduplication, header minimization, coalescing, sentinel, and JSON metadata checks passed"
 
@@ -1048,6 +1052,186 @@ raise "cluster.rb CLI failed" unless $?.success? && File.file?(out_path) && cli_
 stdout_json = JSON.parse(`ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output - --quiet`)
 raise "cluster.rb stdout JSON mismatch" unless stdout_json["clusters"] == JSON.parse(File.read(out_path))["clusters"]
 EOF
-echo "  cluster.rb cross-reason, single-bug, recovery-damping, fallback, and CLI checks passed"
+
+# Exercise verify.rb cluster-based verification workflows (--cluster, --by-cluster, --list-clusters, stale auto-refresh)
+cluster_verify_triage="$WORKDIR/cluster_verify_triage"
+mkdir -p \
+    "$cluster_verify_triage/ABRT/c1_rep_pass" \
+    "$cluster_verify_triage/ABRT/c1_sib_part" \
+    "$cluster_verify_triage/ABRT/c2_only_pass"
+
+ruby - "$cluster_verify_triage" << 'EOF'
+require "digest"
+require "fileutils"
+require "json"
+require "rubygems/package"
+require "zlib"
+
+triage_dir = ARGV.fetch(0)
+write_archive = lambda do |dir, payloads|
+  Zlib::GzipWriter.open(File.join(dir, "inputs.tar.gz")) do |gz|
+    Gem::Package::TarWriter.new(gz) do |tar|
+      payloads.each do |data|
+        sha = Digest::SHA256.hexdigest(data)
+        tar.add_file_simple(sha, 0o644, data.bytesize) { |io| io.write(data) }
+      end
+    end
+  end
+end
+
+# cluster-01: representative (10 occ, PASS) + sibling (5 occ, PARTIAL -> cluster PARTIAL)
+# Representative vs sibling names intentionally pick alphabetical order != rep-first order
+# so tests verify representative runs first inside the cluster.
+c1_rep_dir = File.join(triage_dir, "ABRT/c1_rep_pass")
+c1_sib_dir = File.join(triage_dir, "ABRT/c1_sib_part")
+c2_dir = File.join(triage_dir, "ABRT/c2_only_pass")
+
+File.binwrite(File.join(c1_rep_dir, "input.min"), "clean_rep")
+write_archive.call(c1_rep_dir, ["clean_rep_sib".b])
+
+File.binwrite(File.join(c1_sib_dir, "input.min"), "clean_min")
+write_archive.call(c1_sib_dir, ["clean_ok".b, "CRASH_cluster_sib".b])
+
+File.binwrite(File.join(c2_dir, "input.min"), "clean_c2")
+write_archive.call(c2_dir, ["clean_c2_arch".b])
+
+edge_functions = {
+  "10" => "parse_heredoc",
+  "11" => "parse_heredoc",
+  "20" => "parse_for"
+}
+metadata = {
+  "schema_version" => 1,
+  "corpus" => {
+    "available" => true,
+    "corpus_count" => 100,
+    "edge_df" => { "10" => 0, "11" => 0, "20" => 0 },
+    "edge_functions" => edge_functions
+  },
+  "buckets" => [
+    {
+      "bucket_id" => "ABRT/c1_rep_pass",
+      "reason" => "ABRT",
+      "signature" => "c1_rep_pass",
+      "reproducible" => true,
+      "verify_profile" => "asan_ubsan",
+      "occurrences" => { "count" => 10 },
+      "input" => { "min_size_bytes" => 9 },
+      "symptom" => { "headline" => "Assertion heredoc failed" },
+      "frames" => [{ "function" => "parse_heredoc", "scope" => "prism" }],
+      "coverage" => { "available" => true, "edges" => { "10" => 1, "11" => 1 } }
+    },
+    {
+      "bucket_id" => "ABRT/c1_sib_part",
+      "reason" => "ABRT",
+      "signature" => "c1_sib_part",
+      "reproducible" => true,
+      "verify_profile" => "asan_ubsan",
+      "occurrences" => { "count" => 5 },
+      "input" => { "min_size_bytes" => 9 },
+      "symptom" => { "headline" => "Assertion heredoc failed" },
+      "frames" => [{ "function" => "parse_heredoc", "scope" => "prism" }],
+      "coverage" => { "available" => true, "edges" => { "10" => 1, "11" => 1 } }
+    },
+    {
+      "bucket_id" => "ABRT/c2_only_pass",
+      "reason" => "ABRT",
+      "signature" => "c2_only_pass",
+      "reproducible" => true,
+      "verify_profile" => "asan_ubsan",
+      "occurrences" => { "count" => 3 },
+      "input" => { "min_size_bytes" => 8 },
+      "symptom" => { "headline" => "Assertion parse_for failed" },
+      "frames" => [{ "function" => "parse_for", "scope" => "prism" }],
+      "coverage" => { "available" => true, "edges" => { "20" => 1 } }
+    }
+  ]
+}
+File.write(File.join(triage_dir, "metadata.json"), JSON.pretty_generate(metadata))
+EOF
+
+list_out=$(ruby ./test/fuzz/triage/verify.rb --triage-dir "$cluster_verify_triage" --list-clusters)
+echo "$list_out" | grep -q "cluster-01" || fail "expected --list-clusters to auto-generate and list cluster-01"
+echo "$list_out" | grep -q "cluster-02" || fail "expected --list-clusters to list cluster-02"
+[ -f "$cluster_verify_triage/clusters.json" ] || fail "expected auto-generated clusters.json under $cluster_verify_triage"
+
+# Verify stale clusters.json is automatically refreshed when older than metadata.json
+ruby - "$cluster_verify_triage" << 'EOF'
+require "json"
+dir = ARGV.fetch(0)
+meta_path = File.join(dir, "metadata.json")
+clusters_path = File.join(dir, "clusters.json")
+stale_time = File.mtime(meta_path) - 60
+File.write(clusters_path, JSON.generate({ "schema_version" => 1, "clusters" => [{ "cluster_id" => "cluster-99", "bucket_count" => 0, "occurrences" => 0, "reasons" => {}, "representative" => {}, "buckets" => [] }] }))
+File.utime(stale_time, stale_time, clusters_path)
+EOF
+refreshed_list=$(ruby ./test/fuzz/triage/verify.rb --triage-dir "$cluster_verify_triage" --list-clusters)
+echo "$refreshed_list" | grep -q "cluster-01" || fail "expected stale clusters.json to refresh from metadata.json"
+echo "$refreshed_list" | grep -q "cluster-99" && fail "stale cluster-99 should not persist after refresh"
+
+export VERIFY_BUILD_DIR="$WORKDIR/mock_verify_build"
+touch "$WORKDIR/mock_verify_build/verify_runner.asan_ubsan"
+
+# Passing cluster (--cluster 2 numeric shorthand) exits 0 and runs only cluster-02
+ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$cluster_verify_triage" \
+    --cluster 2 \
+    --json "$WORKDIR/verify_c2.json" > "$WORKDIR/verify_c2.out"
+
+# Partial cluster (--cluster cluster-01, member-bucket expansion, --by-cluster sweep)
+set +e
+ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$cluster_verify_triage" \
+    --cluster cluster-01 \
+    --json "$WORKDIR/verify_c1.json" > "$WORKDIR/verify_c1.out"
+c1_rc=$?
+set -e
+[ "$c1_rc" -eq 1 ] || fail "expected --cluster cluster-01 to exit 1 on PARTIAL sibling, got $c1_rc"
+
+set +e
+ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$cluster_verify_triage" \
+    --cluster ABRT/c1_sib_part \
+    --json "$WORKDIR/verify_member.json" >/dev/null
+mem_rc=$?
+set -e
+[ "$mem_rc" -eq 1 ] || fail "expected member-bucket --cluster lookup to exit 1, got $mem_rc"
+
+set +e
+ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$cluster_verify_triage" \
+    --by-cluster \
+    --json "$WORKDIR/verify_all_clusters.json" > "$WORKDIR/verify_all_clusters.out"
+all_rc=$?
+set -e
+[ "$all_rc" -eq 1 ] || fail "expected --by-cluster sweep to exit 1, got $all_rc"
+
+if ruby ./test/fuzz/triage/verify.rb --triage-dir "$cluster_verify_triage" --cluster cluster-99 >/dev/null 2>&1; then
+    fail "expected unknown --cluster filter to exit non-zero"
+fi
+
+ruby - "$WORKDIR" << 'EOF'
+require "json"
+workdir = ARGV.fetch(0)
+
+c2 = JSON.parse(File.read(File.join(workdir, "verify_c2.json")))
+raise "expected 1 cluster/1 PASS for --cluster 2: #{c2["summary"].inspect}" unless c2.dig("summary", "clusters_checked") == 1 && c2.dig("summary", "cluster_pass") == 1 && c2.dig("summary", "buckets_checked") == 1
+
+c1 = JSON.parse(File.read(File.join(workdir, "verify_c1.json")))
+raise "expected cluster-01 PARTIAL with 2 buckets: #{c1.inspect}" unless c1.dig("summary", "clusters_checked") == 1 && c1.dig("summary", "cluster_partial") == 1 && c1.dig("summary", "buckets_checked") == 2
+raise "expected representative first in cluster-01: #{c1["buckets"].map { |b| b["bucket_id"] }.inspect}" unless c1["buckets"].map { |b| b["bucket_id"] } == %w[ABRT/c1_rep_pass ABRT/c1_sib_part]
+raise "expected cluster_representative flags on cluster-01" unless c1["buckets"][0]["cluster_representative"] == true && c1["buckets"][1]["cluster_representative"] == false
+raise "expected PARTIAL cluster status on cluster-01" unless c1["clusters"].first["status"] == "PARTIAL"
+
+mem = JSON.parse(File.read(File.join(workdir, "verify_member.json")))
+raise "member lookup must expand full cluster-01" unless mem["buckets"].map { |b| b["bucket_id"] } == c1["buckets"].map { |b| b["bucket_id"] }
+
+all = JSON.parse(File.read(File.join(workdir, "verify_all_clusters.json")))
+raise "expected 2 clusters (1 PARTIAL, 1 PASS) in --by-cluster sweep: #{all["summary"].inspect}" unless all.dig("summary", "clusters_checked") == 2 && all.dig("summary", "cluster_partial") == 1 && all.dig("summary", "cluster_pass") == 1
+
+all_out = File.read(File.join(workdir, "verify_all_clusters.out"))
+raise "expected cluster headers, rollup table, and cluster summary in terminal output:\n#{all_out}" unless all_out.include?("== cluster-01") && all_out.include?("-> cluster-01: PARTIAL") && all_out.include?("Clusters:") && all_out.include?("2 clusters (1 PASS, 1 PARTIAL, 0 FAIL, 0 EMPTY)")
+EOF
+echo "  cluster.rb cross-reason, single-bug, recovery-damping, fallback, CLI, and verify.rb cluster checks passed"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."
