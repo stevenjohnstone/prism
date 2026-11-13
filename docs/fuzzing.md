@@ -165,7 +165,7 @@ make fuzz-verify VERIFY_ARGS=--list-clusters
 
 When `clusters.json` is absent or older than `metadata.json`, `make fuzz-verify CLUSTER=...` / `BY_CLUSTER=1` automatically refreshes it via [`cluster.rb`](../test/fuzz/triage/cluster.rb) and tests each cluster's canonical representative bucket first.
 
-`make fuzz-verify` regenerates templates automatically if any file under `templates/` (or `config.yml`) changed, and incrementally compiles only the lightweight C batch verifier (`build/verify/verify_runner.<profile>`) for the required sanitizer profiles (`asan_ubsan`, `msan_slow`, `lsan_slow`, `xallocator`)—it does **not** trigger a slow rebuild of the full AFL++ instrumentation suite. When working inside `make fuzz-debug`, you can also execute a bucket's `verify.sh` directly:
+`make fuzz-verify` regenerates templates automatically if any file under `templates/` (or `config.yml`) changed, and incrementally compiles only the lightweight C batch verifier (`build/verify/verify_runner.<profile>`) for the required sanitizer profiles (`asan_ubsan`, `asan_ubsan_slow`, `msan_slow`, `lsan_slow`, `xallocator`)—it does **not** trigger a slow rebuild of the full AFL++ instrumentation suite. When working inside `make fuzz-debug`, you can also execute a bucket's `verify.sh` directly:
 
 ```bash
 ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/verify.sh
@@ -381,12 +381,16 @@ Every fuzz input begins with a **4-byte options header** consumed by `harness()`
 
 Putting options in the input header lets AFL++ mutate parser configuration alongside Ruby syntax so version-specific grammar rules, streaming input (`pm_parse_stream`), non-UTF-8 initial encodings, shebang callbacks, stack budgets, `int32_t` line boundaries, command-line loops (`-n`/`-p`), and local scope forwarding are all explored automatically.
 
-After `pm_parse()` or `pm_parse_stream()` returns, `harness_parse()` checks four post-parse invariants against the parsed source length (`parsed_size`) on every run:
+After `pm_parse()` or `pm_parse_stream()` returns, `harness_parse()` checks post-parse invariants against the parsed source length (`parsed_size`) on every run:
 
-1. **Monotonic line offsets**: Verifies that `parser->line_offsets` starts at `0`, is strictly increasing, and never exceeds `parsed_size`.
-2. **AST location bounds (`check_node_location`)**: Walks the entire AST with `pm_visit_node` and aborts if any node span exceeds `parsed_size`.
-3. **Diagnostic and magic-comment span bounds**: Verifies every error, warning, and magic-comment key/value location fits within `parsed_size`.
-4. **Comment span bounds and `attach_comments` sort order**: Verifies every comment location fits within `parsed_size` and, when `attach_comments` is set, that comments are ordered monotonically by `start` offset.
+1. **Monotonic line offsets (`line_offsets`)**: Verifies that `parser->line_offsets` starts at `0`, is strictly increasing, and never exceeds `parsed_size`.
+2. **AST location bounds (`node_location`)**: Walks the entire AST with `pm_visit_node` and aborts if any node span exceeds `parsed_size`.
+3. **Container child/sibling AST bounds (`node_relation`)**: Checks that child nodes stay within parent/delimiter bounds and adjacent list parts do not overlap (`duplicate_part`, `sibling_overlap`, `start_after_child`, `child_oob`, `child_before_opening`, `child_after_closing`).
+4. **Non-iterative recursion depth limit (`recursion_depth`)**: Tracks AST depth while excluding iterative Pratt/linked-list chains (`PM_CALL_NODE`, `PM_AND_NODE`, `PM_OR_NODE`, `PM_CONSTANT_PATH_NODE`, `PM_IF_NODE`, `PM_RESCUE_NODE`), asserting depth does not exceed `PRISM_DEPTH_MAXIMUM * 2 + 64` without a `nesting_too_deep` or `stack_exhausted` error.
+5. **Diagnostic and magic-comment span bounds (`diagnostic`, `magic_comment`)**: Verifies every error, warning, and magic-comment key/value location fits within `parsed_size`.
+6. **Diagnostic semantics (`diagnostic_semantic`)**: Verifies `mixed_encoding` errors point to a non-empty span containing a non-ASCII byte or `'\\'` and `escape_invalid_unicode_literal` errors have non-zero length.
+7. **Comment span bounds and `attach_comments` sort order (`comment`)**: Verifies every comment location fits within `parsed_size` and, when `attach_comments` is set, that comments are ordered monotonically by `start` offset.
+8. **Stream vs. buffer differential equivalence (`stream_diff`, `-DSLOW` builds)**: When `stream_mode` is set, re-parses the raw buffer with `pm_parse` and verifies identical serialization (when reading to EOF) or matching `data_loc.start`, error/warning counts, AST pretty-printing, and parsed-prefix serialization (when stopping at `__END__`).
 
 Because these checks run after `pm_parse()` / `pm_parse_stream()` has unwound, `fuzz_invariant_fail()` prints a position-independent `INVARIANT[...]` descriptor to `stderr` (such as the diagnostic type, AST node type, comment/magic-comment kind, or lexical line-offset context, followed by raw offsets in `[detail: ...]`) right before calling `abort()`. `test/fuzz/triage/signature.sh` strips `[detail: ...]` and hashes the `INVARIANT[...]` descriptor so `triage.rb` and `halfempty` separate distinct invariant bugs while still minimizing away unrelated surrounding Ruby code.
 
@@ -394,8 +398,8 @@ Because these checks run after `pm_parse()` / `pm_parse_stream()` has unwound, `
 
 Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json` on every fuzzing iteration would slow down parser exploration and pollute the coverage bitmap with output-formatter edges. We split the build into two modes:
 
-- **Fast parse-only binaries** (`build/fuzz`, `build/fuzz.native`, `build/fuzz.ijon`, `build/fuzz.sand`, `build/fuzz.cmplog`): Compiled with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`. They only run `pm_parse` and the AST/line-offset invariant checks.
-- **Slow full-pipeline binaries** (`build/fuzz.msan`, `build/fuzz.lsan`, and `build/fuzz.coverage`): Compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (plain and color), `pm_prettyprint`, and `pm_dump_json` on every input. Because these serializers and printers read every AST node, token, error, and line offset, running them under MemorySanitizer (`fuzz.msan`) catches uninitialized fields anywhere in the parse tree.
+- **Fast parse-only binaries** (`build/fuzz`, `build/fuzz.native`, `build/fuzz.ijon`, `build/fuzz.sand`, `build/fuzz.cmplog`): Compiled with `-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`. They only run `pm_parse` and the fast AST/diagnostic/line-offset invariant checks.
+- **Slow full-pipeline binaries** (`build/fuzz.slow`, `build/fuzz.msan`, `build/fuzz.lsan`, and `build/fuzz.coverage`): Compiled with `-DSLOW`, which additionally runs `pm_serialize`, `pm_errors_format` (plain and color), `pm_prettyprint`, `pm_dump_json`, and `INVARIANT[stream_diff]` on every input. Running them under ASAN+UBSAN (`fuzz.slow`) and MemorySanitizer (`fuzz.msan`) catches consumer crashes, undefined behavior, stream mismatches, and uninitialized reads anywhere in the parse tree.
 
 ### Worker Fleet Architecture and Sync Topology
 
@@ -410,19 +414,19 @@ Running `pm_serialize`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json`
                                                               └────────▲─────────┘
                                                                        │ peer sync
                                                                        │ (-M / -S)
-                                                       ┌───────────────┴───────────────┐
-                                                       ▼                               ▼
-                                              ┌──────────────────┐           ┌──────────────────┐
-                                              │ -S msan          │           │ -S main-2 .. N   │
-                                              │ (fuzz.msan SLOW) │           │ (fuzz.native +   │
-                                              └──────────────────┘           │  -w fuzz.sand)   │
-                                                                             └──────────────────┘
+                                              ┌────────────────────────┼────────────────────────┐
+                                              ▼                        ▼                        ▼
+                                     ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+                                     │ -S msan          │    │ -S slow          │    │ -S main-2 .. N   │
+                                     │ (fuzz.msan SLOW) │    │ (fuzz.slow SLOW) │    │ (fuzz.native +   │
+                                     └──────────────────┘    └──────────────────┘    │  -w fuzz.sand)   │
+                                                                                     └──────────────────┘
 ```
 
  AFL++ restricts `-F` (foreign testcase import) to `-M` master instances, and inside `sync_fuzzers()` a `-M` node scans every peer queue in its `-o` sync directory *before* calling `read_foreign_testcases()`. Keeping two separate single-master sync roots avoids multi-master contention:
 
 - In `tmp/fuzz/afl-ijon`, `-M ijon` has **no** peer queues to scan, so every foreign sync goes straight to `/tmp/afl-tmpdir/grammar/seeds` at native speed (~45k execs/s) and filters generated Ruby snippets by both CFG edges and IJON parser/lexer state transitions.
-- In `tmp/fuzz/afl`, `-M main` is the sole master: it imports `ijon`'s curated queue sequentially via a one-way shadow peer directory (`tmp/fuzz/afl/ijon_peer/queue -> ../../afl-ijon/ijon/queue`, with no `is_main_node` marker so `-S` secondaries skip it while `main` tracks exact `id:NNNNNN` cursors in `.synced/ijon_peer` without 1-second `-F` `mtime` loss) and exchanges queue discoveries bidirectionally with `-S msan` and `-S main-2..N`. (When `FUZZ_WORKERS < 4`, `ijon` is omitted and `main` ingests `/tmp/afl-tmpdir/grammar/seeds` directly via `-F`.)
+- In `tmp/fuzz/afl`, `-M main` is the sole master: it imports `ijon`'s curated queue sequentially via a one-way shadow peer directory (`tmp/fuzz/afl/ijon_peer/queue -> ../../afl-ijon/ijon/queue`, with no `is_main_node` marker so `-S` secondaries skip it while `main` tracks exact `id:NNNNNN` cursors in `.synced/ijon_peer` without 1-second `-F` `mtime` loss) and exchanges queue discoveries bidirectionally with `-S msan`, `-S slow`, and `-S main-2..N`. (When `FUZZ_WORKERS < 4`, `ijon` is omitted and `main` ingests `/tmp/afl-tmpdir/grammar/seeds` directly via `-F`; `-S slow` starts at `FUZZ_WORKERS >= 5`, which is the minimum default.)
 
 The workers are:
 
@@ -430,7 +434,8 @@ The workers are:
 2. **`grammar`** (`test/fuzz/runtime/grammar.rb`): Structure-aware Ruby seed generator powered by [`lrama-fuzz`](https://github.com/kddnewton/lrama-fuzz), writing candidate seeds to `/tmp/afl-tmpdir/grammar/seeds` and nudging `ijon` via `SIGUSR2`.
 3. **`msan`** (`build/fuzz.msan`): Secondary worker (`-S msan`) running the full `-DSLOW` pipeline under MemorySanitizer to catch uninitialized memory reads and out-of-bounds reads across parsing, serialization, pretty-printing, and JSON dumping.
 4. **`ijon`** (`build/fuzz.ijon`): Isolated native master (`-M ijon -o tmp/fuzz/afl-ijon -F /tmp/afl-tmpdir/grammar/seeds`) with custom leak detection and IJON state-guided instrumentation enabled, acting as a high-throughput state-space filter for grammar seeds and exploring mutations with `-p explore` before `main` imports its winners.
-5. **`main-2 .. main-N`** (`build/fuzz.native` + `-w ./build/fuzz.sand`): Secondary workers (`-S main-2..N`) running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase`). They execute mutations at native speed without sanitizer overhead, and only forward inputs that discover new coverage to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`). Secondary workers cycle through different AFL++ power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), mutation modes (MOpt `-L 0`, `-P explore/exploit`, `-Z`), and disjoint shards of the initial seed corpus.
+5. **`slow`** (`build/fuzz.slow`): Secondary worker (`-S slow`) running the full `-DSLOW` pipeline (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, `pm_dump_json`, and `INVARIANT[stream_diff]`) under full ASAN+UBSAN so consumer overflows/UBSAN bugs and stream vs. non-stream divergences are tested continuously alongside `msan`.
+6. **`main-2 .. main-N`** (`build/fuzz.native` + `-w ./build/fuzz.sand`): Secondary workers (`-S main-2..N`) running AFL++ **SAND** (`AFL_SAN_ABSTRACTION=coverage_increase`). They execute mutations at native speed without sanitizer overhead, and only forward inputs that discover new coverage to the forkserver-only ASAN+UBSAN binary (`build/fuzz.sand`). Secondary workers cycle through different AFL++ power schedules (`explore`, `fast`, `coe`, `lin`, `quad`, `exploit`, `rare`, `mmopt`), mutation modes (MOpt `-L 0`, `-P explore/exploit`, `-Z`), and disjoint shards of the initial seed corpus.
 
 ### Fast Leak Detection (`PRISM_XALLOCATOR`)
 
@@ -478,7 +483,7 @@ When `ijon` reaches a novel state combination and saves the input to `tmp/fuzz/a
 
 `test/fuzz/Makefile` sets several preprocessor flags when building the fuzz binaries:
 
-- **Per-allocation arena redzones (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, `src/arena.c` bump-allocates AST nodes and strings out of 8 KB blocks, which hides intra-block buffer overflows from AddressSanitizer and MemorySanitizer. Sanitizer builds (`fuzz`, `fuzz.sand`, `fuzz.msan`, `fuzz.lsan`) set `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` returns the exact requested size and every `pm_arena_alloc` call gets its own `xmalloc` heap block surrounded by ASAN/MSAN redzones. Non-sanitized builds (`fuzz.native`, `fuzz.ijon`, `fuzz.cmplog`, `fuzz.coverage`) keep the default 8 KB blocks so the normal arena growth and bump-allocation paths are also tested at full speed.
+- **Per-allocation arena redzones (`-DPM_ARENA_INITIAL_SIZE=0`)**: By default, `src/arena.c` bump-allocates AST nodes and strings out of 8 KB blocks, which hides intra-block buffer overflows from AddressSanitizer and MemorySanitizer. Sanitizer builds (`fuzz`, `fuzz.sand`, `fuzz.slow`, `fuzz.msan`, `fuzz.lsan`) set `-DPM_ARENA_INITIAL_SIZE=0` so `pm_arena_next_block_size` returns the exact requested size and every `pm_arena_alloc` call gets its own `xmalloc` heap block surrounded by ASAN/MSAN redzones. Non-sanitized builds (`fuzz.native`, `fuzz.ijon`, `fuzz.cmplog`, `fuzz.coverage`) keep the default 8 KB blocks so the normal arena growth and bump-allocation paths are also tested at full speed.
 - **Reachable bignum divide-and-conquer (`-DPM_INTEGER_DIVIDE_THRESHOLD=8`)**: By default, `src/integer.c` only switches from schoolbook decimal parsing to divide-and-conquer parsing (and Karatsuba multiplication in `src/bignum.c`) above 224 chunks (2,017 digits), which cannot be reached within `FUZZ_MAX_INPUT_SIZE` (1,024 bytes). Lowering the threshold to 8 chunks (72 digits) exercises both schoolbook (20–72 digits) and divide-and-conquer / Karatsuba (73–1,020 digits) within the 1 KB input limit.
 - **Reachable recursion depth limit (`-DPRISM_DEPTH_MAXIMUM=128`)**: Lowering `PRISM_DEPTH_MAXIMUM` from `10000` to `128` makes `PM_ERR_NESTING_TOO_DEEP` error-recovery paths in `parse_expression` and `parse_pattern` reachable within 1 KB inputs and prevents deeply nested expressions from causing quadratic indentation buffer growth in `pm_prettyprint`.
 - **Write-only ASAN (`-mllvm -asan-instrument-reads=0`)**: `build/fuzz` and `build/fuzz.sand` disable ASAN read instrumentation so they only trap on illegal writes, UBSAN errors, and assertion failures, leaving out-of-bounds and uninitialized reads to `build/fuzz.msan`.

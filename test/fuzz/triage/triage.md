@@ -58,8 +58,8 @@ To prevent the same root bug from splitting across worker binaries:
 - **`fuzz.ijon` and `fuzz.native`** (no sanitizers, `-DPRISM_XALLOCATOR`):
   - IJON inputs (`executable.end_with?("ijon")`) first have bit `0x40` cleared in `byte[0]` (`normalize_ijon_crash_bytes`), because `PRISM_FUZZ_IJON` forces `stream_mode = false` in [`test/fuzz/harness/parse.c`](../harness/parse.c); this ensures the archived and tested bytes match standard builds.
   - Replay order: tries `./build/fuzz` (ASAN+UBSAN) first so standard crashes and invariant aborts deduplicate cleanly into the `main` bucket; if that passes, tries `./build/fuzz.lsan` so leaks use LeakSanitizer allocation backtraces; otherwise falls back to the discovering native/IJON binary (catching `FUZZ_MAX_ALLOCATED_BYTES` exhaustion and `PRISM_XALLOCATOR` sized-free / `allocated == 0` assertions).
-- **`fuzz.msan`** (`-DSLOW` + MSAN):
-  - Replay order: tries `./build/fuzz` (ASAN+UBSAN) first so illegal writes, UBSAN errors, and invariants deduplicate against `main`, falling back to `./build/fuzz.msan` only for uninitialized reads, out-of-bounds reads (omitted from `build/fuzz` via `-mllvm -asan-instrument-reads=0`), and `-DSLOW` consumer bugs.
+- **`fuzz.msan` and `fuzz.slow`** (`-DSLOW` + MSAN or ASAN+UBSAN):
+  - Replay order: tries `./build/fuzz` (ASAN+UBSAN) first so fast parser writes, UBSAN errors, and invariants deduplicate against `main`, falling back to `./build/fuzz.msan` for uninitialized/out-of-bounds reads (omitted from `build/fuzz` via `-mllvm -asan-instrument-reads=0`) or `./build/fuzz.slow` for `-DSLOW` consumer bugs and `INVARIANT[stream_diff]`.
 - **Hangs (`hangs*`)**:
   - Replayed with a `5s` timeout (`timeout -k 1 5`). If a hang finishes without timing out or crashing, it is marked `#skip` (`transient_timeout`). If it crashes on replay, it is reclassified by its sanitizer/assertion reason rather than staying in `hang/`.
 - **Unreproducible inputs & OOM `sig:09`**:
@@ -174,6 +174,7 @@ Spawning a sanitized executable once per archived crash incurs ASAN initializati
 | Profile | Selected When | Compile Flags |
 | :--- | :--- | :--- |
 | `asan_ubsan` | Default (`ABRT`, `SEGV`, `undefined-behavior`, `heap-buffer-overflow`, `hang`, etc.) | `-DPM_ARENA_INITIAL_SIZE=0 -fsanitize=address,undefined -fno-sanitize-recover=all` |
+| `asan_ubsan_slow` | `reproduced_by` ends with `slow` or `-DSLOW` in `build.sh` | `-DPM_ARENA_INITIAL_SIZE=0 -DSLOW -fsanitize=address,undefined -fno-sanitize-recover=all` |
 | `msan_slow` | `use-of-uninitialized-value` or `reproduced_by` ends with `msan` | `-DPM_ARENA_INITIAL_SIZE=0 -DSLOW -fsanitize=memory -fsanitize-memory-track-origins -fno-sanitize-recover=all` (Linux/Docker only) |
 | `lsan_slow` | `memory-leak` or `reproduced_by` ends with `lsan` | `-DPM_ARENA_INITIAL_SIZE=0 -DSLOW -fsanitize=leak -fno-sanitize-recover=all` |
 | `xallocator` | `allocation-size-too-big` or `reproduced_by` ends with `ijon`/`native` | `-Itest/fuzz/harness/include -DPRISM_XALLOCATOR` |

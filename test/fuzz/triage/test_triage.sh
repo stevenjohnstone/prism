@@ -285,6 +285,13 @@ tc_rec_depth_c = c_program(
   "test rec depth",
   crash_output: "INVARIANT[recursion_depth]: type=PM_MULTI_TARGET_NODE kind=depth_exceeded\n"
 )
+stream_diff_in = File.join(workdir, "repro_stream_diff.bin")
+File.binwrite(stream_diff_in, "\x40\x00\x03\x01puts 1\n__END__\nbar\n".b)
+tc_stream_diff_c = c_program(
+  stream_diff_in,
+  "test stream diff",
+  crash_output: "INVARIANT[stream_diff]: kind=spurious_stop [detail: parsed_size=15 size=19]\n"
+)
 
 expected_nonempty_url = "https://stevenjohnstone.github.io/prism-loupe/?code=MSArIDIK&ruby_ver=4.1&line=-1&cmd=al&partial=1&enc_lock=1&scopes=a%2Cfoo%2C~MSArIA%3Bp%3Ab%2Cit"
 raise "unexpected Loupe URL in tc_nonempty.c:\n#{tc_nonempty_c}" unless tc_nonempty_c.include?("Prism Loupe: #{expected_nonempty_url}")
@@ -304,7 +311,7 @@ tc_ubsan_c = c_program(
 expected_ubsan_url = "https://stevenjohnstone.github.io/prism-loupe/?code=&san=1&ruby_ver=4.1"
 raise "expected san=1 in UBSAN Loupe URL:\n#{tc_ubsan_c}" unless tc_ubsan_c.include?("Prism Loupe: #{expected_ubsan_url}")
 
-[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c, tc_node_rel_c, tc_diag_sem_c, tc_rec_depth_c].each do |src|
+[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c, tc_node_rel_c, tc_diag_sem_c, tc_rec_depth_c, tc_stream_diff_c].each do |src|
   %w[harness( harness_parse fuzz_options_t PRISM_FUZZ_IJON prism/internal/ #ifdef\ SLOW].each do |forbidden|
     raise "forbidden harness noise #{forbidden.inspect} found in:\n#{src}" if src.include?(forbidden)
   end
@@ -323,6 +330,15 @@ File.write(File.join(workdir, "tc_node_loc.c"), tc_node_loc_c)
 File.write(File.join(workdir, "tc_node_rel.c"), tc_node_rel_c)
 File.write(File.join(workdir, "tc_diag_sem.c"), tc_diag_sem_c)
 File.write(File.join(workdir, "tc_rec_depth.c"), tc_rec_depth_c)
+File.write(File.join(workdir, "tc_stream_diff.c"), tc_stream_diff_c)
+
+stream_diff_build = build_script(
+  stream_diff_in,
+  crash_output: "INVARIANT[stream_diff]: kind=spurious_stop\n",
+  reason: "ABRT",
+  executable: "./build/fuzz.slow"
+)
+raise "stream_diff build.sh missing -DSLOW:\n#{stream_diff_build}" unless stream_diff_build.include?("-DSLOW") && stream_diff_build.include?("-fsanitize=address,undefined -fno-sanitize-recover=all")
 
 rec_build = build_script(
   node_loc_in,
@@ -440,7 +456,7 @@ mkdir -p "$WORKDIR/prism_objs"
 )
 ar rcs "$WORKDIR/libprism_test.a" "$WORKDIR/prism_objs/"*.o
 
-for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_node_rel tc_diag_sem tc_rec_depth; do
+for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_node_rel tc_diag_sem tc_rec_depth tc_stream_diff; do
     clang -O1 -c -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror \
         -fsanitize=address,undefined -Iinclude "$WORKDIR/$name.c" -o "$WORKDIR/$name.o"
     clang -fsanitize=address,undefined "$WORKDIR/$name.o" "$WORKDIR/libprism_test.a" -o "$WORKDIR/$name"
@@ -454,8 +470,11 @@ done
 "$WORKDIR/tc_node_rel"
 "$WORKDIR/tc_diag_sem"
 "$WORKDIR/tc_rec_depth"
+"$WORKDIR/tc_stream_diff"
 PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
+FUZZ_MAX_INPUT_SIZE=8192 ruby test/fuzz/runtime/corpus.rb --no-minimize "$WORKDIR/corpus_8k" >/dev/null
+[ -f "$WORKDIR/corpus_8k/opt_stream_long_line.rb" ] || fail "expected opt_stream_long_line.rb when FUZZ_MAX_INPUT_SIZE=8192"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
 echo "[4/8] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
