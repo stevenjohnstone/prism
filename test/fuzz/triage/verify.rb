@@ -308,6 +308,7 @@ end
 
 options = {
   triage_dir: ENV.fetch("TRIAGE_DIR", "tmp/fuzz/triage"),
+  target: (ENV["VERIFY_TARGET"] || ENV["PRISM_TARGET"])&.strip,
   buckets: parse_csv_env("BUCKET"),
   reasons: parse_csv_env("REASON"),
   clusters: parse_csv_env("CLUSTER"),
@@ -317,48 +318,76 @@ options = {
   timeout: Integer(ENV.fetch("VERIFY_TIMEOUT", "5")),
   max_failures: Integer(ENV.fetch("VERIFY_MAX_FAILURES", "0")),
   extract_dir: ENV["VERIFY_EXTRACT_SURVIVORS"]&.strip,
+  input_min_only: ENV["VERIFY_INPUT_MIN_ONLY"] == "1",
+  skip_min: ENV["VERIFY_SKIP_MIN"] == "1",
   include_unreproducible: ENV["VERIFY_UNREPRODUCIBLE"] == "1",
   rebuild: ENV["VERIFY_REBUILD"] == "1",
   symbolize: ENV["VERIFY_SYMBOLIZE"] == "1",
+  fail_fast: ENV["VERIFY_FAIL_FAST"] == "1",
+  invert: ENV["VERIFY_INVERT"] == "1",
+  bisect: ENV["VERIFY_BISECT"] == "1",
   verbose: ENV["VERIFY_VERBOSE"] == "1",
   quiet: ENV["VERIFY_QUIET"] == "1",
   json_stdout: false,
   json_path: nil
 }
 
-OptionParser.new do |opts|
-  opts.banner = "Usage: verify.rb [OPTIONS]"
-  opts.on("--triage-dir DIR", "Triage directory (default: tmp/fuzz/triage)") { |v| options[:triage_dir] = v }
-  opts.on("--bucket PATTERN", "Verify only buckets matching pattern/id/signature (repeatable)") { |v| options[:buckets] << v }
-  opts.on("--reason REASON", "Verify only buckets in reason directory") { |v| options[:reasons] << v }
-  opts.on("--cluster PATTERN", "Verify all buckets in matching cluster(s) (id, number, or member bucket; repeatable)") { |v| options[:clusters] << v }
-  opts.on("--clusters-file PATH", "Path to clusters.json (default: <triage-dir>/clusters.json)") { |v| options[:clusters_file] = v }
-  opts.on("--by-cluster", "Group output and summary rollups by root-cause cluster") { options[:by_cluster] = true }
-  opts.on("--list-clusters", "Print available clusters for the triage directory and exit") { options[:list_clusters] = true }
-  opts.on("--timeout SEC", Integer, "Per-input timeout in seconds (default: 5)") { |v| options[:timeout] = v }
-  opts.on("--max-failures N", Integer, "Stop each bucket after N failures (default: 0 = all)") { |v| options[:max_failures] = v }
-  opts.on("--extract-survivors DIR", "Write still-failing inputs into DIR/<bucket_id>/") { |v| options[:extract_dir] = v }
-  opts.on("--include-unreproducible", "Include unreproducible/ buckets") { options[:include_unreproducible] = true }
-  opts.on("--rebuild", "Force rebuild of verify_runner binaries") { options[:rebuild] = true }
-  opts.on("--symbolize", "Enable external llvm-symbolizer (slower when many inputs crash)") { options[:symbolize] = true }
-  opts.on("--verbose", "Show stderr details on failures") { options[:verbose] = true }
-  opts.on("--quiet", "Only print final summary") { options[:quiet] = true }
-  opts.on("--json [PATH]", "Emit JSON report (to PATH or stdout)") do |v|
-    if v && !v.empty?
-      options[:json_path] = v
-    else
-      options[:json_stdout] = true
+def die_config(message, options, code: 2)
+  warn message
+  exit(options[:bisect] ? 128 : code)
+end
+
+begin
+  OptionParser.new do |opts|
+    opts.banner = "Usage: verify.rb [OPTIONS]"
+    opts.on("--triage-dir DIR", "Triage directory (default: tmp/fuzz/triage)") { |v| options[:triage_dir] = v }
+    opts.on("--target DIR", "Target Prism source directory to verify against (default: current repo)") { |v| options[:target] = v }
+    opts.on("--bucket PATTERN", "Verify only buckets matching pattern/id/signature (repeatable)") { |v| options[:buckets] << v }
+    opts.on("--reason REASON", "Verify only buckets in reason directory") { |v| options[:reasons] << v }
+    opts.on("--cluster PATTERN", "Verify all buckets in matching cluster(s) (id, number, or member bucket; repeatable)") { |v| options[:clusters] << v }
+    opts.on("--clusters-file PATH", "Path to clusters.json (default: <triage-dir>/clusters.json)") { |v| options[:clusters_file] = v }
+    opts.on("--by-cluster", "Group output and summary rollups by root-cause cluster") { options[:by_cluster] = true }
+    opts.on("--list-clusters", "Print available clusters for the triage directory and exit") { options[:list_clusters] = true }
+    opts.on("--timeout SEC", Integer, "Per-input timeout in seconds (default: 5)") { |v| options[:timeout] = v }
+    opts.on("--max-failures N", Integer, "Stop each bucket after N failures (default: 0 = all)") { |v| options[:max_failures] = v }
+    opts.on("--extract-survivors DIR", "Write still-failing inputs into DIR/<bucket_id>/") { |v| options[:extract_dir] = v }
+    opts.on("--input-min-only", "Check only each bucket's minimized input.min (skip archived inputs)") { options[:input_min_only] = true }
+    opts.on("--skip-min", "Skip each bucket's input.min (check archived inputs only)") { options[:skip_min] = true }
+    opts.on("--include-unreproducible", "Include unreproducible/ buckets") { options[:include_unreproducible] = true }
+    opts.on("--rebuild", "Force rebuild of verify_runner binaries") { options[:rebuild] = true }
+    opts.on("--symbolize", "Enable external llvm-symbolizer (slower when many inputs crash)") { options[:symbolize] = true }
+    opts.on("--fail-fast", "Stop checking further buckets after the first failing/partial bucket") { options[:fail_fast] = true }
+    opts.on("--invert", "Invert verdict exit status (exit 0 on FAIL/PARTIAL, 1 on PASS; useful when bisecting fixes)") { options[:invert] = true }
+    opts.on("--bisect", "git bisect run mode (exit 125 to skip unbuildable commits, 128 on config errors)") { options[:bisect] = true }
+    opts.on("--verbose", "Show stderr details on failures") { options[:verbose] = true }
+    opts.on("--quiet", "Only print final summary") { options[:quiet] = true }
+    opts.on("--json [PATH]", "Emit JSON report (to PATH or stdout)") do |v|
+      if v && !v.empty?
+        options[:json_path] = v
+      else
+        options[:json_stdout] = true
+      end
     end
-  end
-end.parse!
+  end.parse!
+rescue OptionParser::ParseError => e
+  die_config("verify.rb: #{e.message}", options)
+end
 
 options[:extract_dir] = nil if options[:extract_dir]&.empty?
 options[:clusters_file] = nil if options[:clusters_file]&.empty?
+options[:target] = nil if options[:target]&.empty?
+if options[:input_min_only] && options[:skip_min]
+  die_config("verify.rb: --input-min-only and --skip-min cannot be used together", options)
+end
 cluster_mode = options[:by_cluster] || !options[:clusters].empty?
 
-repo_root = locate_repo_root
-verify_bucket_sh = File.join(repo_root, "test/fuzz/triage/verify_bucket.sh")
-abort "Missing verify_bucket.sh at #{verify_bucket_sh}" unless File.executable?(verify_bucket_sh)
+fuzz_root = File.expand_path("../../..", __dir__)
+target_root = File.expand_path(options[:target] || locate_repo_root)
+verify_bucket_sh = File.join(fuzz_root, "test/fuzz/triage/verify_bucket.sh")
+die_config("Missing verify_bucket.sh at #{verify_bucket_sh}", options) unless File.executable?(verify_bucket_sh)
+if !File.file?(File.join(target_root, "include/prism.h")) || !File.directory?(File.join(target_root, "src"))
+  die_config("Invalid Prism target root: #{target_root} (missing include/prism.h or src/)", options)
+end
 
 cluster_report = nil
 clusters_source = nil
@@ -372,7 +401,7 @@ end
 
 if options[:list_clusters]
   if cluster_report.nil?
-    abort "No clusters or metadata.json found under #{options[:triage_dir]} (run make fuzz-triage or cluster.rb first)"
+    die_config("No clusters or metadata.json found under #{options[:triage_dir]} (run make fuzz-triage or cluster.rb first)", options)
   end
   if options[:json_stdout]
     puts JSON.pretty_generate(cluster_report)
@@ -387,7 +416,7 @@ if cluster_mode
   if !options[:clusters].empty?
     if cluster_report.nil?
       expected = options[:clusters_file] || File.join(options[:triage_dir], "clusters.json")
-      abort "Cannot resolve --cluster filter: neither #{expected} nor #{File.join(options[:triage_dir], 'metadata.json')} exists"
+      die_config("Cannot resolve --cluster filter: neither #{expected} nor #{File.join(options[:triage_dir], 'metadata.json')} exists", options)
     end
 
     matched_clusters = cluster_report["clusters"].select { |c| matches_cluster_filter?(c, options[:clusters]) }
@@ -397,7 +426,7 @@ if cluster_mode
         warn ""
         warn FuzzClustering.format_summary_table(cluster_report)
       end
-      exit 1
+      die_config("", options, code: 1)
     end
   elsif cluster_report
     matched_clusters = cluster_report["clusters"]
@@ -406,8 +435,7 @@ end
 
 all_dirs = discover_buckets(options[:triage_dir])
 if all_dirs.empty?
-  warn "No triage buckets found under #{options[:triage_dir]}"
-  exit 0
+  die_config("No triage buckets found under #{options[:triage_dir]}", options, code: options[:bisect] ? 128 : 0)
 end
 
 selected, skipped_unrepro = select_buckets(all_dirs, options, cluster_report, matched_clusters, cluster_mode: cluster_mode)
@@ -415,18 +443,23 @@ selected, skipped_unrepro = select_buckets(all_dirs, options, cluster_report, ma
 if selected.empty?
   if !options[:clusters].empty?
     matched_ids = matched_clusters.map { |c| c["cluster_id"] }.join(", ")
-    warn "Matched cluster(s) (#{matched_ids}), but no matching bucket directories remain on disk under #{options[:triage_dir]}"
+    msg = "Matched cluster(s) (#{matched_ids}), but no matching bucket directories remain on disk under #{options[:triage_dir]}"
   else
-    warn "No matching buckets to verify (skipped #{skipped_unrepro} unreproducible buckets)"
+    msg = "No matching buckets to verify (skipped #{skipped_unrepro} unreproducible buckets)"
   end
-  exit 0
+  die_config(msg, options, code: options[:bisect] ? 128 : 0)
+end
+
+if target_root != fuzz_root && !options[:json_stdout] && !options[:quiet]
+  puts "Target: #{target_root}"
 end
 
 runners = {}
 selected.map { |b| b[:profile] }.uniq.each do |profile|
   cmd = [
     verify_bucket_sh,
-    "--repo-root", repo_root,
+    "--repo-root", target_root,
+    "--fuzz-root", fuzz_root,
     "--profile", profile,
     "--build-only"
   ]
@@ -434,7 +467,11 @@ selected.map { |b| b[:profile] }.uniq.each do |profile|
   stdout, stderr, status = Open3.capture3(*cmd)
   unless status.success?
     warn stderr unless stderr.empty?
-    abort "Failed to build verify_runner (#{profile})"
+    if status.exitstatus == 125
+      warn "Skipping commit: verify_runner (#{profile}) could not be built for #{target_root}"
+      exit 125
+    end
+    die_config("Failed to build verify_runner (#{profile})", options, code: 1)
   end
   runners[profile] = stdout.strip
 end
@@ -466,6 +503,7 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
   end
 
   group_results = []
+  fail_fast_hit = false
   group_items.each do |b|
     bucket_dir = b[:dir]
     bucket_id = b[:bucket_id]
@@ -474,7 +512,8 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
 
     cmd = [
       verify_bucket_sh,
-      "--repo-root", repo_root,
+      "--repo-root", target_root,
+      "--fuzz-root", fuzz_root,
       "--bucket-dir", bucket_dir,
       "--profile", profile,
       "--runner", runner,
@@ -482,6 +521,8 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
       "--max-failures", options[:max_failures].to_s,
       "--json"
     ]
+    cmd << "--input-min-only" if options[:input_min_only]
+    cmd << "--skip-min" if options[:skip_min]
     cmd << "--symbolize" if options[:symbolize]
     if options[:extract_dir]
       surv_dir = File.join(options[:extract_dir], bucket_id)
@@ -492,10 +533,12 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
     res = begin
             JSON.parse(stdout)
           rescue JSON::ParserError
-            abort "Malformed verifier output for #{bucket_id} (rc=#{status.exitstatus}): #{stdout}#{stderr}"
+            exit 125 if status.exitstatus == 125
+            die_config("Malformed verifier output for #{bucket_id} (rc=#{status.exitstatus}): #{stdout}#{stderr}", options, code: 1)
           end
 
     has_min = File.file?(File.join(bucket_dir, "input.min"))
+    min_checked = has_min && !options[:skip_min]
     failures = res["failures"] || []
     min_failed = failures.any? { |f| f["name"] == "input.min" }
     checked = res["checked"].to_i
@@ -507,7 +550,7 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
                       "EMPTY"
                     elsif failed == 0
                       "PASS"
-                    elsif has_min && !min_failed
+                    elsif min_checked && !min_failed
                       "PARTIAL"
                     else
                       "FAIL"
@@ -525,7 +568,7 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
       "profile" => profile,
       "status" => bucket_status,
       "has_input_min" => has_min,
-      "min_passed" => has_min ? !min_failed : nil,
+      "min_passed" => min_checked ? !min_failed : nil,
       "total" => res["total"],
       "checked" => checked,
       "passed" => res["passed"],
@@ -540,45 +583,52 @@ selected.slice_when { |a, b| a[:cluster_id] != b[:cluster_id] }.each_with_index 
     bucket_results << bucket_entry
     group_results << bucket_entry
 
-    next if options[:json_stdout] || (options[:quiet] && bucket_status == "PASS")
+    if !options[:json_stdout] && !(options[:quiet] && bucket_status == "PASS")
+      print_bucket_result(bucket_entry, options)
+    end
 
-    print_bucket_result(bucket_entry, options)
+    if options[:fail_fast] && %w[FAIL PARTIAL].include?(bucket_status)
+      fail_fast_hit = true
+      break
+    end
   end
 
-  next unless cluster_mode
+  if cluster_mode
+    c_status, c_counts, c_checked, c_failed = aggregate_cluster_status(group_results)
+    if !options[:json_stdout] && !options[:quiet]
+      label = cid || "unclustered"
+      puts "-> #{label}: #{c_status} (#{c_counts['PASS']}/#{group_results.size} PASS, #{c_counts['PARTIAL']} PARTIAL, #{c_counts['FAIL']} FAIL; #{c_failed}/#{c_checked} inputs failed)"
+    end
 
-  c_status, c_counts, c_checked, c_failed = aggregate_cluster_status(group_results)
-  if !options[:json_stdout] && !options[:quiet]
-    label = cid || "unclustered"
-    puts "-> #{label}: #{c_status} (#{c_counts['PASS']}/#{group_results.size} PASS, #{c_counts['PARTIAL']} PARTIAL, #{c_counts['FAIL']} FAIL; #{c_failed}/#{c_checked} inputs failed)"
+    if cid
+      info = group_items.first[:cluster_info] || {}
+      cluster_counts[c_status] += 1
+      cluster_results << {
+        "cluster_id" => cid,
+        "status" => c_status,
+        "representative" => info.dig("representative", "bucket_id"),
+        "buckets_checked" => group_results.size,
+        "buckets_in_cluster" => info["bucket_count"] || group_results.size,
+        "occurrences" => info["occurrences"],
+        "pass" => c_counts["PASS"],
+        "partial" => c_counts["PARTIAL"],
+        "fail" => c_counts["FAIL"],
+        "empty" => c_counts["EMPTY"],
+        "inputs_checked" => c_checked,
+        "inputs_failed" => c_failed,
+        "buckets" => group_results.map { |r| r["bucket_id"] }
+      }
+    else
+      unclustered_count += group_results.size
+    end
   end
 
-  if cid
-    info = group_items.first[:cluster_info] || {}
-    cluster_counts[c_status] += 1
-    cluster_results << {
-      "cluster_id" => cid,
-      "status" => c_status,
-      "representative" => info.dig("representative", "bucket_id"),
-      "buckets_checked" => group_results.size,
-      "buckets_in_cluster" => info["bucket_count"] || group_results.size,
-      "occurrences" => info["occurrences"],
-      "pass" => c_counts["PASS"],
-      "partial" => c_counts["PARTIAL"],
-      "fail" => c_counts["FAIL"],
-      "empty" => c_counts["EMPTY"],
-      "inputs_checked" => c_checked,
-      "inputs_failed" => c_failed,
-      "buckets" => group_results.map { |r| r["bucket_id"] }
-    }
-  else
-    unclustered_count += group_results.size
-  end
+  break if fail_fast_hit
 end
 
 elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 summary = {
-  "buckets_checked" => selected.size,
+  "buckets_checked" => bucket_results.size,
   "buckets_skipped_unreproducible" => skipped_unrepro,
   "pass" => counts["PASS"],
   "partial" => counts["PARTIAL"],
@@ -603,6 +653,7 @@ report = {
   "summary" => summary,
   "buckets" => bucket_results
 }
+report["target_root"] = target_root if target_root != fuzz_root
 if cluster_mode
   report["clusters_file"] = clusters_source if clusters_source
   report["clusters"] = cluster_results
@@ -655,7 +706,7 @@ else
   puts format(
     "Summary: %s%d buckets checked (%d PASS, %d PARTIAL, %d FAIL, %d EMPTY; %d unreproducible skipped), %d/%d inputs failed in %.2fs",
     cluster_prefix,
-    selected.size,
+    bucket_results.size,
     counts["PASS"],
     counts["PARTIAL"],
     counts["FAIL"],
@@ -667,5 +718,11 @@ else
   )
 end
 
-exit((counts["PARTIAL"] + counts["FAIL"]) == 0 ? 0 : 1)
+failed_buckets = counts["PARTIAL"] + counts["FAIL"]
+if (options[:invert] || options[:bisect]) && (counts["PASS"] + failed_buckets) == 0
+  exit 125
+end
+verdict_ok = failed_buckets == 0
+verdict_ok = !verdict_ok if options[:invert]
+exit(verdict_ok ? 0 : 1)
 

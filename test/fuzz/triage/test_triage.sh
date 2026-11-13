@@ -19,6 +19,9 @@
 # 7. Root-cause bucket clustering (cluster.rb): cross-reason frame merges,
 #    frame-presence mismatch separation, single-bug short campaigns, boilerplate
 #    & recovery damping, unreproducible filtering, fallbacks, and determinism.
+# 8. External target verification (--target / --fuzz-root), automatic template
+#    regeneration, 2026 API capability shims, exit 125 on unbuildable/pre-opaque
+#    commits, verify.rb --invert / --fail-fast, and git bisect (bisect.rb).
 
 set -euo pipefail
 
@@ -30,7 +33,7 @@ fail() {
     exit 1
 }
 
-echo "[1/7] Checking signature.sh normalization and SIGPIPE safety..."
+echo "[1/8] Checking signature.sh normalization and SIGPIPE safety..."
 s1=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int32_t'\n#0 0x1234 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s2=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s3=$(printf "src/prism.c:20:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
@@ -71,7 +74,7 @@ ruby -e 'File.write(ARGV.fetch(0), "INVARIANT[stream]: kind=parsed_size_oob [det
 SIGLINES=15 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_inv_trace.txt" >/dev/null
 echo "  signature.sh normalization and 5,000-line trace check passed"
 
-echo "[2/7] Checking halfempty.sh minimization, header preservation, and drift protection..."
+echo "[2/8] Checking halfempty.sh minimization, header preservation, and drift protection..."
 cat << 'EOF' > "$WORKDIR/synth_target.c"
 #define _GNU_SOURCE
 #include <signal.h>
@@ -227,7 +230,7 @@ ruby -e '
 ' "$WORKDIR/inv.in" "$WORKDIR/inv.min"
 echo "  halfempty.sh header preservation, drift protection, INVARIANT symmetry breaking, SIGSEGV, and 4-byte checks passed"
 
-echo "[3/7] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
+echo "[3/8] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
 ruby - "$WORKDIR" << 'EOF'
 workdir = ARGV.fetch(0)
 code = File.read("test/fuzz/triage/triage.rb")
@@ -403,7 +406,7 @@ PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
-echo "[4/7] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
+echo "[4/8] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
 mkdir -p "$WORKDIR/afl/w1/crashes" "$WORKDIR/afl/w2/crashes" "$WORKDIR/afl/w1/hangs"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w1/cmdline"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w2/cmdline"
@@ -536,7 +539,7 @@ EOF
 echo "  concurrent deduplication, header minimization, coalescing, sentinel, and JSON metadata checks passed"
 
 if command -v afl-clang-lto >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1 && [ -d build/afl ]; then
-    echo "[5/7] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
+    echo "[5/8] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
     cat << 'EOF' > "$WORKDIR/cov_target.c"
 #include <stdint.h>
 #include <stdio.h>
@@ -639,10 +642,10 @@ raise "expected recounted archive to contain all 3 inputs, got #{b["archive"].in
 EOF
     echo "  afl-showmap coverage, corpus DF, DOCUMENT_IDS, caching, and recount checks passed"
 else
-    echo "[5/7] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
+    echo "[5/8] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
 fi
 
-echo "[6/7] Checking verify_runner crash/timeout/leak isolation and verify.sh / verify.rb PARTIAL-fix workflow..."
+echo "[6/8] Checking verify_runner crash/timeout/leak isolation and verify.sh / verify.rb PARTIAL-fix workflow..."
 cat << 'EOF' > "$WORKDIR/mock_fuzz_target.c"
 #include <stdint.h>
 #include <stdio.h>
@@ -852,7 +855,7 @@ raise "empty survivor dir should not exist for PASS bucket" if Dir.exist?(File.j
 EOF
 echo "  verify_runner isolation, real verify.sh build, and verify.rb PARTIAL-fix checks passed"
 
-echo "[7/7] Checking cluster.rb root-cause clustering, cross-reason merges, single-bug stability, and CLI..."
+echo "[7/8] Checking cluster.rb root-cause clustering, cross-reason merges, single-bug stability, and CLI..."
 ruby - "$WORKDIR" << 'EOF'
 require "json"
 require_relative "test/fuzz/triage/cluster"
@@ -1466,5 +1469,484 @@ raise "expected 0 buckets remaining" unless idx.dig("summary", "bucket_count") =
 raise "expected 0 clusters remaining" unless cl.dig("summary", "cluster_count") == 0
 EOF
 echo "  retriage.rb (--dry-run, scoped cluster survivor split, occurrence provenance, #skip sentinels, and full PASS cleanup) checks passed"
+
+echo "[8/8] Checking external target verification, template regeneration, 2026 API shims, exit 125, --invert/--fail-fast, and bisect.rb..."
+
+# 1) Verify parse.c compiles cleanly under all compatibility macro combinations (-DSLOW and fast modes).
+${CC:-clang} -c -O1 -std=c99 -Iinclude -DSLOW \
+    -DPRISM_FUZZ_NO_ATTACH_COMMENTS -DPRISM_FUZZ_NO_STACK_BUDGET \
+    -DPRISM_FUZZ_NO_ERRORS_FORMAT -DPRISM_FUZZ_NO_STREAM -DPRISM_FUZZ_NO_JSON \
+    test/fuzz/harness/parse.c -o "$WORKDIR/parse_compat_slow.o"
+
+# 2) Verify external Prism target copy regenerates missing templates cleanly without touching host templates.
+ext_prism_target="$WORKDIR/ext_prism_target"
+mkdir -p "$ext_prism_target"
+cp -R "$PWD/config.yml" "$PWD/templates" "$PWD/include" "$PWD/src" "$ext_prism_target/"
+rm -f "$ext_prism_target/src/node.c" "$ext_prism_target/include/prism/ast.h"
+ext_runner="$(VERIFY_BUILD_DIR="" "$PWD/test/fuzz/triage/verify_bucket.sh" --repo-root "$ext_prism_target" --fuzz-root "$PWD" --profile asan_ubsan --build-only)"
+[ -x "$ext_runner" ] || fail "expected external verify_runner to build at $ext_runner"
+[ -f "$ext_prism_target/src/node.c" ] && [ -f "$ext_prism_target/include/prism/ast.h" ] || fail "expected verify_bucket.sh to regenerate missing templates under $ext_prism_target"
+[ -f "$ext_runner.fingerprint" ] || fail "expected build fingerprint at $ext_runner.fingerprint"
+
+# 3) Build a synthetic 7-commit Prism mock git repo covering:
+#    - c1: GOOD (all pass, current API)
+#    - c2: pre-opaque API (no pm_arena_new -> verify_bucket.sh / verify.rb exits 125)
+#    - c3: GOOD after opaque (pass, allows bisect to isolate c4 even after skipping c2)
+#    - c4: BAD regression (older 2026 APIs: no stack_budget/attach_comments, pm_string_constant_init, pm_parser_*_each; triggers ABRT)
+#    - c5: STILL BAD (current API, crashes on CRASH_TOK_INPUT)
+#    - c6: FIRST FIXED (current API, all pass)
+#    - c7: LATER FIXED (current API, all pass; catches missing --invert in fix bisect)
+bisect_repo="$WORKDIR/bisect_mock_repo"
+bisect_triage="$WORKDIR/bisect_triage"
+mkdir -p "$bisect_repo/include/prism" "$bisect_repo/src" "$bisect_triage/ABRT/tok_bug" "$bisect_triage/ABRT/tok_other"
+# Put tok_bug first (lexicographically or via input) and tok_other second to also verify --fail-fast.
+printf '\x80\x80\xff\x01CRASH_TOK_INPUT' > "$bisect_triage/ABRT/tok_bug/input.min"
+printf '\x00\x00\x03\x01PASS_INPUT' > "$bisect_triage/ABRT/tok_other/input.min"
+
+git init -q "$bisect_repo"
+git -C "$bisect_repo" config user.email "fuzz-test@example.com"
+git -C "$bisect_repo" config user.name "Fuzz Test"
+
+cat << 'EOF' > "$bisect_repo/write_commit.rb"
+mode, crash_on = ARGV
+h = File.join(__dir__, "include")
+p = File.join(h, "prism")
+
+if mode == "pre_opaque"
+  File.write(File.join(h, "prism.h"), "#include \"prism/arena.h\"\n")
+  File.write(File.join(p, "arena.h"), "typedef struct { int x; } pm_arena_t;\n")
+  File.write(File.join(p, "options.h"), "")
+  File.write(File.join(p, "stringy.h"), "")
+  File.write(File.join(p, "parser.h"), "")
+  File.write(File.join(p, "diagnostic.h"), "")
+  File.write(File.join(__dir__, "src/stub.c"), "int stub_dummy = 0;\n")
+  exit 0
+end
+
+legacy = (mode == "legacy2026")
+File.write(File.join(h, "prism.h"), <<~H)
+  #include <stddef.h>
+  #include <stdint.h>
+  #include <stdbool.h>
+  #include "prism/arena.h"
+  #include "prism/stringy.h"
+  #include "prism/options.h"
+  #include "prism/diagnostic.h"
+  #include "prism/parser.h"
+  #include "prism/source.h"
+  #include "prism/stream.h"
+H
+File.write(File.join(p, "arena.h"), <<~H)
+  typedef struct pm_arena_t pm_arena_t;
+  pm_arena_t *pm_arena_new(void);
+  void pm_arena_free(pm_arena_t *arena);
+H
+File.write(File.join(p, "stringy.h"), <<~H)
+  typedef struct { const uint8_t *source; size_t length; } pm_string_t;
+  #{legacy ? "void pm_string_constant_init(pm_string_t *s, const char *src, size_t len);" : "void pm_string_init(pm_string_t *s, const uint8_t *src, size_t len);"}
+H
+opts_extra = legacy ? "" : <<~H
+  void pm_options_attach_comments_set(pm_options_t *o, bool v);
+  void pm_options_stack_budget_set(pm_options_t *o, size_t b);
+H
+File.write(File.join(p, "options.h"), <<~H)
+  typedef struct pm_options_t pm_options_t;
+  typedef struct pm_options_scope_t pm_options_scope_t;
+  typedef void (*pm_options_shebang_callback_t)(pm_options_t *, const uint8_t *, size_t, void *);
+  #define PM_OPTIONS_COMMAND_LINE_X 0x20
+  #define PM_OPTIONS_SCOPE_FORWARDING_NONE 0x0
+  pm_options_t *pm_options_new(void);
+  void pm_options_free(pm_options_t *o);
+  void pm_options_line_set(pm_options_t *o, int32_t l);
+  void pm_options_command_line_set(pm_options_t *o, uint8_t c);
+  void pm_options_main_script_set(pm_options_t *o, bool m);
+  void pm_options_freeze_set(pm_options_t *o, bool f);
+  void pm_options_partial_script_set(pm_options_t *o, bool p);
+  void pm_options_encoding_locked_set(pm_options_t *o, bool e);
+  bool pm_options_version_set(pm_options_t *o, const char *v, size_t l);
+  void pm_options_frozen_string_literal_set(pm_options_t *o, bool f);
+  void pm_options_encoding_set(pm_options_t *o, const char *e);
+  void pm_options_filepath_set(pm_options_t *o, const char *f);
+  void pm_options_shebang_callback_set(pm_options_t *o, pm_options_shebang_callback_t cb, void *d);
+  bool pm_options_scopes_init(pm_options_t *o, size_t c);
+  pm_options_scope_t *pm_options_scope_mut(pm_options_t *o, size_t i);
+  void pm_options_scope_init(pm_options_scope_t *s, size_t c);
+  void pm_options_scope_forwarding_set(pm_options_scope_t *s, uint8_t f);
+  pm_string_t *pm_options_scope_local_mut(pm_options_scope_t *s, size_t i);
+  #{opts_extra}
+H
+File.write(File.join(p, "diagnostic.h"), <<~H)
+  typedef struct { uint32_t start; uint32_t length; } pm_location_t;
+  typedef struct pm_diagnostic_t pm_diagnostic_t;
+  typedef struct pm_comment_t pm_comment_t;
+  typedef struct pm_magic_comment_t pm_magic_comment_t;
+  #define PM_COMMENT_EMBDOC 1
+  pm_location_t pm_diagnostic_location(const pm_diagnostic_t *d);
+  const char *pm_diagnostic_type(const pm_diagnostic_t *d);
+  unsigned pm_diagnostic_error_level(const pm_diagnostic_t *d);
+  unsigned pm_diagnostic_warning_level(const pm_diagnostic_t *d);
+  pm_location_t pm_comment_location(const pm_comment_t *c);
+  int pm_comment_type(const pm_comment_t *c);
+  pm_location_t pm_magic_comment_key(const pm_magic_comment_t *mc);
+  pm_location_t pm_magic_comment_value(const pm_magic_comment_t *mc);
+  const pm_diagnostic_t *pm_diagnostic_next(const pm_diagnostic_t *d);
+  const pm_comment_t *pm_comment_next(const pm_comment_t *c);
+  const pm_magic_comment_t *pm_magic_comment_next(const pm_magic_comment_t *mc);
+H
+iter_decls = if legacy
+  <<~H
+    typedef void (*pm_comment_callback_t)(const pm_comment_t *, void *);
+    typedef void (*pm_diagnostic_callback_t)(const pm_diagnostic_t *, void *);
+    typedef void (*pm_magic_comment_callback_t)(const pm_magic_comment_t *, void *);
+    void pm_parser_errors_each(const pm_parser_t *, pm_diagnostic_callback_t, void *);
+    void pm_parser_warnings_each(const pm_parser_t *, pm_diagnostic_callback_t, void *);
+    void pm_parser_comments_each(const pm_parser_t *, pm_comment_callback_t, void *);
+    void pm_parser_magic_comments_each(const pm_parser_t *, pm_magic_comment_callback_t, void *);
+  H
+else
+  <<~H
+    const pm_diagnostic_t *pm_parser_errors_first(const pm_parser_t *);
+    const pm_diagnostic_t *pm_parser_warnings_first(const pm_parser_t *);
+    const pm_comment_t *pm_parser_comments_first(const pm_parser_t *);
+    const pm_magic_comment_t *pm_parser_magic_comments_first(const pm_parser_t *);
+  H
+end
+visit_decls = if legacy
+  <<~H
+    void pm_visit_node(const pm_node_t *n, bool (*cb)(const pm_node_t *, void *), void *d);
+    void pm_visit_child_nodes(const pm_node_t *n, bool (*cb)(const pm_node_t *, void *), void *d);
+  H
+else
+  <<~H
+    typedef enum { PM_VISIT_DESCEND = 0, PM_VISIT_SKIP = 1 } pm_visit_result_t;
+    void pm_visit_node(const pm_node_t *n, pm_visit_result_t (*cb)(const pm_node_t *, void *), void *d);
+    void pm_visit_child_nodes(const pm_node_t *n, pm_visit_result_t (*cb)(const pm_node_t *, void *), void *d);
+  H
+end
+File.write(File.join(p, "parser.h"), <<~H)
+  typedef uint16_t pm_node_type_t;
+  typedef struct { pm_node_type_t type; pm_location_t location; } pm_node_t;
+  typedef struct { uint32_t start; uint32_t length; } pm_string_loc_dummy;
+  typedef struct { pm_node_t base; pm_location_t opening_loc; pm_location_t closing_loc; } pm_string_node_t;
+  typedef pm_string_node_t pm_interpolated_string_node_t;
+  typedef pm_string_node_t pm_x_string_node_t;
+  typedef pm_string_node_t pm_interpolated_x_string_node_t;
+  typedef struct { pm_node_t base; pm_location_t opening_loc; } pm_array_node_t;
+  enum { PM_STRING_NODE = 1, PM_INTERPOLATED_STRING_NODE, PM_X_STRING_NODE, PM_INTERPOLATED_X_STRING_NODE, PM_SYMBOL_NODE, PM_INTERPOLATED_SYMBOL_NODE, PM_REGULAR_EXPRESSION_NODE, PM_INTERPOLATED_REGULAR_EXPRESSION_NODE, PM_MATCH_LAST_LINE_NODE, PM_INTERPOLATED_MATCH_LAST_LINE_NODE, PM_ARRAY_NODE };
+  #define PM_NODE_TYPE(n) ((n)->type)
+  typedef struct { size_t size; size_t capacity; uint32_t *offsets; } pm_line_offset_list_t;
+  typedef struct pm_parser_t pm_parser_t;
+  pm_parser_t *pm_parser_new(pm_arena_t *a, const uint8_t *s, size_t n, const pm_options_t *o);
+  void pm_parser_free(pm_parser_t *p);
+  pm_node_t *pm_parse(pm_parser_t *p);
+  const pm_line_offset_list_t *pm_parser_line_offsets(const pm_parser_t *p);
+  const pm_location_t *pm_parser_data_loc(const pm_parser_t *p);
+  #{visit_decls}
+  const char *pm_node_type(pm_node_type_t t);
+  #{iter_decls}
+H
+File.write(File.join(p, "source.h"), "typedef struct pm_source_t pm_source_t; typedef char *(pm_source_stream_fgets_t)(char *, int, void *); typedef int (pm_source_stream_feof_t)(void *); pm_source_t *pm_source_stream_new(void *, pm_source_stream_fgets_t *, pm_source_stream_feof_t *); size_t pm_source_length(const pm_source_t *); void pm_source_free(pm_source_t *);\n")
+File.write(File.join(p, "stream.h"), "pm_node_t *pm_parse_stream(pm_parser_t **p, pm_arena_t *a, pm_source_t *s, const pm_options_t *o);\n")
+
+crash_tokens = crash_on == "NONE" ? [] : crash_on.split(",")
+crash_stmt = crash_tokens.map do |tok|
+  <<~C
+    for (size_t i = 0; i + #{tok.bytesize} <= len; i++) {
+      if (memcmp(src + i, "#{tok}", #{tok.bytesize}) == 0) abort();
+    }
+  C
+end.join("\n")
+
+File.write(File.join(__dir__, "src/stub.c"), <<~C)
+  #include "prism.h"
+  #include <stdlib.h>
+  #include <string.h>
+  struct pm_arena_t { int unused; };
+  struct pm_options_scope_t { pm_string_t locals[4]; };
+  struct pm_options_t { pm_options_scope_t scopes[4]; };
+  struct pm_diagnostic_t { int unused; };
+  struct pm_comment_t { int unused; };
+  struct pm_magic_comment_t { int unused; };
+  struct pm_source_t { size_t len; const uint8_t *src; };
+  struct pm_parser_t { const uint8_t *src; size_t len; uint32_t offs[1]; pm_line_offset_list_t lo; pm_location_t data_loc; pm_node_t root; };
+  pm_arena_t *pm_arena_new(void) { return calloc(1, sizeof(pm_arena_t)); }
+  void pm_arena_free(pm_arena_t *a) { free(a); }
+  pm_options_t *pm_options_new(void) { return calloc(1, sizeof(pm_options_t)); }
+  void pm_options_free(pm_options_t *o) { free(o); }
+  void pm_options_line_set(pm_options_t *o, int32_t l) { (void)o; (void)l; }
+  void pm_options_command_line_set(pm_options_t *o, uint8_t c) { (void)o; (void)c; }
+  void pm_options_main_script_set(pm_options_t *o, bool m) { (void)o; (void)m; }
+  void pm_options_freeze_set(pm_options_t *o, bool f) { (void)o; (void)f; }
+  void pm_options_partial_script_set(pm_options_t *o, bool p) { (void)o; (void)p; }
+  void pm_options_encoding_locked_set(pm_options_t *o, bool e) { (void)o; (void)e; }
+  bool pm_options_version_set(pm_options_t *o, const char *v, size_t l) { (void)o; (void)v; (void)l; return true; }
+  void pm_options_frozen_string_literal_set(pm_options_t *o, bool f) { (void)o; (void)f; }
+  void pm_options_encoding_set(pm_options_t *o, const char *e) { (void)o; (void)e; }
+  void pm_options_filepath_set(pm_options_t *o, const char *f) { (void)o; (void)f; }
+  void pm_options_shebang_callback_set(pm_options_t *o, pm_options_shebang_callback_t cb, void *d) { (void)o; (void)cb; (void)d; }
+  bool pm_options_scopes_init(pm_options_t *o, size_t c) { (void)o; return c <= 4; }
+  pm_options_scope_t *pm_options_scope_mut(pm_options_t *o, size_t i) { return &o->scopes[i]; }
+  void pm_options_scope_init(pm_options_scope_t *s, size_t c) { (void)s; (void)c; }
+  void pm_options_scope_forwarding_set(pm_options_scope_t *s, uint8_t f) { (void)s; (void)f; }
+  pm_string_t *pm_options_scope_local_mut(pm_options_scope_t *s, size_t i) { return &s->locals[i]; }
+  void pm_string_init(pm_string_t *s, const uint8_t *src, size_t len) { s->source = src; s->length = len; }
+  void pm_string_constant_init(pm_string_t *s, const char *src, size_t len) { s->source = (const uint8_t *)src; s->length = len; }
+  void pm_options_attach_comments_set(pm_options_t *o, bool v) { (void)o; (void)v; }
+  void pm_options_stack_budget_set(pm_options_t *o, size_t b) { (void)o; (void)b; }
+  pm_parser_t *pm_parser_new(pm_arena_t *a, const uint8_t *s, size_t n, const pm_options_t *o) {
+    (void)a; (void)o;
+    pm_parser_t *p = calloc(1, sizeof(pm_parser_t));
+    p->src = s; p->len = n; p->offs[0] = 0; p->lo.size = 1; p->lo.capacity = 1; p->lo.offsets = p->offs;
+    p->root.type = 0; p->root.location.start = 0; p->root.location.length = (uint32_t)n;
+    return p;
+  }
+  void pm_parser_free(pm_parser_t *p) { free(p); }
+  pm_node_t *pm_parse(pm_parser_t *p) {
+    const uint8_t *src = p->src; size_t len = p->len;
+    #{crash_stmt}
+    return &p->root;
+  }
+  const pm_line_offset_list_t *pm_parser_line_offsets(const pm_parser_t *p) { return &p->lo; }
+  const pm_location_t *pm_parser_data_loc(const pm_parser_t *p) { return &p->data_loc; }
+  pm_source_t *pm_source_stream_new(void *st, pm_source_stream_fgets_t *fg, pm_source_stream_feof_t *fe) { (void)st; (void)fg; (void)fe; return calloc(1, sizeof(pm_source_t)); }
+  pm_node_t *pm_parse_stream(pm_parser_t **p, pm_arena_t *a, pm_source_t *s, const pm_options_t *o) { (void)s; *p = pm_parser_new(a, (const uint8_t *)"", 0, o); return pm_parse(*p); }
+  size_t pm_source_length(const pm_source_t *s) { return s->len; }
+  void pm_source_free(pm_source_t *s) { free(s); }
+  void pm_visit_node(const pm_node_t *n, #{legacy ? "bool" : "pm_visit_result_t"} (*cb)(const pm_node_t *, void *), void *d) { if (n) cb(n, d); }
+  void pm_visit_child_nodes(const pm_node_t *n, #{legacy ? "bool" : "pm_visit_result_t"} (*cb)(const pm_node_t *, void *), void *d) { (void)n; (void)cb; (void)d; }
+  const char *pm_node_type(pm_node_type_t t) { (void)t; return "node"; }
+  pm_location_t pm_diagnostic_location(const pm_diagnostic_t *d) { (void)d; return (pm_location_t){0, 0}; }
+  const char *pm_diagnostic_type(const pm_diagnostic_t *d) { (void)d; return "err"; }
+  unsigned pm_diagnostic_error_level(const pm_diagnostic_t *d) { (void)d; return 0; }
+  unsigned pm_diagnostic_warning_level(const pm_diagnostic_t *d) { (void)d; return 0; }
+  pm_location_t pm_comment_location(const pm_comment_t *c) { (void)c; return (pm_location_t){0, 0}; }
+  int pm_comment_type(const pm_comment_t *c) { (void)c; return 0; }
+  pm_location_t pm_magic_comment_key(const pm_magic_comment_t *mc) { (void)mc; return (pm_location_t){0, 0}; }
+  pm_location_t pm_magic_comment_value(const pm_magic_comment_t *mc) { (void)mc; return (pm_location_t){0, 0}; }
+  const pm_diagnostic_t *pm_diagnostic_next(const pm_diagnostic_t *d) { (void)d; return NULL; }
+  const pm_comment_t *pm_comment_next(const pm_comment_t *c) { (void)c; return NULL; }
+  const pm_magic_comment_t *pm_magic_comment_next(const pm_magic_comment_t *mc) { (void)mc; return NULL; }
+  const pm_diagnostic_t *pm_parser_errors_first(const pm_parser_t *p) { (void)p; return NULL; }
+  const pm_diagnostic_t *pm_parser_warnings_first(const pm_parser_t *p) { (void)p; return NULL; }
+  const pm_comment_t *pm_parser_comments_first(const pm_parser_t *p) { (void)p; return NULL; }
+  const pm_magic_comment_t *pm_parser_magic_comments_first(const pm_parser_t *p) { (void)p; return NULL; }
+  void pm_parser_errors_each(const pm_parser_t *p, void (*cb)(const pm_diagnostic_t *, void *), void *d) { (void)p; (void)cb; (void)d; }
+  void pm_parser_warnings_each(const pm_parser_t *p, void (*cb)(const pm_diagnostic_t *, void *), void *d) { (void)p; (void)cb; (void)d; }
+  void pm_parser_comments_each(const pm_parser_t *p, void (*cb)(const pm_comment_t *, void *), void *d) { (void)p; (void)cb; (void)d; }
+  void pm_parser_magic_comments_each(const pm_parser_t *p, void (*cb)(const pm_magic_comment_t *, void *), void *d) { (void)p; (void)cb; (void)d; }
+C
+EOF
+
+make_commit() {
+  local mode="$1" crash_on="$2" msg="$3"
+  ruby "$bisect_repo/write_commit.rb" "$mode" "$crash_on"
+  git -C "$bisect_repo" add include src
+  git -C "$bisect_repo" commit -q --allow-empty -m "$msg"
+}
+
+make_commit current NONE "c1_good"
+c1_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit pre_opaque NONE "c2_pre_opaque"
+c2_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current NONE "c3_good_after_opaque"
+c3_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit legacy2026 CRASH_TOK_INPUT "c4_bad_legacy2026"
+c4_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_TOK_INPUT "c5_still_bad"
+c5_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current NONE "c6_first_fixed"
+c6_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current NONE "c7_later_fixed"
+c7_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+
+# Check pre-opaque target returns exit 125 from verify.rb --target
+git -C "$bisect_repo" checkout -q "$c2_sha"
+set +e
+VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/verify.rb --triage-dir "$bisect_triage" --target "$bisect_repo" --bisect --quiet >"$WORKDIR/pre_opaque.out" 2>"$WORKDIR/pre_opaque.err"
+pre_rc=$?
+set -e
+[ "$pre_rc" -eq 125 ] || fail "expected exit 125 for pre-opaque commit, got $pre_rc"
+
+# Check legacy2026 target compiles with probed shims, --invert returns 0 on FAIL, --fail-fast stops after tok_bug, and missing cluster returns 128 in --bisect mode.
+git -C "$bisect_repo" checkout -q "$c4_sha"
+VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$bisect_triage" --target "$bisect_repo" --invert --fail-fast \
+    --json "$WORKDIR/bisect_inv.json" >/dev/null
+ruby - "$WORKDIR/bisect_inv.json" << 'EOF'
+require "json"
+rep = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected fail-fast to stop after 1 bucket, got #{rep.dig('summary', 'buckets_checked')}" unless rep.dig("summary", "buckets_checked") == 1
+raise "expected fail == 1" unless rep.dig("summary", "fail") == 1
+EOF
+
+set +e
+VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/verify.rb --triage-dir "$WORKDIR/no_such_dir" --target "$bisect_repo" --bisect --quiet >/dev/null 2>&1
+bad_cfg_rc=$?
+set -e
+[ "$bad_cfg_rc" -eq 128 ] || fail "expected exit 128 for missing triage dir under --bisect, got $bad_cfg_rc"
+
+git -C "$bisect_repo" checkout -q "$c7_sha"
+
+# Bisect regression: c1 (good) .. c5 (bad), skipping c2 (125), identifying c4_bad_legacy2026!
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_triage" \
+    --good "$c1_sha" --bad "$c5_sha" --bucket ABRT/tok_bug \
+    --worktree "$WORKDIR/bisect_wt_reg" > "$WORKDIR/bisect_reg.out" 2>&1; then
+  fail "regression bisect failed: $(cat "$WORKDIR/bisect_reg.out")"
+fi
+grep -q "^${c4_sha} is the first bad commit$" "$WORKDIR/bisect_reg.out" || fail "expected regression bisect to identify $c4_sha, output: $(cat "$WORKDIR/bisect_reg.out")"
+[ ! -e "$WORKDIR/bisect_wt_reg" ] || fail "expected temporary bisect worktree to be cleaned up"
+
+# Bisect fix: c4 (broken) .. c7 (fixed), identifying c6_first_fixed (not c7_later_fixed)!
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_triage" \
+    --broken "$c4_sha" --fixed "$c7_sha" --bucket ABRT/tok_bug \
+    --worktree "$WORKDIR/bisect_wt_fix" > "$WORKDIR/bisect_fix.out" 2>&1; then
+  fail "fix bisect failed: $(cat "$WORKDIR/bisect_fix.out")"
+fi
+grep -q "^${c6_sha} is the first fixed commit$" "$WORKDIR/bisect_fix.out" || fail "expected fix bisect to identify $c6_sha, output: $(cat "$WORKDIR/bisect_fix.out")"
+
+# Multi-bucket cluster attribution checks (regression split, fix split, PARTIAL archived failure, and --input-min-only/--skip-min)
+bisect_cluster_triage="$WORKDIR/bisect_cluster_triage"
+mkdir -p "$bisect_cluster_triage/ABRT/tok_bug" "$bisect_cluster_triage/ABRT/tok2_bug" "$WORKDIR/bisect_arch_src" "$WORKDIR/bisect_bc1_src"
+printf '\x80\x80\xff\x01CRASH_TOK_INPUT' > "$bisect_cluster_triage/ABRT/tok_bug/input.min"
+printf '\x80\x80\xff\x01CRASH_BC1_INPUT' > "$WORKDIR/bisect_bc1_src/bc1"
+tar -czf "$bisect_cluster_triage/ABRT/tok_bug/inputs.tar.gz" -C "$WORKDIR/bisect_bc1_src" bc1
+printf '\x80\x80\xff\x01CRASH_TOK2_INPUT' > "$bisect_cluster_triage/ABRT/tok2_bug/input.min"
+printf '\x80\x80\xff\x01CRASH_ARCH_INPUT' > "$WORKDIR/bisect_arch_src/arch_extra"
+tar -czf "$bisect_cluster_triage/ABRT/tok2_bug/inputs.tar.gz" -C "$WORKDIR/bisect_arch_src" arch_extra
+
+ruby - "$bisect_cluster_triage" << 'EOF'
+require "json"
+dir = ARGV.fetch(0)
+meta = {
+  "schema_version" => 1,
+  "buckets" => [
+    { "bucket_id" => "ABRT/tok_bug", "reason" => "ABRT", "signature" => "tok_bug", "reproducible" => true, "occurrences" => { "count" => 5 } },
+    { "bucket_id" => "ABRT/tok2_bug", "reason" => "ABRT", "signature" => "tok2_bug", "reproducible" => true, "occurrences" => { "count" => 3 } }
+  ]
+}
+clusters = {
+  "schema_version" => 1,
+  "clusters" => [
+    {
+      "cluster_id" => "cluster-01",
+      "bucket_count" => 2,
+      "occurrences" => 8,
+      "reasons" => { "ABRT" => 8 },
+      "representative" => { "bucket_id" => "ABRT/tok_bug" },
+      "buckets" => [{ "bucket_id" => "ABRT/tok_bug" }, { "bucket_id" => "ABRT/tok2_bug" }]
+    }
+  ]
+}
+File.write(File.join(dir, "metadata.json"), JSON.pretty_generate(meta))
+File.write(File.join(dir, "clusters.json"), JSON.pretty_generate(clusters))
+EOF
+
+make_commit current CRASH_TOK_INPUT "c8_cluster_part1"
+c8_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_TOK_INPUT,CRASH_TOK2_INPUT,CRASH_ARCH_INPUT "c9_cluster_both"
+c9_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_TOK2_INPUT "c10_cluster_fix1"
+c10_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current NONE "c11_cluster_fix_all"
+c11_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_ARCH_INPUT "c12_cluster_arch_only"
+c12_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+
+git -C "$bisect_repo" checkout -q "$c12_sha"
+
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_cluster_triage" \
+    --good "$c7_sha" --bad "$c9_sha" --cluster cluster-01 \
+    --worktree "$WORKDIR/bisect_wt_cluster_reg" > "$WORKDIR/bisect_cluster_reg.out" 2>&1; then
+  fail "split cluster regression bisect failed: $(cat "$WORKDIR/bisect_cluster_reg.out")"
+fi
+grep -q "^${c8_sha} is the first bad commit$" "$WORKDIR/bisect_cluster_reg.out" || fail "expected c8, got: $(cat "$WORKDIR/bisect_cluster_reg.out")"
+grep -q "Warning: only 1/2 selected buckets transitioned at ${c8_sha:0:12}" "$WORKDIR/bisect_cluster_reg.out" || fail "expected split-cluster warning in regression output: $(cat "$WORKDIR/bisect_cluster_reg.out")"
+grep -q "ABRT/tok_bug: FAIL (input.min:" "$WORKDIR/bisect_cluster_reg.out" || fail "expected tok_bug FAIL attribution: $(cat "$WORKDIR/bisect_cluster_reg.out")"
+grep -q "ABRT/tok2_bug: PASS (at ${c9_sha:0:12} BAD: FAIL (input.min + 1 archived:" "$WORKDIR/bisect_cluster_reg.out" || fail "expected tok2_bug PASS + BAD FAIL attribution: $(cat "$WORKDIR/bisect_cluster_reg.out")"
+[ ! -e "$WORKDIR/bisect_wt_cluster_reg" ] || fail "expected temporary cluster reg worktree to be cleaned up"
+
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_cluster_triage" \
+    --broken "$c9_sha" --fixed "$c11_sha" --cluster cluster-01 \
+    --worktree "$WORKDIR/bisect_wt_cluster_fix" > "$WORKDIR/bisect_cluster_fix.out" 2>&1; then
+  fail "split cluster fix bisect failed: $(cat "$WORKDIR/bisect_cluster_fix.out")"
+fi
+grep -q "^${c11_sha} is the first fixed commit$" "$WORKDIR/bisect_cluster_fix.out" || fail "expected c11, got: $(cat "$WORKDIR/bisect_cluster_fix.out")"
+grep -q "Warning: ${c11_sha:0:12} fixed only 1/2 selected buckets (1 already PASSED at ${c10_sha:0:12})" "$WORKDIR/bisect_cluster_fix.out" || fail "expected split-cluster fix warning: $(cat "$WORKDIR/bisect_cluster_fix.out")"
+grep -q "ABRT/tok2_bug: FAIL (input.min:" "$WORKDIR/bisect_cluster_fix.out" || fail "expected tok2_bug fixed-here attribution: $(cat "$WORKDIR/bisect_cluster_fix.out")"
+grep -q "ABRT/tok_bug: PASS (failed at ${c9_sha:0:12} BROKEN: FAIL (input.min" "$WORKDIR/bisect_cluster_fix.out" || fail "expected tok_bug already-PASS + BROKEN detail: $(cat "$WORKDIR/bisect_cluster_fix.out")"
+[ ! -e "$WORKDIR/bisect_wt_cluster_fix" ] || fail "expected temporary cluster fix worktree to be cleaned up"
+
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_cluster_triage" \
+    --good "$c11_sha" --bad "$c12_sha" --cluster cluster-01 \
+    --worktree "$WORKDIR/bisect_wt_cluster_part" > "$WORKDIR/bisect_cluster_part.out" 2>&1; then
+  fail "PARTIAL cluster regression bisect failed: $(cat "$WORKDIR/bisect_cluster_part.out")"
+fi
+grep -q "^${c12_sha} is the first bad commit$" "$WORKDIR/bisect_cluster_part.out" || fail "expected c12, got: $(cat "$WORKDIR/bisect_cluster_part.out")"
+grep -q "ABRT/tok2_bug: PARTIAL (input.min PASSED; 1 archived failed" "$WORKDIR/bisect_cluster_part.out" || fail "expected PARTIAL attribution detail: $(cat "$WORKDIR/bisect_cluster_part.out")"
+[ ! -e "$WORKDIR/bisect_wt_cluster_part" ] || fail "expected temporary cluster partial worktree to be cleaned up"
+
+# Check verify.rb --input-min-only, --skip-min (must report FAIL, not PARTIAL, and min_passed=nil), and mutual exclusion on c12.
+git -C "$bisect_repo" checkout -q "$c12_sha"
+VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$bisect_cluster_triage" --target "$bisect_repo" --cluster cluster-01 \
+    --input-min-only --json "$WORKDIR/verify_min_only.json" >/dev/null
+set +e
+VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$bisect_cluster_triage" --target "$bisect_repo" --bucket ABRT/tok2_bug \
+    --skip-min --json "$WORKDIR/verify_skip_min.json" >/dev/null
+skip_rc=$?
+VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$bisect_cluster_triage" --target "$bisect_repo" --input-min-only --skip-min >/dev/null 2>&1
+both_rc=$?
+set -e
+[ "$skip_rc" -eq 1 ] || fail "expected --skip-min on c12 tok2_bug to exit 1, got $skip_rc"
+[ "$both_rc" -eq 2 ] || fail "expected --input-min-only --skip-min to exit 2, got $both_rc"
+ruby - "$WORKDIR/verify_min_only.json" "$WORKDIR/verify_skip_min.json" << 'EOF'
+require "json"
+mo = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected both buckets PASS under --input-min-only: #{mo['summary']}" unless mo.dig("summary", "pass") == 2 && mo.dig("summary", "inputs_checked") == 2
+sm = JSON.parse(File.read(ARGV.fetch(1)))
+b = sm.fetch("buckets").first
+raise "expected FAIL (not PARTIAL) and min_passed=nil under --skip-min: #{b.inspect}" unless b["status"] == "FAIL" && b["min_passed"].nil? && b["failed"] == 1
+EOF
+
+# Model X -> Y -> Z with contaminated GOOD baseline (c13 has pre-existing archive crash on tok2_bug,
+# c14 introduces B_1.min, c15 introduces BC_1 archive inside tok_bug, c16 leaves B_2.min passing).
+make_commit current CRASH_ARCH_INPUT "c13_g_arch_noise"
+c13_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_ARCH_INPUT,CRASH_TOK_INPUT "c14_x_b1_min"
+c14_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_ARCH_INPUT,CRASH_TOK_INPUT,CRASH_BC1_INPUT "c15_y_bc1_arch"
+c15_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+make_commit current CRASH_ARCH_INPUT,CRASH_TOK_INPUT,CRASH_BC1_INPUT "c16_z_b2_min_ok"
+c16_sha="$(git -C "$bisect_repo" rev-parse HEAD)"
+git -C "$bisect_repo" checkout -q "$c16_sha"
+
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_cluster_triage" \
+    --good "$c13_sha" --bad "$c16_sha" --cluster cluster-01 --input-min-only \
+    --worktree "$WORKDIR/bisect_wt_xyz_min" > "$WORKDIR/bisect_xyz_min.out" 2>&1; then
+  fail "--input-min-only X->Y->Z bisect failed: $(cat "$WORKDIR/bisect_xyz_min.out")"
+fi
+grep -q "^${c14_sha} is the first bad commit$" "$WORKDIR/bisect_xyz_min.out" || fail "expected c14 (X), got: $(cat "$WORKDIR/bisect_xyz_min.out")"
+grep -q "^== Cluster attribution (2 buckets at ${c14_sha:0:12}; input.min only) ==$" "$WORKDIR/bisect_xyz_min.out" || fail "expected input.min-only attribution header: $(cat "$WORKDIR/bisect_xyz_min.out")"
+grep -q "ABRT/tok2_bug: PASS (at ${c16_sha:0:12} BAD: PARTIAL (input.min PASSED; 1 archived failed — arch_extra" "$WORKDIR/bisect_xyz_min.out" || fail "expected tok2_bug BAD PARTIAL attribution: $(cat "$WORKDIR/bisect_xyz_min.out")"
+[ ! -e "$WORKDIR/bisect_wt_xyz_min" ] || fail "expected temporary xyz_min worktree to be cleaned up"
+
+if ! VERIFY_BUILD_DIR="" ruby ./test/fuzz/triage/bisect.rb \
+    --local --git-repo "$bisect_repo" --triage-dir "$bisect_cluster_triage" \
+    --good "$c14_sha" --bad "$c16_sha" --bucket ABRT/tok_bug --skip-min \
+    --worktree "$WORKDIR/bisect_wt_xyz_skip" > "$WORKDIR/bisect_xyz_skip.out" 2>&1; then
+  fail "--skip-min follow-up bisect failed: $(cat "$WORKDIR/bisect_xyz_skip.out")"
+fi
+grep -q "^${c15_sha} is the first bad commit$" "$WORKDIR/bisect_xyz_skip.out" || fail "expected c15 (Y) under --skip-min, got: $(cat "$WORKDIR/bisect_xyz_skip.out")"
+[ ! -e "$WORKDIR/bisect_wt_xyz_skip" ] || fail "expected temporary xyz_skip worktree to be cleaned up"
+
+echo "  external target verification, template regen, 2026 API shims, exit 125/128, --invert/--fail-fast, and bisect.rb checks passed"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."

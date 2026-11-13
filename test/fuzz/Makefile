@@ -41,6 +41,9 @@ FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
 FUZZ_TEMPLATE_DEPS := config.yml $(shell find templates -type f 2>/dev/null)
 FUZZ_TMPFS_FLAGS := --tmpfs /tmp:rw,exec,mode=1777
 FUZZ_CONTAINER_NAME ?= prism-fuzz
+PRISM_TARGET ?= $(TARGET)
+PRISM_REV ?= $(REV)
+FUZZ_EXTERNAL_TARGET := $(strip $(PRISM_TARGET)$(PRISM_REV))
 ifneq ($(FUZZ_DAEMON),)
 FUZZ_RUN_DOCKER_FLAGS := -d --name $(FUZZ_CONTAINER_NAME) -e FUZZ_DAEMON=1
 else
@@ -113,11 +116,37 @@ fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	fi; \
 	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
 
+FUZZ_VERIFY_ENV_FLAGS := -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BY_CLUSTER -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_MAX_FAILURES -e VERIFY_EXTRACT_SURVIVORS -e VERIFY_INPUT_MIN_ONLY -e VERIFY_SKIP_MIN -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_SYMBOLIZE -e VERIFY_FAIL_FAST -e VERIFY_INVERT -e VERIFY_BISECT -e VERIFY_VERBOSE -e VERIFY_QUIET -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED)
+
+ifeq ($(FUZZ_EXTERNAL_TARGET),)
 fuzz-verify: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BY_CLUSTER -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_MAX_FAILURES -e VERIFY_EXTRACT_SURVIVORS -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_SYMBOLIZE -e VERIFY_VERBOSE -e VERIFY_QUIET -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/verify.rb $(VERIFY_ARGS)
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) $(FUZZ_VERIFY_ENV_FLAGS) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/verify.rb $(VERIFY_ARGS)
+else
+fuzz-verify: fuzz-docker-build
+	@if [ -n "$(strip $(PRISM_TARGET))" ] && [ -n "$(strip $(PRISM_REV))" ]; then \
+		echo "Specify either TARGET=... or REV=..., not both." >&2; \
+		exit 2; \
+	fi; \
+	if [ -n "$(strip $(PRISM_REV))" ]; then \
+		target_dir="$$(./test/fuzz/triage/target_worktree.sh "$(PRISM_REV)")" || exit $$?; \
+	else \
+		target_dir="$$(cd "$(PRISM_TARGET)" 2>/dev/null && pwd)" || { echo "Invalid TARGET directory: $(PRISM_TARGET)" >&2; exit 2; }; \
+	fi; \
+	if [ ! -f "$$target_dir/include/prism.h" ] || [ ! -d "$$target_dir/src" ]; then \
+		echo "Invalid Prism target directory: $$target_dir (missing include/prism.h or src/)" >&2; \
+		exit 2; \
+	fi; \
+	if [ -t 1 ]; then \
+		DOCKER_ARGS="-it"; \
+	fi; \
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) $(FUZZ_VERIFY_ENV_FLAGS) -e VERIFY_TARGET=/target -v $(CURDIR):/prism -v "$$target_dir:/target" prism/fuzz ruby ./test/fuzz/triage/verify.rb $(VERIFY_ARGS)
+endif
+
+fuzz-bisect: fuzz-docker-build
+	$(Q) FUZZ_TMPFS_FLAGS="$(FUZZ_TMPFS_FLAGS)" FUZZ_MAX_INPUT_SIZE="$(FUZZ_MAX_INPUT_SIZE)" FUZZ_MAX_ALLOCATED="$(FUZZ_MAX_ALLOCATED)" ruby ./test/fuzz/triage/bisect.rb $(BISECT_ARGS)
 
 fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
@@ -230,5 +259,5 @@ fuzz-clean:
 	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
 
