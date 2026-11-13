@@ -991,6 +991,39 @@ static inline void fuzz_buffer_reset(pm_buffer_t *buffer) {
 #if !defined(PRISM_FUZZ_IJON) && !defined(PRISM_FUZZ_NO_STREAM) && !defined(PRISM_FUZZ_NO_STREAM_DIFF) && \
     !defined(PRISM_FUZZ_LEGACY_NO_ARENA) && !defined(PRISM_FUZZ_LEGACY_ARENA_STRUCT) && !defined(PRISM_FUZZ_LEGACY_PARSER_INIT) && \
     !defined(PRISM_FUZZ_LEGACY_PARSER_DATA_LOC) && !defined(PRISM_FUZZ_LEGACY_BUFFER_STRUCT) && !defined(PRISM_FUZZ_NO_PARSER_ERRORS_SIZE)
+static bool fuzz_has_eof_control_byte(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        uint8_t byte = buf[i];
+        if (byte == '\0' || byte == '\004' || byte == '\032') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void fuzz_assert_serialized_equal(
+    const pm_buffer_t *stream_buf,
+    const pm_buffer_t *ref_buf,
+    const char *kind,
+    const char *ref_label,
+    size_t parsed_size,
+    size_t size
+) {
+    size_t stream_len = pm_buffer_length(stream_buf);
+    size_t ref_len = pm_buffer_length(ref_buf);
+    if (stream_len != ref_len || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_len) != 0) {
+        fuzz_invariant_fail(
+            "INVARIANT[stream_diff]: kind=%s [detail: parsed_size=%zu size=%zu stream_len=%zu %s=%zu]\n",
+            kind,
+            parsed_size,
+            size,
+            stream_len,
+            ref_label,
+            ref_len
+        );
+    }
+}
+
 static void fuzz_check_stream_diff(
     pm_parser_t *parser,
     pm_node_t *node,
@@ -1018,29 +1051,22 @@ static void fuzz_check_stream_diff(
     if (parsed_size == size) {
         if (node != NULL) {
             pm_serialize(ref_parser, ref_node, ref_buf);
-            size_t stream_len = pm_buffer_length(stream_buf);
-            size_t ref_len = pm_buffer_length(ref_buf);
-            if (stream_len != ref_len || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_len) != 0) {
-                fuzz_invariant_fail(
-                    "INVARIANT[stream_diff]: kind=serialize_mismatch [detail: parsed_size=%zu size=%zu stream_len=%zu ref_len=%zu]\n",
-                    parsed_size,
-                    size,
-                    stream_len,
-                    ref_len
-                );
-            }
+            fuzz_assert_serialized_equal(stream_buf, ref_buf, "serialize_mismatch", "ref_len", parsed_size, size);
         }
     } else {
         const pm_location_t *stream_data = pm_parser_data_loc(parser);
         const pm_location_t *full_data = pm_parser_data_loc(ref_parser);
         if (stream_data->length == 0) {
-            fuzz_invariant_fail(
-                "INVARIANT[stream_diff]: kind=spurious_stop [detail: parsed_size=%zu size=%zu]\n",
-                parsed_size,
-                size
-            );
-        }
-        if (full_data->length == 0 || stream_data->start != full_data->start) {
+            // An early-EOF byte (\0, ^D, ^Z) stops lexing before pm_source_stream_read's __END__ marker, leaving data_loc empty on both parses.
+            // pm_serialize checksums the full input buffer, so only full_data, error/warning counts, prettyprint, and prefix serialization can match here.
+            if (full_data->length != 0 || parsed_size > size || !fuzz_has_eof_control_byte(source_buf, parsed_size)) {
+                fuzz_invariant_fail(
+                    "INVARIANT[stream_diff]: kind=spurious_stop [detail: parsed_size=%zu size=%zu]\n",
+                    parsed_size,
+                    size
+                );
+            }
+        } else if (full_data->length == 0 || stream_data->start != full_data->start) {
             fuzz_invariant_fail(
                 "INVARIANT[stream_diff]: kind=data_loc_mismatch [detail: stream_start=%u stream_len=%u full_start=%u full_len=%u parsed_size=%zu size=%zu]\n",
                 stream_data->start,
@@ -1097,17 +1123,7 @@ static void fuzz_check_stream_diff(
             fuzz_buffer_reset(ref_buf);
             pm_serialize(parser, node, stream_buf);
             pm_serialize(prefix_parser, prefix_node, ref_buf);
-            size_t stream_len = pm_buffer_length(stream_buf);
-            size_t prefix_len = pm_buffer_length(ref_buf);
-            if (stream_len != prefix_len || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_len) != 0) {
-                fuzz_invariant_fail(
-                    "INVARIANT[stream_diff]: kind=prefix_serialize_mismatch [detail: parsed_size=%zu size=%zu stream_len=%zu prefix_len=%zu]\n",
-                    parsed_size,
-                    size,
-                    stream_len,
-                    prefix_len
-                );
-            }
+            fuzz_assert_serialized_equal(stream_buf, ref_buf, "prefix_serialize_mismatch", "prefix_len", parsed_size, size);
             pm_parser_free(prefix_parser);
             pm_arena_free(prefix_arena);
         }
