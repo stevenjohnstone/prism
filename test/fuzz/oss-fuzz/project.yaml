@@ -1,0 +1,16 @@
+homepage: "https://github.com/ruby/prism"
+language: c
+# Set primary_contact to a Google-account-linked email before submitting to
+# google/oss-fuzz so maintainers receive ClusterFuzz bug access and alerts.
+primary_contact: "maintainer@example.com"
+main_repo: "https://github.com/ruby/prism.git"
+fuzzing_engines:
+  - libfuzzer
+  - afl
+  - honggfuzz
+  - centipede
+sanitizers:
+  - address
+  - undefined
+  - memory
+

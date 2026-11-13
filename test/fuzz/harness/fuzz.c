@@ -136,6 +136,7 @@ void *fuzz_realloc_sized(void *ptr, size_t new_size, size_t expected_old_size) {
 // something else calls abort() (e.g. an assert), the
 // asan error handler will kick in giving a nice
 // backtrace
+#ifndef PRISM_OSS_FUZZ
 extern const char *__asan_default_options(void);
 extern const char *__ubsan_default_options(void);
 
@@ -147,10 +148,11 @@ const char* __asan_default_options(void) {
 const char* __ubsan_default_options(void) {
     return "abort_on_error=1:print_stacktrace=1";
 }
+#endif
 extern void harness(const uint8_t *input, size_t size);
 
 int
-LLVMFuzzerTestOneInput(const char *data, size_t size) {
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
 #ifdef MSAN_ENABLED
     // It appears that AFL++ is a bit broken when it comes to MSAN.
@@ -158,7 +160,7 @@ LLVMFuzzerTestOneInput(const char *data, size_t size) {
     // buffers passed to this function appear to be uninitialized
     __msan_unpoison(data, size);
 #endif
-    harness((const uint8_t *) data, size);
+    harness(data, size);
 #ifdef PRISM_XALLOCATOR
     assert(allocated == 0);
 #endif

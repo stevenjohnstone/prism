@@ -665,7 +665,7 @@ __attribute__((noinline)) static void scrub_stack(void) {
     for (size_t i = 0; i < sizeof(buf); i++) buf[i] = 0;
 }
 
-int LLVMFuzzerTestOneInput(const char *data, size_t size) {
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size >= 5 && memcmp(data, "CRASH", 5) == 0) {
         fprintf(stderr, "INVARIANT[mock]: kind=crash\n");
         abort();

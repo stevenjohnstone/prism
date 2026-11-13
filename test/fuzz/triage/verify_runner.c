@@ -24,7 +24,7 @@
 #  endif
 #endif
 
-extern int LLVMFuzzerTestOneInput(const char *data, size_t size);
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 typedef struct {
     char *name;
@@ -556,7 +556,8 @@ int main(int argc, char **argv) {
                 shared->current_idx = i;
                 __sync_synchronize();
                 if (timeout_sec > 0) alarm((unsigned int)timeout_sec);
-                const char *ptr = entries.items[i].size > 0 ? (const char *)entries.items[i].data : "";
+                static const uint8_t empty_input[1] = { 0 };
+                const uint8_t *ptr = entries.items[i].size > 0 ? entries.items[i].data : empty_input;
                 LLVMFuzzerTestOneInput(ptr, entries.items[i].size);
                 if (timeout_sec > 0) alarm(0);
             }
