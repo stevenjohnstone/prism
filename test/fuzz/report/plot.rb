@@ -1448,40 +1448,24 @@ def render_crash_lineage_table(pathways, total_crashes, color_by_name, id_prefix
   HTML
 end
 
-def render_grammar_lineage_section(fleet_lineage, color_by_name)
-  q_paths = fleet_lineage[:grammar_queue_pathways] || []
+def render_loupe_pair_links(chain, last_label:)
+  first_step = chain.first || {}
+  last_step = chain.last || {}
+  links = []
+  if first_step[:loupe_url]
+    links << %(<a class="cov-link" href="#{CGI.escapeHTML(first_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate original grammar seed in Prism Loupe">Prism Loupe (Seed) &nearr;</a>)
+  end
+  if last_step[:loupe_url]
+    links << %(<a class="cov-link" href="#{CGI.escapeHTML(last_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate #{CGI.escapeHTML(last_label.downcase)} input in Prism Loupe">Prism Loupe (#{CGI.escapeHTML(last_label)}) &nearr;</a>)
+  end
+  links.empty? ? '<span class="muted">&mdash;</span>' : links.join(" &bull; ")
+end
+
+def render_grammar_seed_crashes_card(fleet_lineage, color_by_name)
   g_crashes = fleet_lineage[:grammar_seed_crashes] || []
-  return "" if q_paths.empty? && g_crashes.empty?
-
-  q_pills_html = q_paths.map do |qp|
-    hops = qp.is_a?(Hash) ? qp[:hops] : qp[0]
-    cnt = qp.is_a?(Hash) ? qp[:count] : qp[1]
-    sample_last = qp.is_a?(Hash) ? (qp[:sample_chain] || []).last : nil
-    loupe_a = if sample_last && sample_last[:loupe_url]
-                %(<a class="cov-link" style="margin-left:8px;font-size:0.74rem;" href="#{CGI.escapeHTML(sample_last[:loupe_url])}" target="_blank" rel="noopener" title="Animate sample queue testcase from this pathway in Prism Loupe">Prism Loupe &nearr;</a>)
-              else
-                ""
-              end
-    <<~PILL
-      <div class="excl-pill" style="padding:4px 10px;">
-        #{render_pathway_pills(hops, color_by_name)}
-        <strong style="margin-left:6px;color:#34d399;">#{format_int(cnt)}</strong>
-        #{loupe_a}
-      </div>
-    PILL
-  end.join("\n")
-
   seed_rows_html = g_crashes.each_with_index.map do |g, idx|
     drawer_id = "gram-seed-crash-#{idx}"
-    first_step = g[:sample_chain].first || {}
     last_step = g[:sample_chain].last || {}
-    loupe_links = []
-    if first_step[:loupe_url]
-      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(first_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate original grammar seed in Prism Loupe">Prism Loupe (Seed) &nearr;</a>)
-    end
-    if last_step[:loupe_url]
-      loupe_links << %(<a class="cov-link" href="#{CGI.escapeHTML(last_step[:loupe_url])}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Animate mutated crash input in Prism Loupe">Prism Loupe (Crash) &nearr;</a>)
-    end
     sample_crash_short = last_step[:id] ? "#{last_step[:worker]} id:#{last_step[:id]}" : last_step[:base].to_s
     <<~ROW
       <tr class="clickable-row" onclick="toggleHunkDrawer('#{drawer_id}')">
@@ -1494,7 +1478,7 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
         <td class="num">#{format_int(g[:parents].size)}</td>
         <td class="num">#{g[:sample_chain].size} steps</td>
         <td><code title="#{CGI.escapeHTML(last_step[:base].to_s)}">#{CGI.escapeHTML(sample_crash_short)}</code></td>
-        <td class="num" style="white-space:nowrap;">#{loupe_links.join(" &bull; ")}</td>
+        <td class="num" style="white-space:nowrap;">#{render_loupe_pair_links(g[:sample_chain], last_label: "Crash")}</td>
       </tr>
       <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
         <td colspan="7" class="hunk-drawer-cell">
@@ -1531,6 +1515,128 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
                     %(<div style="padding:12px 16px;" class="muted">No crashes traced to grammar seeds yet.</div>)
                   end
 
+  expand_btn = if g_crashes.any?
+                 %(<button class="cov-btn cov-btn-secondary" data-expand-label="Expand All Seed Crash Chains" data-collapse-label="Collapse All Seed Crash Chains" onclick="toggleAllHunks(this, 'gram-seed-crash-')">Expand All Seed Crash Chains</button>)
+               else
+                 ""
+               end
+
+  <<~HTML
+    <div class="table-card" style="margin-top: 18px;">
+      <div class="table-card-header">
+        <div>
+          <h3><span class="legend-dot" style="background:#{color_by_name['grammar'] || '#34d399'}"></span> Per-Seed Crash Breakdown (#{format_int(fleet_lineage[:total_grammar_crashes])} Crashes from #{format_int(fleet_lineage[:unique_grammar_crash_seeds])} Grammar Seeds)</h3>
+          <p class="chart-sub">
+            <strong class="#{fleet_lineage[:total_grammar_crashes] > 0 ? 'text-danger' : ''}">#{format_int(fleet_lineage[:total_grammar_crashes])} crashes</strong>
+            across the fleet traced back to <strong>#{format_int(fleet_lineage[:unique_grammar_crash_seeds])}</strong> <code>grammar</code>-generated seeds.
+            Click any seed row below to inspect the generated Ruby code and the mutation steps from seed to crash, or open directly in Prism Loupe.
+          </p>
+        </div>
+        <div>
+          #{expand_btn}
+        </div>
+      </div>
+      #{crashes_table}
+    </div>
+  HTML
+end
+
+def render_grammar_queue_pathways_card(fleet_lineage, color_by_name, preview_limit: 15)
+  q_paths = fleet_lineage[:grammar_queue_pathways] || []
+  return "" if q_paths.empty?
+
+  total_q = [fleet_lineage[:total_grammar_queue_items].to_i, 1].max
+  max_q = [q_paths.map { |qp| (qp.is_a?(Hash) ? qp[:count] : qp[1]).to_i }.max.to_i, 1].max
+
+  rows_html = q_paths.each_with_index.map do |qp, idx|
+    hops = qp.is_a?(Hash) ? qp[:hops] : qp[0]
+    cnt = (qp.is_a?(Hash) ? qp[:count] : qp[1]).to_i
+    chain = qp.is_a?(Hash) ? (qp[:sample_chain] || []) : []
+    drawer_id = "gram-queue-path-#{idx}"
+    last_step = chain.last || {}
+    sample_short = last_step[:id] ? "#{last_step[:worker]} id:#{last_step[:id]}" : last_step[:base].to_s
+    pct_of_total = cnt * 100.0 / total_q
+    bar_w = (cnt * 100.0 / max_q).round(1)
+    is_extra = idx >= preview_limit
+    row_cls = is_extra ? "clickable-row extra-toggle-row" : "clickable-row"
+    row_style = is_extra ? ' style="display:none;"' : ""
+
+    <<~ROW
+      <tr class="#{row_cls}" data-drawer-id="#{drawer_id}"#{row_style} onclick="toggleHunkDrawer('#{drawer_id}')">
+        <td>
+          <span id="caret-#{drawer_id}" class="muted" style="display:inline-block;width:14px;">&#9656;</span>
+          #{render_pathway_pills(hops, color_by_name)}
+        </td>
+        <td class="num">
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;">
+            <div style="width:70px;height:7px;background:#0b0f19;border:1px solid #1f2937;border-radius:4px;overflow:hidden;">
+              <div style="width:#{bar_w}%;height:100%;background:#34d399;"></div>
+            </div>
+            <strong style="color:#34d399;">#{format_int(cnt)}</strong>
+            <span class="muted" style="min-width:44px;text-align:right;">(#{format("%.1f%%", pct_of_total)})</span>
+          </div>
+        </td>
+        <td class="num">#{chain.size} steps</td>
+        <td><code title="#{CGI.escapeHTML(last_step[:base].to_s)}">#{CGI.escapeHTML(sample_short)}</code></td>
+        <td class="num" style="white-space:nowrap;">#{render_loupe_pair_links(chain, last_label: "Queue")}</td>
+      </tr>
+      <tr id="#{drawer_id}" class="hunk-drawer-row" style="display:none;">
+        <td colspan="5" class="hunk-drawer-cell">
+          <div class="origin-hunk-title">
+            <span>Representative Queue Evolution: #{render_pathway_pills(hops, color_by_name)}</span>
+            <span class="muted">#{format_int(cnt)} queue entries across fleet</span>
+          </div>
+          #{render_evolution_chain_steps(chain, color_by_name)}
+        </td>
+      </tr>
+    ROW
+  end.join("\n")
+
+  show_all_btn = if q_paths.size > preview_limit
+                   %(<button class="cov-btn cov-btn-secondary" data-show-label="Show All #{format_int(q_paths.size)} Pathways" data-hide-label="Show Top #{preview_limit} Pathways" onclick="toggleExtraTableRows(this, 'gram-queue-paths-tbody')">Show All #{format_int(q_paths.size)} Pathways</button>)
+                 else
+                   ""
+                 end
+
+  <<~HTML
+    <div class="table-card" style="margin-top: 18px;">
+      <div class="table-card-header">
+        <div>
+          <h3><span class="legend-dot" style="background:#{color_by_name['grammar'] || '#34d399'}"></span> Queue Propagation Pathways Across Fleet (#{format_int(fleet_lineage[:total_grammar_queue_items])} Queue Entries across #{format_int(q_paths.size)} Pathways)</h3>
+          <p class="chart-sub">
+            <strong>#{format_int(fleet_lineage[:total_grammar_queue_items])}</strong> interesting queue entries across the fleet trace their ancestry back to <code>grammar</code>
+            (via foreign <code>-F</code> sync and subsequent peer mutations), independent of crashes.
+            Click any pathway row to inspect a representative seed-to-queue evolution chain or open in Prism Loupe.
+          </p>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          #{show_all_btn}
+          <button class="cov-btn cov-btn-secondary" data-expand-label="Expand Visible Evolution Chains" data-collapse-label="Collapse Evolution Chains" onclick="toggleVisibleHunks(this, 'gram-queue-paths-tbody')">Expand Visible Evolution Chains</button>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Propagation Pathway (<code>grammar</code> &rarr; Fleet Hops)</th>
+            <th class="num">Queue Entries</th>
+            <th class="num">Sample Depth</th>
+            <th>Sample Queue Entry</th>
+            <th class="num">Parse Animator</th>
+          </tr>
+        </thead>
+        <tbody id="gram-queue-paths-tbody">
+          #{rows_html}
+        </tbody>
+      </table>
+    </div>
+  HTML
+end
+
+def render_grammar_lineage_section(fleet_lineage, color_by_name)
+  q_paths = fleet_lineage[:grammar_queue_pathways] || []
+  g_crashes = fleet_lineage[:grammar_seed_crashes] || []
+  return "" if q_paths.empty? && g_crashes.empty?
+
   grammar_paths = (fleet_lineage[:pathways] || []).select { |p| p[:hops].include?("grammar") }
   grammar_pathway_table = if grammar_paths.any?
                             render_crash_lineage_table(
@@ -1547,29 +1653,8 @@ def render_grammar_lineage_section(fleet_lineage, color_by_name)
 
   <<~HTML
     #{grammar_pathway_table}
-    <div class="table-card" style="margin-top: 18px;">
-      <div class="table-card-header">
-        <div>
-          <h3><span class="legend-dot" style="background:#{color_by_name['grammar'] || '#34d399'}"></span> Grammar Seed Fleet Propagation &amp; Per-Seed Crash Breakdown</h3>
-          <p class="chart-sub">
-            <strong>#{format_int(fleet_lineage[:total_grammar_queue_items])}</strong> queue testcases across the fleet and
-            <strong class="#{fleet_lineage[:total_grammar_crashes] > 0 ? 'text-danger' : ''}">#{format_int(fleet_lineage[:total_grammar_crashes])} crashes</strong>
-            (from <strong>#{format_int(fleet_lineage[:unique_grammar_crash_seeds])}</strong> generated seeds) trace their ancestry back to <code>grammar</code>.
-            Click any seed row below to inspect the generated Ruby code and the mutation steps that triggered the crash, or open directly in Prism Loupe.
-          </p>
-        </div>
-        <div>
-          <button class="cov-btn cov-btn-secondary" data-expand-label="Expand All Seed Crash Chains" data-collapse-label="Collapse All Seed Crash Chains" onclick="toggleAllHunks(this, 'gram-seed-crash-')">Expand All Seed Crash Chains</button>
-        </div>
-      </div>
-      <div style="padding: 12px 16px; border-bottom: 1px solid var(--panel-border);">
-        <div class="kpi-label" style="margin-bottom:8px;">Queue Propagation Pathways Across Fleet (#{format_int(fleet_lineage[:total_grammar_queue_items])} queue entries rooted in grammar)</div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;">
-          #{q_pills_html}
-        </div>
-      </div>
-      #{crashes_table}
-    </div>
+    #{render_grammar_seed_crashes_card(fleet_lineage, color_by_name)}
+    #{render_grammar_queue_pathways_card(fleet_lineage, color_by_name)}
   HTML
 end
 
@@ -3978,6 +4063,48 @@ html = <<~HTML
         if (btn) {
           const collapseLabel = (btn.dataset && btn.dataset.collapseLabel) || 'Collapse All Exclusive Hunks';
           const expandLabel = (btn.dataset && btn.dataset.expandLabel) || 'Expand All Exclusive Hunks';
+          btn.textContent = anyHidden ? collapseLabel : expandLabel;
+        }
+      }
+
+      function toggleExtraTableRows(btn, tbodyId) {
+        const tbody = document.getElementById(tbodyId);
+        if (!tbody) return;
+        const extras = Array.from(tbody.querySelectorAll('tr.extra-toggle-row'));
+        const anyHidden = extras.some(r => r.style.display === 'none' || !r.style.display);
+        extras.forEach(r => {
+          r.style.display = anyHidden ? 'table-row' : 'none';
+          if (!anyHidden && r.dataset.drawerId) {
+            const drawer = document.getElementById(r.dataset.drawerId);
+            if (drawer) drawer.style.display = 'none';
+            const caret = document.getElementById('caret-' + r.dataset.drawerId);
+            if (caret) caret.innerHTML = '&#9656;';
+          }
+        });
+        if (btn) {
+          const hideLabel = (btn.dataset && btn.dataset.hideLabel) || 'Show Top';
+          const showLabel = (btn.dataset && btn.dataset.showLabel) || 'Show All';
+          btn.textContent = anyHidden ? hideLabel : showLabel;
+        }
+      }
+
+      function toggleVisibleHunks(btn, tbodyId) {
+        const tbody = document.getElementById(tbodyId);
+        if (!tbody) return;
+        const visibleRows = Array.from(tbody.querySelectorAll('tr.clickable-row')).filter(r => r.style.display !== 'none');
+        const drawers = visibleRows.map(r => r.dataset.drawerId && document.getElementById(r.dataset.drawerId)).filter(Boolean);
+        const anyHidden = drawers.some(r => r.style.display === 'none' || !r.style.display);
+        drawers.forEach(row => {
+          row.style.display = anyHidden ? 'table-row' : 'none';
+          if (anyHidden) {
+            row.querySelectorAll('.origin-hunk-group').forEach(g => { g.style.display = 'block'; });
+          }
+          const caret = document.getElementById('caret-' + row.id);
+          if (caret) caret.innerHTML = anyHidden ? '&#9662;' : '&#9656;';
+        });
+        if (btn) {
+          const collapseLabel = (btn.dataset && btn.dataset.collapseLabel) || 'Collapse All';
+          const expandLabel = (btn.dataset && btn.dataset.expandLabel) || 'Expand All';
           btn.textContent = anyHidden ? collapseLabel : expandLabel;
         }
       }
