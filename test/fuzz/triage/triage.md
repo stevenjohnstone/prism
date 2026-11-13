@@ -1,0 +1,240 @@
+# Crash Triage, Archiving, and Verification (`test/fuzz/triage`)
+
+The scripts and C harness in `test/fuzz/triage` turn raw AFL++ crash and hang queues (`tmp/fuzz/afl/` and `tmp/fuzz/afl-ijon/`) into deduplicated, minimized bug buckets under `tmp/fuzz/triage/`, record structured JSON metadata and coverage maps for every bucket, archive all unique raw triggering inputs, and verify fixes cleanly across every archived input.
+
+For user workflows and reproduction/verification commands, see [`docs/fuzzing.md`](../../../docs/fuzzing.md).
+
+## Components
+
+| File | Role |
+| :--- | :--- |
+| [`triage.rb`](triage.rb) | Orchestrates parallel classification, deduplication, minimization, reproducer generation, raw input archiving, `afl-showmap` coverage collection, and JSON metadata output. |
+| [`signature.sh`](signature.sh) | Normalizes sanitizer / assertion / `INVARIANT[...]` output and hashes it with `xxh64sum` into a 16-hex-character bucket signature. |
+| [`halfempty.sh`](halfempty.sh) | Minimizes crashing Ruby inputs using `halfempty` while preserving the 4-byte fuzzing options header. |
+| [`halfempty_compare.sh`](halfempty_compare.sh) | Predicate invoked by `halfempty` to verify each candidate still fails with the original crash signature. |
+| [`verify_runner.c`](verify_runner.c) | C99 batch verifier linking Prism and the fuzz harness directly to execute thousands of archived inputs quickly under `fork()` + shared `mmap` isolation. |
+| [`verify_bucket.sh`](verify_bucket.sh) | Builds/caches `verify_runner.<profile>` cleanly and verifies `input.min`, `.inputs.pending`, and `inputs.tar.gz` for a single bucket. |
+| [`verify.rb`](verify.rb) | Multi-bucket verification sweep (`make fuzz-verify`) reporting `PASS`, `PARTIAL`, `FAIL`, and `EMPTY`, with survivor extraction and JSON reporting. |
+| [`test_triage.sh`](test_triage.sh) | Regression test suite covering signature normalization, minimization, C reproducer synthesis, concurrency/coalescing, coverage/recount, and `verify_runner`/`verify.rb` isolation. |
+
+## Output Layout (`tmp/fuzz/triage`)
+
+```
+tmp/fuzz/triage/
+├── metadata.json                    # Global index of all buckets + corpus edge document frequencies
+├── .corpus-coverage.json            # Cached afl-showmap baseline across tmp/fuzz/corpus
+├── .processed/
+│   └── <raw_sha256>                 # Sentinel file: "<reason>/<signature>" or "#skip"
+└── <reason>/                        # e.g., ABRT, SEGV, undefined-behavior, use-of-uninitialized-value, memory-leak, allocation-size-too-big, hang, unreproducible
+    └── <signature>/                 # 16-char xxHash64 of normalized crash output (or first 16 hex chars of sha256 if unreproducible)
+        ├── input.min                # Minimized input (4-byte options header + minimal Ruby source)
+        ├── testcase.c               # Standalone <prism.h> C reproducer with decoded options, Loupe URL, and report
+        ├── build.sh                 # Executable compile script targeting testcase.c with bucket-specific sanitizer/macros
+        ├── verify.sh                # Executable wrapper delegating to verify_bucket.sh with this bucket's profile
+        ├── id:000000,...            # Original raw crash file from the first occurrence that created the bucket
+        ├── inputs.tar.gz            # Deterministic tar.gz archive of all unique raw crashers mapped to this bucket (entries named by sha256)
+        ├── occurrences.jsonl        # Append-only log (one JSON object per unique raw sha256) tracking every occurrence across workers
+        └── meta.json                # Complete structured metadata and afl-showmap edge map for this bucket
+```
+
+---
+
+## Triage Pipeline (`triage.rb`)
+
+`make fuzz-triage` executes `test/fuzz/triage/triage.rb` inside the `prism/fuzz` Docker container.
+
+### 1. Discovery and Worker Thread Pool
+
+`triage.rb` discovers all `tmp/fuzz/afl/*/{crashes*,hangs*}` and `tmp/fuzz/afl-ijon/*/{crashes*,hangs*}` directories that have a sibling `../cmdline` file (recording which binary discovered the findings) and dispatches `id*` files across a `Concurrent::FixedThreadPool` sized by `TRIAGE_THREADS` (default: half of available CPUs, minimum `1`).
+
+### 2. Classification and Cross-Worker Normalization (`classify_crash_execution`)
+
+To prevent the same root bug from splitting across worker binaries:
+
+- **`fuzz.ijon` and `fuzz.native`** (no sanitizers, `-DPRISM_XALLOCATOR`):
+  - IJON inputs (`executable.end_with?("ijon")`) first have bit `0x40` cleared in `byte[0]` (`normalize_ijon_crash_bytes`), because `PRISM_FUZZ_IJON` forces `stream_mode = false` in [`test/fuzz/harness/parse.c`](../harness/parse.c); this ensures the archived and tested bytes match standard builds.
+  - Replay order: tries `./build/fuzz` (ASAN+UBSAN) first so standard crashes and invariant aborts deduplicate cleanly into the `main` bucket; if that passes, tries `./build/fuzz.lsan` so leaks use LeakSanitizer allocation backtraces; otherwise falls back to the discovering native/IJON binary (catching `FUZZ_MAX_ALLOCATED_BYTES` exhaustion and `PRISM_XALLOCATOR` sized-free / `allocated == 0` assertions).
+- **`fuzz.msan`** (`-DSLOW` + MSAN):
+  - Replay order: tries `./build/fuzz` (ASAN+UBSAN) first so illegal writes, UBSAN errors, and invariants deduplicate against `main`, falling back to `./build/fuzz.msan` only for uninitialized reads, out-of-bounds reads (omitted from `build/fuzz` via `-mllvm -asan-instrument-reads=0`), and `-DSLOW` consumer bugs.
+- **Hangs (`hangs*`)**:
+  - Replayed with a `5s` timeout (`timeout -k 1 5`). If a hang finishes without timing out or crashing, it is marked `#skip` (`transient_timeout`). If it crashes on replay, it is reclassified by its sanitizer/assertion reason rather than staying in `hang/`.
+- **Unreproducible inputs & OOM `sig:09`**:
+  - Unreproducible inputs whose AFL++ filename contains `sig:09` (external `SIGKILL` / OOM) are marked `#skip`.
+  - Other unreproducible inputs are preserved unminimized in `unreproducible/<first_16_of_sha256>`.
+
+Sanitizer reason detection parses `SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: <reason>`, with fallbacks for `ERROR: LeakSanitizer: detected memory leaks` / ``Assertion `allocated == 0' failed`` (`memory-leak`), `FUZZ_MAX_ALLOCATED_BYTES` (`allocation-size-too-big`), and ``Assertion ` `` / `INVARIANT[` (`ABRT`).
+
+### 3. Signature Normalization (`signature.sh`)
+
+`signature.sh` strips volatile runtime details before hashing with `xxh64sum`:
+
+- Drops driver preamble/epilogue (`Reading N bytes from ...`, `Execution successful.`).
+- Normalizes executable prefixes (`fuzz*:` and `.../build/fuzz*` -> `fuzz_bin`).
+- Strips `[detail: ...]` suffixes on `INVARIANT[...]` lines so offset shifts during minimization do not change the bucket signature.
+- Redacts hex addresses (`0x...`), integer values inside UBSAN `runtime error:` lines, ASAN access sizes (`READ|WRITE of size N`), sanitizer PIDs/TIDs (`==PID==`, `T<id>`), and leak byte/object counts.
+- If an `INVARIANT[...]` line is present, hashes **only** that normalized `INVARIANT[...]` line; otherwise hashes the first `SIGLINES` lines (tuned per reason in `triage.rb`: `3` for `undefined-behavior`, `5` for `use-of-uninitialized-value`, `7` for `heap-use-after-free`, `15` for `ABRT`, `50` for `stack-use-after-return`, `10` default).
+
+### 4. Minimization (`halfempty.sh`, `afl-tmin`, `minimize_options_header`)
+
+For every **new** reproducible bucket (unless `TRIAGE_MINIMIZE=0`):
+
+1. **Payload minimization (`halfempty.sh`)**: Splits the 4-byte options header (`header.bin`) from the Ruby body (`body.bin`) and runs `halfempty --stable -T 3 --zero-char=32` (space-fill bisection) using [`halfempty_compare.sh`](halfempty_compare.sh). On each candidate, `halfempty_compare.sh` re-prepends `header.bin`, runs the classifying binary, and accepts the reduction only if `signature.sh` returns the exact original `FUZZ_SIG`. Hangs use `afl-tmin -H -t 500` instead of `halfempty`.
+2. **Header minimization (`minimize_options_header`)**: Walks the 4-byte options header toward `DEFAULT_HEADER_BYTES` (`0x00, 0x00, 0x03, 0x01`: default parser flags, `ruby_version = "4.1"`, `start_line = 1`), clearing unnecessary flag/version/scope/limit bits one by one whenever the crash signature stays identical.
+3. **Drift check**: Re-runs the classifying binary on `input.min` and records `minimized_matches_signature` (`true`/`false`/`nil`) in `meta.json`.
+
+### 5. Concurrent Coalescing & `.processed` Sentinels
+
+Multiple worker threads can concurrently pick up raw crashes belonging to the same unseen signature:
+
+- Each raw file is hashed by SHA-256 of its on-disk bytes and checked against `tmp/fuzz/triage/.processed/<sha256>`.
+- While the first thread minimizes a new bucket inside an isolated staging directory (`.tmp-*`), subsequent threads hitting the same `target_directory` attach their sentinel path, occurrence record, and normalized raw bytes to `pending_sentinels`, `pending_occurrences`, and `pending_inputs`.
+- When minimization completes, the staging directory is atomically renamed to `<reason>/<signature>`, coalesced occurrences/inputs are flushed, and `.processed/<sha256>` is written with `<reason>/<signature>` (or `#skip`).
+- On later runs, already-present sentinels return immediately in `O(1)` without executing a binary. Setting `TRIAGE_RECOUNT=1` uses cached non-`#skip` sentinels to populate missing entries in `occurrences.jsonl` or `inputs.tar.gz` without re-triaging.
+
+### 6. Reproducer Synthesis (`testcase.c`, `build.sh`, `verify.sh`)
+
+For each new bucket, `triage.rb` writes:
+
+- `testcase.c`: Self-contained C99 `<prism.h>` program containing only the non-default `pm_options_*` calls decoded from `input.min`, the minimal downstream driver (`pm_parse` vs `pm_parse_stream` plus only the failing post-parse consumer or invariant checks), a readable C string dump, a [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) link, and the captured report.
+- `build.sh`: Auto-detects the Prism repo root (`PRISM_ROOT` override supported) and compiles `testcase.c` with only the sanitizer and `-D` tunings needed (`-DPM_ARENA_INITIAL_SIZE=0`, `-DPM_INTEGER_DIVIDE_THRESHOLD=8`, `-DPRISM_DEPTH_MAXIMUM=128`, `-DPRISM_BUILD_DEBUG` added conditionally).
+- `verify.sh`: Auto-detects the repo root and delegates to [`verify_bucket.sh`](verify_bucket.sh) with `--profile` set to `bucket_verify_profile(reason:, executable:)`.
+
+---
+
+## Raw Input Archiving (`inputs.tar.gz` and `.inputs.pending`)
+
+Because triage collapses many raw findings into one bucket directory and keeps only one `id:...` file + `input.min`, post-fix verification needs access to **every** unique raw crash input that landed in that bucket.
+
+- **Staging during triage**: Instead of rewriting a compressed `.tar.gz` on every duplicate crash under a mutex, `triage.rb` appends each unseen unique raw input to an internal staging file `<bucket>/.inputs.pending` using length-prefixed records:
+  ```text
+  <sha256>\t<byte_size>\n
+  <raw_bytes>\n
+  ```
+- **Atomic compaction (`sync_bucket_archive`)**: During `finalize_triage_metadata`, `triage.rb` merges any legacy `id*` file (when migrating an older bucket without an archive), existing `inputs.tar.gz` entries, and `.inputs.pending` entries, sorts keys by `<sha256>`, writes a temporary gzipped POSIX tar archive, renames it atomically to `inputs.tar.gz`, and deletes `.inputs.pending`.
+- **Fast no-op skip**: If `.inputs.pending` does not exist and `inputs.tar.gz` matches `meta.json["archive"]["archive_bytes"]`, archive compaction is skipped.
+- **Persistence**: Everything lives inside `tmp/fuzz/triage/`, so `make fuzz-clean` removes the AFL++ queues while preserving every bucket's `inputs.tar.gz`.
+
+---
+
+## Metadata and Coverage Schema
+
+At the end of triage, `finalize_triage_metadata` updates stale `meta.json` files (atomic rename), ensures `verify.sh` exists, collects `afl-showmap` coverage, and rewrites `tmp/fuzz/triage/metadata.json`.
+
+### Per-Bucket Files (`occurrences.jsonl` and `meta.json`)
+
+- **`occurrences.jsonl`**: Append-only JSON Lines; each record captures `sha256`, `path`, `filename`, `fuzzer` (`afl`/`afl-ijon`), `worker`, `queue`, `size_bytes`, and `mtime`. Readers deduplicate by `sha256`.
+- **`meta.json`** (`schema_version: 1`):
+  - `bucket_id`, `reason`, `signature`, `reproducible`, `timed_out`, `reproduced_by`, `verify_profile`
+  - `occurrences`: `count`, `by_fuzzer`, `by_worker`, `by_queue`, `first_seen`, `last_seen`, up to 5 `sample_crashes`
+  - `archive`: `{"file": "inputs.tar.gz", "count": N, "total_bytes": ..., "archive_bytes": ...}`
+  - `input`: `raw_size_bytes`, `raw_sha256`, `min_size_bytes`, `min_sha256`, `payload_size_bytes`, `header_bytes`, `header_hex`, `valid_header`, `has_shebang_prefix`, `minimized_matches_signature`, `loupe_url`
+  - `options`: decoded fields (`ruby_version`, `start_line`, `start_line_expr`, `encoding`, `encoding_locked`, `freeze`, `partial_script`, `attach_comments`, `main_script`, `stream_mode`, `frozen_string_literal`, `command_line_flags`, `filepath`, `shebang_callback`, `stack_budget`, `scopes_count`, `forwarding_scope`, `forwarding_flags`)
+  - `symptom`: structured parse of `headline`, `summary`, `preamble_lines`, plus `invariant`, `ubsan`, `sanitizer`, or `assertion` sub-objects
+  - `frames`: stack frame array annotated with `scope` (`"prism"`, `"harness"`, or `"external"`)
+  - `coverage`: `{ "available", "binary", "build_id", "edge_count", "edges": { "<edge_id>": <hit_count>, ... } }`
+
+### Global Index (`metadata.json` and `.corpus-coverage.json`)
+
+- `reference_binary`: `{ "available", "path", "build_id", "ids_path", "ids_available", "edge_count_total" }` — reads `AFL_LLVM_DOCUMENT_IDS` (`./build/fuzz.ids`) mapping `<edge_id> -> Function`.
+- `corpus`: Cached in `tmp/fuzz/triage/.corpus-coverage.json` keyed by reference binary `build_id`, corpus directory file fingerprint, and `ids_sha256`. Records `corpus_count`, `edge_df` (number of corpus files hitting each edge ID), and `edge_functions`.
+- `summary`: `{ "bucket_count", "total_occurrences", "by_reason", "by_worker" }`.
+- `buckets`: Full array of bucket `meta.json` objects sorted by descending `occurrences.count`, then `bucket_id`.
+
+### `afl-showmap` Collection Details
+
+- Executed in forkserver batch mode (`afl-showmap -q -t <SHOWMAP_TIMEOUT_MS>`) against `TRIAGE_COVERAGE_BIN` (default `./build/fuzz`), keyed by `sha256(bin_path)` (`build_id`) so bucket and corpus maps are only recomputed when the binary changes.
+- Uses `AFL_NO_IJON=1`, `AFL_CMIN_ALLOW_ANY=1`, `detect_leaks=0`, and `symbolize=0` so crashing `input.min` inputs still emit edge maps without invoking `llvm-symbolizer`.
+
+---
+
+## Post-Fix Verification (`verify_runner.c`, `verify_bucket.sh`, `verify.rb`)
+
+### High-Throughput C Batch Runner (`verify_runner.c`)
+
+Spawning a sanitized executable once per archived crash incurs ASAN initialization and dynamic linking overhead on every run. `verify_runner.c` eliminates per-input process startup:
+
+1. Compiles cleanly as C99 (`-O1 -ggdb3 -std=c99`) directly against `src/*.c`, `src/*/*.c`, [`test/fuzz/harness/parse.c`](../harness/parse.c), and [`test/fuzz/harness/fuzz.c`](../harness/fuzz.c).
+2. Loads all inputs into memory up front from any combination of:
+   - Positional file paths (`input.min`)
+   - Length-prefixed packs (`--pack PATH|-`, e.g. `.inputs.pending`)
+   - POSIX tar streams (`--tar PATH|-`, fed by `gzip -dc inputs.tar.gz`)
+3. Runs inputs in persistent `fork()` worker batches sharing an anonymous `mmap` struct (`verify_shared_t` with `current_idx` and `finished_loop`) plus a stdout/stderr pipe (`max_cap_bytes = 16384` per failure).
+4. Before calling `LLVMFuzzerTestOneInput`, the child publishes `shared->current_idx` (`__sync_synchronize()`) and arms `alarm(timeout_sec)` (`SIGALRM` traps hangs as timeouts).
+5. If a child dies mid-batch, the parent blames `shared->current_idx`, records the failure (`name`, `size`, signal/exit/timeout, and headline extracted via `extract_headline`), optionally copies the raw failing input to `--extract-dir`, and immediately forks a new child at `fail_idx + 1`.
+6. **Late `atexit` / LeakSanitizer isolation**: LeakSanitizer checks memory at process `exit(0)`, *after* `finished_loop` becomes `1`. Whenever `finished_loop == 1` and a batch of size `> 1` fails, the parent binary-splits `[pos, batch_end)` down to single-input batches until every leaking input is identified individually.
+
+### Build Profiles (`verify_bucket.sh`)
+
+`verify_bucket.sh` compiles and caches `build/verify/verify_runner.<profile>` (rebuilding automatically whenever any file under `src/`, `include/`, `test/fuzz/harness/`, or `verify_runner.c` is newer than the binary, or when `--rebuild` is passed; falls back to `${TMPDIR:-/tmp}/prism-fuzz-verify` if `build/verify` is not writable). Every profile shares `-DPM_INTEGER_DIVIDE_THRESHOLD=8`, `-DPRISM_DEPTH_MAXIMUM=128`, `-DFUZZ_MAX_INPUT_SIZE`, `-DFUZZ_MAX_ALLOCATED`, and `-DFUZZ_HARD_RSS_LIMIT`, plus:
+
+| Profile | Selected When | Compile Flags |
+| :--- | :--- | :--- |
+| `asan_ubsan` | Default (`ABRT`, `SEGV`, `undefined-behavior`, `heap-buffer-overflow`, `hang`, etc.) | `-DPM_ARENA_INITIAL_SIZE=0 -fsanitize=address,undefined -fno-sanitize-recover=all` |
+| `msan_slow` | `use-of-uninitialized-value` or `reproduced_by` ends with `msan` | `-DPM_ARENA_INITIAL_SIZE=0 -DSLOW -fsanitize=memory -fsanitize-memory-track-origins -fno-sanitize-recover=all` (Linux/Docker only) |
+| `lsan_slow` | `memory-leak` or `reproduced_by` ends with `lsan` | `-DPM_ARENA_INITIAL_SIZE=0 -DSLOW -fsanitize=leak -fno-sanitize-recover=all` |
+| `xallocator` | `allocation-size-too-big` or `reproduced_by` ends with `ijon`/`native` | `-Itest/fuzz/harness/include -DPRISM_XALLOCATOR` |
+
+To keep bulk failure sweeps fast, `verify_bucket.sh` appends `:symbolize=0` to `ASAN_OPTIONS`, `UBSAN_OPTIONS`, `MSAN_OPTIONS`, and `LSAN_OPTIONS` unless `--symbolize` / `VERIFY_SYMBOLIZE=1` is set (or the caller already defined those env vars). Without symbolization, `INVARIANT[...]` descriptors and UBSAN `file:line:col` errors are still printed intact; enable `--symbolize` / `VERIFY_SYMBOLIZE=1` when you need full symbolized stack traces on surviving crashes.
+
+> **Note:** On macOS hosts where `build/verify/` is shared with the Linux Docker container, host-built and container-built binaries share `verify_runner.<profile>`. Prefer running `make fuzz-verify` from the host (runs inside Docker) or running `./verify.sh` inside `make fuzz-debug`, or override `VERIFY_BUILD_DIR` when mixing host and container runs.
+
+### Multi-Bucket Statuses (`verify.rb`)
+
+`verify.rb` builds each needed profile once (`--build-only`), skips `unreproducible/` unless explicitly targeted (`--include-unreproducible`, `VERIFY_UNREPRODUCIBLE=1`, `--reason unreproducible`, or a matching `--bucket` / `BUCKET` filter), checks `input.min` first followed by `.inputs.pending` and `inputs.tar.gz`, and classifies every bucket:
+
+| Status | Meaning | Exit Code Contribution |
+| :--- | :--- | :--- |
+| `PASS` | `input.min` and all archived raw inputs passed. | Clean (`0`) |
+| `PARTIAL` | `input.min` passed, but at least one archived raw input (or pending input) still failed. Indicates an incomplete fix or distinct bugs sharing a signature. | Failing (`1`) |
+| `FAIL` | `input.min` failed (or bucket has no `input.min` and an archived input failed). | Failing (`1`) |
+| `EMPTY` | Bucket contained zero verifiable inputs. | Ignored |
+
+---
+
+## Configuration Reference
+
+### Triage Environment Variables (`triage.rb` / `halfempty.sh`)
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `TRIAGE_THREADS` | `CPUs / 2` (min `1`) | Worker threads in `triage.rb`. |
+| `HALFEMPTY_THREADS` | `2` | Parallel threads per `halfempty` minimization job. |
+| `TRIAGE_MINIMIZE` | enabled (`!= "0"`) | Set to `0` to skip `halfempty`/`afl-tmin` and copy raw inputs as `input.min`. |
+| `TRIAGE_RECOUNT` | unset (`"1"` enables) | Backfill missing `occurrences.jsonl` / `inputs.tar.gz` entries using `.processed/<sha256>` without re-running crashes. |
+| `TRIAGE_COVERAGE_BIN` | `./build/fuzz` | Reference instrumented binary for `afl-showmap` edge collection (empty disables coverage). |
+| `TRIAGE_COVERAGE_IDS` | `<TRIAGE_COVERAGE_BIN>.ids` | `AFL_LLVM_DOCUMENT_IDS` map file mapping edge IDs to function names. |
+| `TRIAGE_CORPUS_DIR` | `tmp/fuzz/corpus` | Seed corpus directory used to compute corpus edge document frequencies (`edge_df`). |
+| `TRIAGE_SHOWMAP_TIMEOUT_MS` | `1000` | Per-input `afl-showmap` timeout in milliseconds. |
+| `FUZZ_MAX_ALLOCATED` | `128` | Per-input allocation cap in MiB (`FUZZ_MAX_ALLOCATED_BYTES`, RSS limit = `16x`). |
+
+### Verification Environment Variables and CLI Options
+
+Forwarded by `make fuzz-verify` (in [`test/fuzz/Makefile`](../Makefile)) or accepted by `verify.rb` / `verify_bucket.sh`:
+
+| Env Var (`make fuzz-verify`) | `verify.rb` / `verify_bucket.sh` Flag | Default | Purpose |
+| :--- | :--- | :--- | :--- |
+| `BUCKET` | `--bucket PATTERN` (`verify.rb`, repeatable) | all | Comma-separated bucket IDs, signatures, or glob/substring patterns. |
+| `REASON` | `--reason REASON` (`verify.rb`, repeatable) | all | Filter by reason directory (e.g., `ABRT`, `undefined-behavior`). |
+| `VERIFY_TIMEOUT` | `--timeout SEC` | `5` | Per-input `alarm()` timeout in seconds (`0` disables in `verify_runner`). |
+| `VERIFY_MAX_FAILURES` | `--max-failures N` | `0` (all) | Stop each bucket after `N` failing inputs (`1` enables fast fail-first checks while still detecting `PARTIAL` vs `PASS`). |
+| `VERIFY_EXTRACT_SURVIVORS` | `--extract-survivors DIR` | unset | Copy still-failing raw inputs to `DIR/<bucket_id>/<name>`. Empty directories for passing buckets are removed. |
+| `VERIFY_UNREPRODUCIBLE` | `--include-unreproducible` (`verify.rb`) | `0` | Include `unreproducible/` buckets in the sweep. |
+| `VERIFY_REBUILD` | `--rebuild` | `0` | Force recompilation of `build/verify/verify_runner.<profile>`. |
+| `VERIFY_SYMBOLIZE` | `--symbolize` | `0` | Enable external `llvm-symbolizer` for symbolized stack traces on failures. |
+| `VERIFY_VERBOSE` | `--verbose` | `0` | List every failing input in `verify.rb` and capture full stderr in `verify_runner`. |
+| `VERIFY_QUIET` | `--quiet` | `0` | Suppress `PASS` lines in `verify.rb` and truncated stderr snippets in `verify_runner`. |
+| — | `--json [PATH]` | unset | Emit full structured JSON report to stdout or `PATH` (pass via `VERIFY_ARGS="--json ..."`). |
+| — | `VERIFY_BUILD_DIR` | `build/verify` | Override compiled `verify_runner` cache directory (`verify_bucket.sh`). |
+
+---
+
+## Automated Regression Suite (`test_triage.sh`)
+
+`make fuzz-test` runs [`test_triage.sh`](test_triage.sh) across six stages:
+
+1. **`[1/6]` Signature normalization**: Verifies `signature.sh` redaction rules, `INVARIANT[...]` precedence + `[detail: ...]` stripping, and `SIGPIPE` safety on 5,000-line traces.
+2. **`[2/6]` `halfempty.sh` minimization**: Verifies 4-byte header preservation, crash-drift rejection, `INVARIANT` symmetry breaking, `SIGSEGV` handling, and 4-byte minimum bounds.
+3. **`[3/6]` Standalone C reproducer synthesis**: Checks generated `testcase.c` + `build.sh` compiles strictly with `-std=c99 -Werror` using only `-Iinclude` and reproduces under ASAN+UBSAN.
+4. **`[4/6]` Concurrent triage**: Tests parallel `triage.rb` deduplication, header minimization, coalescing of simultaneous duplicates, `.processed` sentinels, and `meta.json` / `occurrences.jsonl` / `metadata.json` schema.
+5. **`[5/6]` `afl-showmap` coverage & recount** (Docker only; skips outside Docker): Verifies bucket `edges`, corpus `edge_df`, `AFL_LLVM_DOCUMENT_IDS` loading, `.corpus-coverage.json` caching, and `TRIAGE_RECOUNT=1` archive/occurrence backfill.
+6. **`[6/6]` Post-fix verification**: Compiles `verify_runner` natively, verifies crash/timeout/`atexit`-leak binary-split isolation, runs generated `verify.sh` end-to-end, and tests `verify.rb`'s `FAIL` -> `PARTIAL` -> `PASS` lifecycle with survivor extraction (`--extract-survivors`) and JSON output.

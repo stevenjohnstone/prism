@@ -110,7 +110,13 @@ fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
+
+fuzz-verify: fuzz-docker-build fuzz-gen-templates
+	@if [ -t 1 ]; then \
+		DOCKER_ARGS="-it"; \
+	fi; \
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_MAX_FAILURES -e VERIFY_EXTRACT_SURVIVORS -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_SYMBOLIZE -e VERIFY_VERBOSE -e VERIFY_QUIET -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/verify.rb $(VERIFY_ARGS)
 
 fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP)
 	$(ECHO) "Templates up to date"
@@ -217,5 +223,5 @@ fuzz-clean:
 	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-verify fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
 

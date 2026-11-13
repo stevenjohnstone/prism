@@ -7,10 +7,12 @@ require "digest"
 require "fileutils"
 require "json"
 require "open3"
+require "rubygems/package"
 require "set"
 require "tempfile"
 require "time"
 require "tmpdir"
+require "zlib"
 
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
@@ -20,12 +22,15 @@ TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
 MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
 HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 16
 HALFEMPTY_THREADS = Integer(ENV.fetch("HALFEMPTY_THREADS", "2"))
+TRIAGE_THREADS = Integer(ENV.fetch("TRIAGE_THREADS", [Concurrent.processor_count / 2, 1].max.to_s))
 COVERAGE_BIN = ENV.fetch("TRIAGE_COVERAGE_BIN", "./build/fuzz")
 COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_COVERAGE_IDS", COVERAGE_BIN.empty? ? "" : "#{COVERAGE_BIN}.ids")
 CORPUS_DIR = ENV.fetch("TRIAGE_CORPUS_DIR", "tmp/fuzz/corpus")
 AFL_SHOWMAP_BIN = ENV.fetch("AFL_SHOWMAP", "afl-showmap")
 SHOWMAP_TIMEOUT_MS = Integer(ENV.fetch("TRIAGE_SHOWMAP_TIMEOUT_MS", "1000"))
 TRIAGE_RECOUNT = ENV["TRIAGE_RECOUNT"] == "1"
+INPUTS_ARCHIVE_FILE = "inputs.tar.gz"
+PENDING_INPUTS_FILE = ".inputs.pending"
 META_SCHEMA_VERSION = 1
 
 SANITIZER_ENV = {
@@ -664,6 +669,56 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   clang_format("#{sections.join("\n\n")}\n")
 end
 
+def repo_root_lookup_bash
+  <<~'SH'.chomp
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    REPO_ROOT="${PRISM_ROOT:-}"
+    if [ -z "$REPO_ROOT" ]; then
+      dir="$SCRIPT_DIR"
+      while [ "$dir" != "/" ]; do
+        if [ -f "$dir/include/prism.h" ] && [ -d "$dir/src" ]; then
+          REPO_ROOT="$dir"
+          break
+        fi
+        dir="$(dirname "$dir")"
+      done
+    fi
+    if [ -z "$REPO_ROOT" ]; then
+      echo "Error: could not locate Prism root (set PRISM_ROOT=/path/to/prism)" >&2
+      exit 1
+    fi
+  SH
+end
+
+def bucket_verify_profile(reason:, executable: "")
+  exe = executable.to_s
+  if exe.end_with?("msan") || reason == "use-of-uninitialized-value"
+    "msan_slow"
+  elsif exe.end_with?("lsan") || reason == "memory-leak"
+    "lsan_slow"
+  elsif reason == "allocation-size-too-big" || exe.end_with?("ijon", "native")
+    "xallocator"
+  else
+    "asan_ubsan"
+  end
+end
+
+def verify_script(reason:, executable: "")
+  profile = bucket_verify_profile(reason: reason, executable: executable)
+  <<~SH
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    #{repo_root_lookup_bash}
+
+    exec "$REPO_ROOT/test/fuzz/triage/verify_bucket.sh" \\
+      --repo-root "$REPO_ROOT" \\
+      --bucket-dir "$SCRIPT_DIR" \\
+      --profile "#{profile}" \\
+      "$@"
+  SH
+end
+
 def build_script(input_file, crash_output: "", reason: "unknown", executable: "")
   raw = File.binread(input_file)
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
@@ -697,22 +752,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
     #!/usr/bin/env bash
     set -euo pipefail
 
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    REPO_ROOT="${PRISM_ROOT:-}"
-    if [ -z "$REPO_ROOT" ]; then
-      dir="$SCRIPT_DIR"
-      while [ "$dir" != "/" ]; do
-        if [ -f "$dir/include/prism.h" ] && [ -d "$dir/src" ]; then
-          REPO_ROOT="$dir"
-          break
-        fi
-        dir="$(dirname "$dir")"
-      done
-    fi
-    if [ -z "$REPO_ROOT" ]; then
-      echo "Error: could not locate Prism root (set PRISM_ROOT=/path/to/prism)" >&2
-      exit 1
-    fi
+    #{repo_root_lookup_bash}
 
     shopt -s nullglob
     srcs=("$REPO_ROOT"/src/*.c "$REPO_ROOT"/src/*/*.c)
@@ -1184,7 +1224,7 @@ ensure
   FileUtils.rm_f(tmp_path) if tmp_path && File.exist?(tmp_path)
 end
 
-def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_out:, executable:, crash_output:, minimized_input:, raw_size_bytes:, raw_sha256:, minimized_matches_signature:, occurrences:, coverage: nil)
+def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_out:, executable:, crash_output:, minimized_input:, raw_size_bytes:, raw_sha256:, minimized_matches_signature:, occurrences:, coverage: nil, archive: nil, verify_profile: nil)
   parsed = parse_crash_output(crash_output)
   io_meta = input_and_options_metadata(
     minimized_input,
@@ -1203,7 +1243,9 @@ def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_
     "reproducible" => reproducible,
     "timed_out" => timed_out,
     "reproduced_by" => File.basename(executable.to_s),
+    "verify_profile" => verify_profile || bucket_verify_profile(reason: reason, executable: executable),
     "occurrences" => occurrences,
+    "archive" => archive,
     "input" => io_meta["input"],
     "options" => io_meta["options"],
     "symptom" => parsed["symptom"],
@@ -1485,6 +1527,194 @@ def load_all_recorded_occurrence_hashes(triage_dir)
   hashes
 end
 
+def read_sentinel_state(sentinel_path, triage_dir)
+  return { status: :absent } unless File.exist?(sentinel_path)
+
+  raw = File.read(sentinel_path).strip
+  return { status: :skip } if raw == "#skip"
+  return { status: :empty } if raw.empty?
+
+  if raw.match?(%r{\A[^/\n]+/[^/\n]+\z}) && File.directory?(File.join(triage_dir, raw))
+    return { status: :bucket, bucket_id: raw }
+  end
+
+  { status: :empty }
+rescue SystemCallError
+  { status: :empty }
+end
+
+def write_processed_sentinel(sentinel_path, content = "")
+  File.write(sentinel_path, content.empty? ? "" : "#{content.chomp}\n")
+end
+
+def append_pending_inputs(bucket_dir, items)
+  return if items.nil? || items.empty?
+
+  pending_path = File.join(bucket_dir, PENDING_INPUTS_FILE)
+  File.open(pending_path, "ab") do |f|
+    items.each do |sha, bytes|
+      next if sha.nil? || sha.empty? || bytes.nil?
+
+      b = bytes.b
+      f.write("#{sha}\t#{b.bytesize}\n")
+      f.write(b)
+      f.write("\n")
+    end
+    f.flush
+  end
+end
+
+def read_pending_inputs(bucket_dir)
+  pending_path = File.join(bucket_dir, PENDING_INPUTS_FILE)
+  entries = {}
+  return entries unless File.file?(pending_path)
+
+  File.open(pending_path, "rb") do |f|
+    while (header = f.gets("\n"))
+      header = header.chomp
+      next if header.empty?
+
+      sha, len_str = header.split("\t", 2)
+      break if sha.nil? || len_str.nil? || !len_str.match?(/\A\d+\z/)
+
+      sz = Integer(len_str)
+      data = sz > 0 ? f.read(sz) : "".b
+      break if data.nil? || data.bytesize < sz
+
+      nl = f.read(1)
+      f.seek(-1, IO::SEEK_CUR) if nl && nl != "\n"
+      entries[sha] ||= data.b
+    end
+  end
+  entries
+end
+
+def read_tar_gz_entries(archive_path, include_bytes: true)
+  entries = {}
+  total_bytes = 0
+  return { entries: entries, total_bytes: 0 } unless File.file?(archive_path)
+
+  Zlib::GzipReader.open(archive_path) do |gz|
+    Gem::Package::TarReader.new(gz) do |tar|
+      tar.each do |entry|
+        next unless entry.file?
+
+        name = File.basename(entry.full_name.to_s)
+        next if name.empty?
+
+        sz = entry.header.size.to_i
+        if include_bytes
+          entries[name] ||= (entry.read || "".b).b
+        else
+          entries[name] = true
+        end
+        total_bytes += sz
+      end
+    end
+  end
+  { entries: entries, total_bytes: total_bytes }
+rescue Zlib::Error, Gem::Package::TarInvalidError
+  { entries: {}, total_bytes: 0 }
+end
+
+def load_all_archived_input_hashes(triage_dir)
+  hashes = Set.new
+  discover_bucket_dirs(triage_dir).each do |bucket_dir|
+    tar_path = File.join(bucket_dir, INPUTS_ARCHIVE_FILE)
+    if File.file?(tar_path)
+      read_tar_gz_entries(tar_path, include_bytes: false)[:entries].each_key { |sha| hashes.add(sha) }
+    end
+    read_pending_inputs(bucket_dir).each_key { |sha| hashes.add(sha) }
+  end
+  hashes
+end
+
+def legacy_bucket_ijon?(bucket_dir)
+  tc_path = File.join(bucket_dir, "testcase.c")
+  return false unless File.file?(tc_path)
+
+  head = File.read(tc_path, 4096)
+  crash_line = head[/^(?:Crash|Unreproducible crash):\s*(.+)$/, 1]
+  !crash_line.nil? && crash_line.include?("/afl-ijon/")
+end
+
+def sync_bucket_archive(bucket_dir, existing_archive = nil)
+  tar_path = File.join(bucket_dir, INPUTS_ARCHIVE_FILE)
+  pending_path = File.join(bucket_dir, PENDING_INPUTS_FILE)
+  has_pending = File.file?(pending_path) && File.size(pending_path) > 0
+
+  if !has_pending && File.file?(tar_path) &&
+     existing_archive.is_a?(Hash) &&
+     existing_archive["file"] == INPUTS_ARCHIVE_FILE &&
+     existing_archive["archive_bytes"] == File.size(tar_path) &&
+     existing_archive["count"].is_a?(Integer)
+    return existing_archive
+  end
+
+  if !has_pending && File.file?(tar_path)
+    stats = read_tar_gz_entries(tar_path, include_bytes: false)
+    return {
+      "file" => INPUTS_ARCHIVE_FILE,
+      "count" => stats[:entries].size,
+      "total_bytes" => stats[:total_bytes],
+      "archive_bytes" => File.size(tar_path)
+    }
+  end
+
+  merged = File.file?(tar_path) ? read_tar_gz_entries(tar_path, include_bytes: true)[:entries] : {}
+  if !File.file?(tar_path)
+    from_ijon = legacy_bucket_ijon?(bucket_dir)
+    Dir.glob(File.join(bucket_dir, "id*")).select { |p| File.file?(p) }.sort.each do |raw_path|
+      raw = File.binread(raw_path)
+      sha = Digest::SHA256.hexdigest(raw)
+      next if merged.key?(sha)
+
+      effective = from_ijon ? (normalize_ijon_crash_bytes(raw) || raw) : raw
+      merged[sha] = effective.b
+    end
+  end
+
+  read_pending_inputs(bucket_dir).each do |sha, bytes|
+    merged[sha] ||= bytes.b
+  end
+
+  return nil if merged.empty?
+
+  dir = File.dirname(tar_path)
+  tmp_path = File.join(dir, ".#{INPUTS_ARCHIVE_FILE}.tmp.#{Process.pid}.#{Thread.current.object_id}")
+  total_bytes = 0
+  Zlib::GzipWriter.open(tmp_path) do |gz|
+    Gem::Package::TarWriter.new(gz) do |tar|
+      merged.keys.sort.each do |sha|
+        data = merged[sha]
+        total_bytes += data.bytesize
+        tar.add_file_simple(sha, 0o644, data.bytesize) { |io| io.write(data) }
+      end
+    end
+  end
+  File.chmod(0o666 & ~File.umask, tmp_path)
+  File.rename(tmp_path, tar_path)
+  FileUtils.rm_f(pending_path) if File.exist?(pending_path)
+
+  {
+    "file" => INPUTS_ARCHIVE_FILE,
+    "count" => merged.size,
+    "total_bytes" => total_bytes,
+    "archive_bytes" => File.size(tar_path)
+  }
+ensure
+  FileUtils.rm_f(tmp_path) if tmp_path && File.exist?(tmp_path)
+end
+
+def ensure_bucket_verify_script(bucket_dir, reason:, executable:)
+  verify_path = File.join(bucket_dir, "verify.sh")
+  content = verify_script(reason: reason, executable: executable)
+  return if File.file?(verify_path) && File.read(verify_path) == content
+
+  File.write(verify_path, content)
+  File.chmod(0o755, verify_path)
+end
+
 # Populates occurrences.jsonl for buckets created before metadata tracking existed.
 def seed_legacy_occurrences(bucket_dir)
   occ_path = File.join(bucket_dir, "occurrences.jsonl")
@@ -1607,6 +1837,27 @@ def finalize_triage_metadata(triage_dir)
       meta["occurrences"] = occ_summary
       dirty_dirs.add(bucket_dir)
     end
+
+    archive_info = sync_bucket_archive(bucket_dir, meta["archive"])
+    if meta["archive"] != archive_info
+      meta["archive"] = archive_info
+      dirty_dirs.add(bucket_dir)
+    end
+
+    expected_profile = bucket_verify_profile(
+      reason: meta["reason"].to_s,
+      executable: meta["reproduced_by"].to_s
+    )
+    if meta["verify_profile"] != expected_profile
+      meta["verify_profile"] = expected_profile
+      dirty_dirs.add(bucket_dir)
+    end
+
+    ensure_bucket_verify_script(
+      bucket_dir,
+      reason: meta["reason"].to_s,
+      executable: meta["reproduced_by"].to_s
+    )
     metas_by_dir[bucket_dir] = meta
   end
 
@@ -1741,16 +1992,21 @@ def binary_build_id(bin_path)
   Digest::SHA256.file(bin_path).hexdigest
 end
 
-def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, recorded_hashes = Set.new)
+def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes = Set.new, archived_hashes = Set.new)
   raw_crash = File.binread(crash)
   crash_hash = Digest::SHA2.hexdigest(raw_crash)
   sentinel = File.join(TESTCASES_PROCESSED_DIR, crash_hash)
 
   recount_only = false
+  cached_bucket_id = nil
   claimed = semaphore.synchronize do
-    if File.exist?(sentinel)
-      if TRIAGE_RECOUNT && !recorded_hashes.include?(crash_hash) && !in_progress.include?(crash_hash)
+    state = read_sentinel_state(sentinel, TESTCASES_DIR)
+    if state[:status] != :absent
+      if TRIAGE_RECOUNT && state[:status] != :skip &&
+         (!recorded_hashes.include?(crash_hash) || !archived_hashes.include?(crash_hash)) &&
+         !in_progress.include?(crash_hash)
         recount_only = true
+        cached_bucket_id = state[:bucket_id]
         in_progress.add(crash_hash)
         true
       else
@@ -1764,22 +2020,38 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
 
   normalized_crash_file = nil
   begin
-    crash_input = crash
-    if executable.end_with?("ijon")
-      normalized_bytes = normalize_ijon_crash_bytes(raw_crash)
-      if normalized_bytes
-        normalized_crash_file = Tempfile.new(["ijon-crash-", ".bin"])
-        normalized_crash_file.binmode
-        normalized_crash_file.write(normalized_bytes)
-        normalized_crash_file.close
-        crash_input = normalized_crash_file.path
+    normalized_bytes = executable.end_with?("ijon") ? normalize_ijon_crash_bytes(raw_crash) : nil
+    effective_raw_bytes = normalized_bytes || raw_crash
+    occ_record = build_occurrence_record(crash_dir, crash, crash_hash)
+
+    if recount_only && cached_bucket_id
+      target_directory = File.join(TESTCASES_DIR, cached_bucket_id)
+      semaphore.synchronize do
+        unless recorded_hashes.include?(crash_hash)
+          append_occurrences(target_directory, [occ_record])
+          recorded_hashes.add(crash_hash)
+        end
+        unless archived_hashes.include?(crash_hash)
+          append_pending_inputs(target_directory, [[crash_hash, effective_raw_bytes]])
+          archived_hashes.add(crash_hash)
+        end
       end
+      return
+    end
+
+    crash_input = crash
+    if normalized_bytes
+      normalized_crash_file = Tempfile.new(["ijon-crash-", ".bin"])
+      normalized_crash_file.binmode
+      normalized_crash_file.write(normalized_bytes)
+      normalized_crash_file.close
+      crash_input = normalized_crash_file.path
     end
 
     info = classify_crash_execution(crash_dir, crash_input, executable)
     if info[:transient_timeout]
       puts "Skipping #{crash} (transient timeout)"
-      semaphore.synchronize { FileUtils.touch(sentinel) } unless recount_only
+      semaphore.synchronize { write_processed_sentinel(sentinel, "#skip") }
       return
     end
 
@@ -1792,32 +2064,41 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
 
     if unreproducible && File.basename(crash).include?("sig:09")
       puts "Skipping #{crash} (external SIGKILL / OOM)"
-      semaphore.synchronize { FileUtils.touch(sentinel) } unless recount_only
+      semaphore.synchronize { write_processed_sentinel(sentinel, "#skip") }
       return
     end
 
     signature = unreproducible ? crash_hash[0, 16] : testcase_output_signature(testcase_output, sig_lines)
     bucket_dir_name = unreproducible ? "unreproducible" : reason
+    bucket_id = "#{bucket_dir_name}/#{signature}"
     target_directory = File.join(TESTCASES_DIR, bucket_dir_name, signature)
-    occ_record = build_occurrence_record(crash_dir, crash, crash_hash)
 
     skip_duplicate = semaphore.synchronize do
       if File.directory?(target_directory) && !Dir.empty?(target_directory)
         puts "#{crash} is a duplicate of #{target_directory}"
-        append_occurrences(target_directory, [occ_record])
-        recorded_hashes.add(crash_hash)
-        FileUtils.touch(sentinel) unless recount_only
+        unless recorded_hashes.include?(crash_hash)
+          append_occurrences(target_directory, [occ_record])
+          recorded_hashes.add(crash_hash)
+        end
+        unless archived_hashes.include?(crash_hash)
+          append_pending_inputs(target_directory, [[crash_hash, effective_raw_bytes]])
+          archived_hashes.add(crash_hash)
+        end
+        write_processed_sentinel(sentinel, bucket_id)
         true
       elsif pending_sentinels.key?(target_directory)
         puts "#{crash} is a duplicate of in-progress #{target_directory}"
         pending_sentinels[target_directory] << sentinel
         pending_occurrences[target_directory] ||= []
-        pending_occurrences[target_directory] << occ_record
+        pending_occurrences[target_directory] << occ_record unless recorded_hashes.include?(crash_hash)
+        pending_inputs[target_directory] ||= []
+        pending_inputs[target_directory] << [crash_hash, effective_raw_bytes] unless archived_hashes.include?(crash_hash)
         true
       else
         puts "#{crash} is new"
         pending_sentinels[target_directory] = [sentinel]
         pending_occurrences[target_directory] = []
+        pending_inputs[target_directory] = []
         false
       end
     end
@@ -1865,15 +2146,23 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
         reason: bucket_dir_name,
         executable: executable
       )
+      c_verify = verify_script(
+        reason: bucket_dir_name,
+        executable: executable
+      )
 
       File.write(File.join(staging_dir, "testcase.c"), c_testcase)
       build_path = File.join(staging_dir, "build.sh")
       File.write(build_path, c_build)
       File.chmod(0o755, build_path)
+      verify_path = File.join(staging_dir, "verify.sh")
+      File.write(verify_path, c_verify)
+      File.chmod(0o755, verify_path)
       FileUtils.cp(crash, File.join(staging_dir, File.basename(crash)))
       append_occurrences(staging_dir, [occ_record])
+      append_pending_inputs(staging_dir, [[crash_hash, effective_raw_bytes]])
       initial_meta = build_bucket_metadata(
-        bucket_id: "#{bucket_dir_name}/#{signature}",
+        bucket_id: bucket_id,
         reason: bucket_dir_name,
         signature: signature,
         reproducible: !unreproducible,
@@ -1897,15 +2186,21 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
           published = true
         end
         extra_occurrences = pending_occurrences.delete(target_directory) || []
+        extra_inputs = pending_inputs.delete(target_directory) || []
         if published
           append_occurrences(target_directory, extra_occurrences)
+          append_pending_inputs(target_directory, extra_inputs)
         else
-          append_occurrences(target_directory, [occ_record] + extra_occurrences)
+          append_occurrences(target_directory, [occ_record] + extra_occurrences) unless recorded_hashes.include?(crash_hash)
+          new_items = archived_hashes.include?(crash_hash) ? extra_inputs : [[crash_hash, effective_raw_bytes]] + extra_inputs
+          append_pending_inputs(target_directory, new_items)
         end
         recorded_hashes.add(crash_hash)
         extra_occurrences.each { |r| recorded_hashes.add(r["sha256"]) if r["sha256"] }
+        archived_hashes.add(crash_hash)
+        extra_inputs.each { |sha, _| archived_hashes.add(sha) if sha }
         sentinels = pending_sentinels.delete(target_directory) || [sentinel]
-        sentinels.uniq.each { |s| FileUtils.touch(s) }
+        sentinels.uniq.each { |s| write_processed_sentinel(s, bucket_id) }
       end
     ensure
       FileUtils.rm_rf(staging_dir) if !published && staging_dir && File.exist?(staging_dir)
@@ -1913,6 +2208,7 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
         semaphore.synchronize do
           pending_sentinels.delete(target_directory)
           pending_occurrences.delete(target_directory)
+          pending_inputs.delete(target_directory)
         end
       end
     end
@@ -1923,12 +2219,14 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
   end
 end
 
-pool = Concurrent::FixedThreadPool.new([Concurrent.processor_count / 2, 1].max)
+pool = Concurrent::FixedThreadPool.new(TRIAGE_THREADS)
 semaphore = Mutex.new
 in_progress = Set.new
 pending_sentinels = {}
 pending_occurrences = {}
-recorded_hashes = TRIAGE_RECOUNT ? load_all_recorded_occurrence_hashes(TESTCASES_DIR) : Set.new
+pending_inputs = {}
+recorded_hashes = load_all_recorded_occurrence_hashes(TESTCASES_DIR)
+archived_hashes = load_all_archived_input_hashes(TESTCASES_DIR)
 OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each do |crash_dir|
   cmdline_file = File.join(crash_dir, "../cmdline")
   next unless File.exist?(cmdline_file)
@@ -1936,7 +2234,7 @@ OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each
   executable = File.read(cmdline_file).strip
   Dir.glob(File.join(crash_dir, "/id*")) do |crash|
     pool.post do
-      process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, recorded_hashes)
+      process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes, archived_hashes)
     rescue StandardError => e
       warn "Error processing #{crash}: #{e.class}: #{e.message}\n#{e.backtrace.join("\n")}"
     end

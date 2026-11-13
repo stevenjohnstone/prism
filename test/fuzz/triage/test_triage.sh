@@ -14,6 +14,8 @@
 #    atomic staging + .processed sentinels, and per-bucket / index JSON metadata.
 # 5. afl-showmap per-bucket edge coverage, corpus edge document frequencies,
 #    AFL_LLVM_DOCUMENT_IDS function resolution, corpus cache hits, and recount.
+# 6. Per-bucket raw input archiving, verify.sh / verify.rb PARTIAL-fix detection,
+#    survivor extraction, crash/timeout isolation, and LSan leak bisection.
 
 set -euo pipefail
 
@@ -25,7 +27,7 @@ fail() {
     exit 1
 }
 
-echo "[1/5] Checking signature.sh normalization and SIGPIPE safety..."
+echo "[1/6] Checking signature.sh normalization and SIGPIPE safety..."
 s1=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int32_t'\n#0 0x1234 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s2=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s3=$(printf "src/prism.c:20:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
@@ -66,7 +68,7 @@ ruby -e 'File.write(ARGV.fetch(0), "INVARIANT[stream]: kind=parsed_size_oob [det
 SIGLINES=15 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_inv_trace.txt" >/dev/null
 echo "  signature.sh normalization and 5,000-line trace check passed"
 
-echo "[2/5] Checking halfempty.sh minimization, header preservation, and drift protection..."
+echo "[2/6] Checking halfempty.sh minimization, header preservation, and drift protection..."
 cat << 'EOF' > "$WORKDIR/synth_target.c"
 #define _GNU_SOURCE
 #include <signal.h>
@@ -222,7 +224,7 @@ ruby -e '
 ' "$WORKDIR/inv.in" "$WORKDIR/inv.min"
 echo "  halfempty.sh header preservation, drift protection, INVARIANT symmetry breaking, SIGSEGV, and 4-byte checks passed"
 
-echo "[3/5] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
+echo "[3/6] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
 ruby - "$WORKDIR" << 'EOF'
 workdir = ARGV.fetch(0)
 code = File.read("test/fuzz/triage/triage.rb")
@@ -398,7 +400,7 @@ PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
-echo "[4/5] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
+echo "[4/6] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
 mkdir -p "$WORKDIR/afl/w1/crashes" "$WORKDIR/afl/w2/crashes" "$WORKDIR/afl/w1/hangs"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w1/cmdline"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w2/cmdline"
@@ -456,14 +458,22 @@ abrt_dirs.each do |abrt_dir|
   raise "expected world-readable/traversable dir mode, got #{format('%#o', mode)}" unless (mode & 0o755) == 0o755
   tc_path = File.join(abrt_dir, "testcase.c")
   build_path = File.join(abrt_dir, "build.sh")
+  verify_path = File.join(abrt_dir, "verify.sh")
+  archive_path = File.join(abrt_dir, "inputs.tar.gz")
+  pending_path = File.join(abrt_dir, ".inputs.pending")
   meta_path = File.join(abrt_dir, "meta.json")
   occ_path = File.join(abrt_dir, "occurrences.jsonl")
   raise "missing testcase.c in #{abrt_dir}" unless File.file?(tc_path)
   raise "missing executable build.sh in #{abrt_dir}" unless File.executable?(build_path)
+  raise "missing executable verify.sh in #{abrt_dir}" unless File.executable?(verify_path)
+  raise "missing inputs.tar.gz in #{abrt_dir}" unless File.file?(archive_path)
+  raise "unexpected leftover .inputs.pending in #{abrt_dir}" if File.exist?(pending_path)
   raise "missing meta.json in #{abrt_dir}" unless File.file?(meta_path)
   raise "missing occurrences.jsonl in #{abrt_dir}" unless File.file?(occ_path)
   tc = File.read(tc_path)
   meta = JSON.parse(File.read(meta_path))
+  raise "archive count #{meta.dig("archive", "count")} != occurrences #{meta.dig("occurrences", "count")}" unless meta.dig("archive", "count") == meta.dig("occurrences", "count")
+  raise "unexpected verify_profile: #{meta["verify_profile"].inspect}" unless meta["verify_profile"] == "asan_ubsan"
 
   min_data = File.binread(File.join(abrt_dir, "input.min"))
   body = min_data.byteslice(4..)
@@ -519,7 +529,7 @@ EOF
 echo "  concurrent deduplication, header minimization, coalescing, sentinel, and JSON metadata checks passed"
 
 if command -v afl-clang-lto >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1 && [ -d build/afl ]; then
-    echo "[5/5] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
+    echo "[5/6] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
     cat << 'EOF' > "$WORKDIR/cov_target.c"
 #include <stdint.h>
 #include <stdio.h>
@@ -617,10 +627,222 @@ EOF
 require "json"
 index = JSON.parse(File.read(ARGV.fetch(0)))
 raise "expected recount to raise count to 3, got #{index.dig("summary", "total_occurrences")}" unless index.dig("summary", "total_occurrences") == 3
+b = index["buckets"].first
+raise "expected recounted archive to contain all 3 inputs, got #{b["archive"].inspect}" unless b.dig("archive", "count") == 3
 EOF
     echo "  afl-showmap coverage, corpus DF, DOCUMENT_IDS, caching, and recount checks passed"
 else
-    echo "[5/5] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
+    echo "[5/6] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
 fi
+
+echo "[6/6] Checking verify_runner crash/timeout/leak isolation and verify.sh / verify.rb PARTIAL-fix workflow..."
+cat << 'EOF' > "$WORKDIR/mock_fuzz_target.c"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static volatile uintptr_t leak_sink = 0;
+
+__attribute__((noinline)) static void do_leak(void) {
+    void *p = malloc(128);
+    if (!p) abort();
+    leak_sink = ((uintptr_t)p) ^ (uintptr_t)0x5555;
+}
+
+__attribute__((noinline)) static void scrub_stack(void) {
+    volatile char buf[512];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = 0;
+}
+
+int LLVMFuzzerTestOneInput(const char *data, size_t size) {
+    if (size >= 5 && memcmp(data, "CRASH", 5) == 0) {
+        fprintf(stderr, "INVARIANT[mock]: kind=crash\n");
+        abort();
+    }
+    if (size >= 4 && memcmp(data, "HANG", 4) == 0) {
+        for (;;) {}
+    }
+    if (size >= 4 && memcmp(data, "LEAK", 4) == 0) {
+        do_leak();
+    }
+    scrub_stack();
+    return 0;
+}
+EOF
+
+clang -O1 -g -std=c99 -fsanitize=address \
+    test/fuzz/triage/verify_runner.c "$WORKDIR/mock_fuzz_target.c" \
+    -o "$WORKDIR/mock_verify"
+
+ruby - "$WORKDIR" << 'EOF'
+require "rubygems/package"
+require "zlib"
+workdir = ARGV.fetch(0)
+Zlib::GzipWriter.open(File.join(workdir, "mixed.tar.gz")) do |gz|
+  Gem::Package::TarWriter.new(gz) do |tar|
+    items = [
+      ["ok_0", "ok_zero"],
+      ["bad_crash", "CRASH_1"],
+      ["ok_1", "ok_one"],
+      ["bad_hang", "HANG_forever"],
+      ["ok_2", "ok_two"],
+      ["bad_crash2", "CRASH_2"],
+      ["ok_3", "ok_three"]
+    ]
+    items.each do |name, body|
+      tar.add_file_simple(name, 0o644, body.bytesize) { |io| io.write(body) }
+    end
+  end
+end
+
+Zlib::GzipWriter.open(File.join(workdir, "leak.tar.gz")) do |gz|
+  Gem::Package::TarWriter.new(gz) do |tar|
+    10.times do |i|
+      body = (i == 6) ? "LEAK_here" : "clean_#{i}"
+      tar.add_file_simple("item_#{i}", 0o644, body.bytesize) { |io| io.write(body) }
+    end
+  end
+end
+EOF
+
+set +e
+gzip -dc "$WORKDIR/mixed.tar.gz" | "$WORKDIR/mock_verify" --tar - --timeout 1 --json > "$WORKDIR/mixed.json"
+mixed_rc=$?
+set -e
+[ "$mixed_rc" -eq 1 ] || fail "expected mixed verify_runner run to exit 1, got $mixed_rc"
+
+ruby - "$WORKDIR/mixed.json" << 'EOF'
+require "json"
+res = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected 7 checked inputs, got #{res.inspect}" unless res["checked"] == 7 && res["passed"] == 4 && res["failed"] == 3 && res["timed_out"] == 1
+names = res["failures"].map { |f| f["name"] }
+raise "expected exact failure isolation [bad_crash, bad_hang, bad_crash2], got #{names.inspect}" unless names == %w[bad_crash bad_hang bad_crash2]
+EOF
+
+if [ "$(uname -s)" != "Darwin" ]; then
+    set +e
+    gzip -dc "$WORKDIR/leak.tar.gz" | ASAN_OPTIONS=detect_leaks=1 "$WORKDIR/mock_verify" --tar - --timeout 5 --json > "$WORKDIR/leak.json"
+    leak_rc=$?
+    set -e
+    [ "$leak_rc" -eq 1 ] || fail "expected LSan bisection run to exit 1, got $leak_rc"
+    ruby - "$WORKDIR/leak.json" << 'EOF'
+require "json"
+res = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected LSan bisect to isolate only item_6, got #{res.inspect}" unless res["checked"] == 10 && res["failed"] == 1 && res["failures"].first["name"] == "item_6"
+EOF
+fi
+
+# 1) Compile verify_runner.c against the real Prism tree and verify valid inputs end-to-end.
+real_triage="$WORKDIR/real_verify_triage"
+real_pass_dir="$real_triage/ABRT/real_pass_sig"
+mkdir -p "$real_pass_dir"
+printf '\x00\x00\x03\x012 + 2\n' > "$real_pass_dir/input.min"
+ruby - "$real_pass_dir" << 'EOF'
+require "digest"
+require "rubygems/package"
+require "zlib"
+pass_dir = ARGV.fetch(0)
+ok_bytes_a = "\x00\x00\x03\x01puts 42\n".b
+ok_bytes_b = "\x00\x00\x03\x01x = [1, 2]\n".b
+Zlib::GzipWriter.open(File.join(pass_dir, "inputs.tar.gz")) do |gz|
+  Gem::Package::TarWriter.new(gz) do |tar|
+    [ok_bytes_a, ok_bytes_b].each do |data|
+      sha = Digest::SHA256.hexdigest(data)
+      tar.add_file_simple(sha, 0o644, data.bytesize) { |io| io.write(data) }
+    end
+  end
+end
+EOF
+cat << EOF > "$real_pass_dir/verify.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$PWD/test/fuzz/triage/verify_bucket.sh" --repo-root "$PWD" --bucket-dir "$real_pass_dir" --profile "asan_ubsan" "\$@"
+EOF
+chmod +x "$real_pass_dir/verify.sh"
+VERIFY_BUILD_DIR="$WORKDIR/real_verify_build" "$real_pass_dir/verify.sh" --quiet >/dev/null
+VERIFY_BUILD_DIR="$WORKDIR/real_verify_build" ruby ./test/fuzz/triage/verify.rb --triage-dir "$real_triage" --quiet
+
+# 2) Deterministic verify.sh + verify.rb PARTIAL-fix & survivor extraction check.
+mock_triage="$WORKDIR/mock_verify_triage"
+partial_dir="$mock_triage/ABRT/partial_sig"
+pass_dir="$mock_triage/ABRT/pass_sig"
+mkdir -p "$partial_dir" "$pass_dir" "$WORKDIR/mock_verify_build"
+cp "$WORKDIR/mock_verify" "$WORKDIR/mock_verify_build/verify_runner.asan_ubsan"
+touch "$WORKDIR/mock_verify_build/verify_runner.asan_ubsan"
+
+printf 'fixed_representative' > "$partial_dir/input.min"
+printf 'clean_representative' > "$pass_dir/input.min"
+
+ruby - "$partial_dir" "$pass_dir" << 'EOF'
+require "digest"
+require "rubygems/package"
+require "zlib"
+partial_dir, pass_dir = ARGV
+
+bad_bytes = "CRASH_rare_sibling".b
+bad_sha = Digest::SHA256.hexdigest(bad_bytes)
+File.write(File.join(partial_dir, ".expected_bad_sha"), bad_sha)
+ok_bytes_a = "clean_a".b
+ok_bytes_b = "clean_b".b
+
+Zlib::GzipWriter.open(File.join(partial_dir, "inputs.tar.gz")) do |gz|
+  Gem::Package::TarWriter.new(gz) do |tar|
+    [[Digest::SHA256.hexdigest(ok_bytes_a), ok_bytes_a], [bad_sha, bad_bytes], [Digest::SHA256.hexdigest(ok_bytes_b), ok_bytes_b]].each do |sha, data|
+      tar.add_file_simple(sha, 0o644, data.bytesize) { |io| io.write(data) }
+    end
+  end
+end
+
+Zlib::GzipWriter.open(File.join(pass_dir, "inputs.tar.gz")) do |gz|
+  Gem::Package::TarWriter.new(gz) do |tar|
+    tar.add_file_simple(Digest::SHA256.hexdigest(ok_bytes_a), 0o644, ok_bytes_a.bytesize) { |io| io.write(ok_bytes_a) }
+  end
+end
+EOF
+
+cat << EOF > "$partial_dir/verify.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$PWD/test/fuzz/triage/verify_bucket.sh" --repo-root "$PWD" --bucket-dir "$partial_dir" --profile "asan_ubsan" "\$@"
+EOF
+cat << EOF > "$pass_dir/verify.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$PWD/test/fuzz/triage/verify_bucket.sh" --repo-root "$PWD" --bucket-dir "$pass_dir" --profile "asan_ubsan" "\$@"
+EOF
+chmod +x "$partial_dir/verify.sh" "$pass_dir/verify.sh"
+
+export VERIFY_BUILD_DIR="$WORKDIR/mock_verify_build"
+"$pass_dir/verify.sh" --quiet >/dev/null
+if "$partial_dir/verify.sh" --quiet >/dev/null 2>&1; then
+    fail "expected verify.sh to catch surviving archived crasher when input.min passes"
+fi
+
+set +e
+ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$mock_triage" \
+    --extract-survivors "$WORKDIR/survivors" \
+    --json "$WORKDIR/verify_report.json" >/dev/null
+vrb_rc=$?
+set -e
+[ "$vrb_rc" -eq 1 ] || fail "expected verify.rb to exit 1 on PARTIAL bucket, got $vrb_rc"
+
+ruby - "$WORKDIR/verify_report.json" "$WORKDIR/survivors" "$partial_dir/.expected_bad_sha" << 'EOF'
+require "json"
+report_path, surv_dir, sha_file = ARGV
+report = JSON.parse(File.read(report_path))
+bad_sha = File.read(sha_file).strip
+summary = report["summary"]
+raise "unexpected verify summary: #{summary.inspect}" unless summary["pass"] == 1 && summary["partial"] == 1 && summary["fail"] == 0 && summary["inputs_checked"] == 6 && summary["inputs_failed"] == 1
+
+partial_bucket = report["buckets"].find { |b| b["bucket_id"] == "ABRT/partial_sig" }
+raise "expected min_passed==true on PARTIAL bucket: #{partial_bucket.inspect}" unless partial_bucket && partial_bucket["min_passed"] == true
+surv_file = File.join(surv_dir, "ABRT/partial_sig", bad_sha)
+raise "missing extracted survivor at #{surv_file}" unless File.file?(surv_file)
+raise "extracted survivor contents mismatch" unless File.binread(surv_file) == "CRASH_rare_sibling".b
+raise "empty survivor dir should not exist for PASS bucket" if Dir.exist?(File.join(surv_dir, "ABRT/pass_sig"))
+EOF
+echo "  verify_runner isolation, real verify.sh build, and verify.rb PARTIAL-fix checks passed"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."

@@ -31,8 +31,12 @@ test/fuzz
     ├── halfempty.sh              minimizes crash inputs with Google Project Zero's halfempty
     ├── halfempty_compare.sh      identifies similar backtraces during minimization
     ├── signature.sh              hashes stack traces into a crash signature
-    ├── test_triage.sh            verifies signature normalization, minimization, and crash triage
-    └── triage.rb                 deduplicates, minimizes, and packages crashes into C reproducers
+    ├── test_triage.sh            verifies signature normalization, minimization, triage, and verification
+    ├── triage.md                 implementation details for triage, metadata schemas, and verification
+    ├── triage.rb                 deduplicates, minimizes, archives raw crashes, and writes C reproducers
+    ├── verify.rb                 sweeps triaged buckets after a fix (PASS / PARTIAL / FAIL)
+    ├── verify_bucket.sh          compiles verify_runner.<profile> and runs a bucket's archived inputs
+    └── verify_runner.c           fast forked C batch runner for archived crashers
 ```
 
 ## Requirements
@@ -57,7 +61,7 @@ Everything needed to build the fuzzers, run a campaign, and triage crashes is se
    ```bash
    make fuzz-triage
    ```
-   Triage runs every crash and hang from `tmp/fuzz/afl/` and `tmp/fuzz/afl-ijon/` against the sanitizer binaries, deduplicates them by backtrace signature, minimizes the triggering input, and writes standalone reproducers into `tmp/fuzz/triage/`.
+   Triage runs every crash and hang from `tmp/fuzz/afl/` and `tmp/fuzz/afl-ijon/` against the sanitizer binaries, deduplicates them by backtrace signature, minimizes a representative triggering input, archives **all** unique raw crash inputs for each bucket, and writes standalone C reproducers and verification scripts into `tmp/fuzz/triage/`.
 
 ### Where to Find Crashes and How to Reproduce
 
@@ -65,15 +69,20 @@ Everything needed to build the fuzzers, run a campaign, and triage crashes is se
 
 ```
 tmp/fuzz/triage
-└── ABRT                          <-- crash category (e.g., ABRT, SEGV, heap-buffer-overflow, memory-leak)
-    └── 14a9275da317ddd6          <-- hash of the normalized backtrace
-        ├── build.sh              <-- executable compiler script with the exact flags for this crash
-        ├── id:000000,sig:06,...  <-- original unminimized AFL++ crash input
-        ├── input.min             <-- minimized raw input (4-byte option header + Ruby source)
-        └── testcase.c            <-- self-contained C program that reproduces the crash
+├── metadata.json                     <-- global index of buckets, counts, and corpus/bucket coverage
+└── ABRT                              <-- crash category (e.g., ABRT, SEGV, heap-buffer-overflow, memory-leak)
+    └── 14a9275da317ddd6              <-- hash of the normalized backtrace
+        ├── build.sh                  <-- executable compiler script with the exact flags for this crash
+        ├── id:000000,sig:06,...      <-- original unminimized AFL++ crash input that created the bucket
+        ├── input.min                 <-- minimized raw input (4-byte option header + Ruby source)
+        ├── inputs.tar.gz             <-- archive of all unique raw crash inputs collapsed into this bucket
+        ├── meta.json                 <-- structured metadata, decoded options, frames, and edge coverage
+        ├── occurrences.jsonl         <-- append-only log of every unique raw crash seen in this bucket
+        ├── testcase.c                <-- self-contained C program that reproduces the crash
+        └── verify.sh                 <-- executable script to test input.min and inputs.tar.gz after a fix
 ```
 
-Each `testcase.c` is synthesized as a minimal, self-contained `<prism.h>` program: `triage.rb` minimizes both the Ruby source and the 4-byte options header, emits only the non-default `pm_options_*` calls and the specific invariant or downstream consumer (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, or `pm_dump_json`) needed to trigger the crash, and includes a readable string dump, [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) link, and captured sanitizer report in comments. Alongside it, `build.sh` compiles `testcase.c` into `testcase` with the specific sanitizer (`address,undefined`, `memory`, `leak`, or `undefined`) and compile-time `-D` tunings needed for that finding.
+Each `testcase.c` is synthesized as a minimal, self-contained `<prism.h>` program: `triage.rb` minimizes both the Ruby source and the 4-byte options header, emits only the non-default `pm_options_*` calls and the specific invariant or downstream consumer (`pm_serialize`, `pm_errors_format`, `pm_prettyprint`, or `pm_dump_json`) needed to trigger the crash, and includes a readable string dump, [Prism Loupe](https://stevenjohnstone.github.io/prism-loupe/) link, and captured sanitizer report in comments. Alongside it, `build.sh` compiles `testcase.c` into `testcase` with the specific sanitizer (`address,undefined`, `memory`, `leak`, or `undefined`) and compile-time `-D` tunings needed for that finding. (See [`test/fuzz/triage/triage.md`](../test/fuzz/triage/triage.md) for implementation details of the triage pipeline, metadata schemas, and archiving internals.)
 
 To reproduce a triaged finding, you can either pass `input.min` directly to the prebuilt fuzzer binaries (inside `make fuzz-debug`) or run its generated `build.sh`:
 
@@ -108,6 +117,83 @@ gdb ./testcase
 ```
 
 Tip: set a breakpoint on `__sanitizer::Die` if you want the debugger to stop before the ASAN/UBSAN handler exits.
+
+### Testing a Fix Across All Related Crashers
+
+During triage, many distinct raw crashes (often hundreds or thousands) can collapse into a single signature bucket, while `halfempty.sh` only minimizes one representative crash into `input.min` and `testcase.c`. Checking only `./testcase` after writing a fix leaves a blind spot: your patch might cure the minimized `input.min` while an unminimized sibling archived in `inputs.tar.gz` still fails—either because your fix only handled the simplified case in `input.min`, or because two distinct root causes happened to share the same crash signature.
+
+Every bucket therefore archives all of its unique raw crash inputs in `inputs.tar.gz` and ships with a verifier (`verify.sh` / `make fuzz-verify`) built directly against your current `src/` working tree.
+
+#### Running Verification
+
+After editing C files under `src/` (and running `bundle exec rake templates` if you modified `.erb` templates under `templates/`):
+
+```bash
+# Verify a single bucket (tests input.min plus every archived crasher in inputs.tar.gz):
+make fuzz-verify BUCKET=ABRT/14a9275da317ddd6
+
+# Verify all buckets in a category (e.g., ABRT or undefined-behavior):
+make fuzz-verify REASON=ABRT
+
+# Verify every triaged bucket at once:
+make fuzz-verify
+```
+
+`make fuzz-verify` incrementally compiles only the lightweight C batch verifier (`build/verify/verify_runner.<profile>`) for the required sanitizer profiles (`asan_ubsan`, `msan_slow`, `lsan_slow`, `xallocator`)—it does **not** trigger a slow rebuild of the full AFL++ instrumentation suite. When working inside `make fuzz-debug`, you can also execute a bucket's `verify.sh` directly:
+
+```bash
+./tmp/fuzz/triage/ABRT/14a9275da317ddd6/verify.sh
+```
+
+Useful verification options (pass as env vars to `make fuzz-verify` or CLI flags to `verify.sh`):
+
+- `VERIFY_SYMBOLIZE=1` (`--symbolize`): Enable external `llvm-symbolizer` output on failing inputs. Disabled by default so large buckets verify in seconds while still printing `INVARIANT[...]` descriptors and UBSAN `file:line:col` locations; turn on when you want symbolized stack traces on surviving crashes.
+- `VERIFY_VERBOSE=1` (`--verbose`): Print every still-failing archived filename and failure headline rather than just the first few.
+- `VERIFY_MAX_FAILURES=1` (`--max-failures 1`): Stop checking a bucket on its first failing archived input for quick `PASS` vs `PARTIAL`/`FAIL` checks.
+- `VERIFY_TIMEOUT=10` (`--timeout 10`): Override the default 5-second per-input timeout.
+- `VERIFY_UNREPRODUCIBLE=1` (`--include-unreproducible`): Include `unreproducible/` buckets in full sweeps (`BUCKET=...` and `REASON=unreproducible` already include them automatically).
+
+#### What the Results Mean (`PASS`, `PARTIAL`, `FAIL`, `EMPTY`)
+
+`make fuzz-verify` tests `input.min` first, followed by every unique raw input archived in `inputs.tar.gz`, and reports one status per bucket:
+
+- **`PASS`**: Both `input.min` and **every** archived raw crasher in `inputs.tar.gz` exited cleanly without sanitizer errors, invariant failures, memory leaks, or timeouts. All related crashes captured in the bucket are fixed.
+- **`PARTIAL`** (`input.min PASSED, X/Y archived STILL FAIL!`): Your fix cured the minimized representative `input.min`, **but at least one archived raw input in `inputs.tar.gz` still fails**. This happens for one of three reasons:
+  1. **Incomplete fix**: Your patch fixed the simplified pattern or options in `input.min`, while larger raw siblings still hit an unhandled branch, encoding, option combination (`pm_options_t`), or `-DSLOW` post-parse consumer.
+  2. **Signature collision**: Two distinct bugs shared the same normalized crash signature (for example, the same `INVARIANT[...]` descriptor or top stack frames reached through different parser states) and your fix only resolved one of them.
+  3. **Masked secondary bug**: Fixing the original crash allowed parsing to get further into a complex raw crasher and reach a different pre-existing bug.
+- **`FAIL`**: `input.min` itself (and typically archived siblings) still fails with a crash, leak, or timeout. Re-run with `VERIFY_SYMBOLIZE=1 VERIFY_MAX_FAILURES=1` or rebuild `./testcase` via `build.sh` to inspect the remaining failure.
+- **`EMPTY`**: No `input.min` or archived inputs were present in the bucket.
+
+`make fuzz-verify` exits cleanly (`0`) only when all checked buckets report `PASS` (or `EMPTY`).
+
+#### Investigating `PARTIAL` Fixes and Surviving Crashers
+
+When a bucket reports `PARTIAL`, extract the raw inputs that still fail so you can inspect or re-triage them individually:
+
+```bash
+# Copy still-failing raw inputs to tmp/fuzz/survivors/<reason>/<signature>/
+make fuzz-verify BUCKET=ABRT/14a9275da317ddd6 VERIFY_EXTRACT_SURVIVORS=tmp/fuzz/survivors
+```
+
+From there:
+
+1. Inspect the surviving crash headlines and stack traces directly with `VERIFY_VERBOSE=1 VERIFY_SYMBOLIZE=1`:
+   ```bash
+   make fuzz-verify BUCKET=ABRT/14a9275da317ddd6 VERIFY_VERBOSE=1 VERIFY_SYMBOLIZE=1
+   ```
+2. Replay a specific survivor inside `make fuzz-debug` (after rebuilding the fuzzer binaries with `make fuzz-build`; use `./build/fuzz.msan` or `./build/fuzz.lsan` if `meta.json`'s `reproduced_by` says `fuzz.msan`/`fuzz.lsan`):
+   ```bash
+   ./build/fuzz tmp/fuzz/survivors/ABRT/14a9275da317ddd6/<sha256>
+   ```
+   Or minimize a single survivor cleanly while keeping its 4-byte options header:
+   ```bash
+   ./test/fuzz/triage/halfempty.sh ./build/fuzz tmp/fuzz/survivors/ABRT/14a9275da317ddd6/<sha256> /tmp/survivor.min
+   ```
+3. Extend your fix until `make fuzz-verify BUCKET=...` reports `PASS` across every input in the bucket. If a `PARTIAL` survivor clearly represents a second unrelated bug (for example, a different parser bug masked behind the same signature), you can remove the now-fixed bucket or track the extracted survivor separately once verified.
+4. Once `make fuzz-verify` is green, run `make fuzz-build` and `make fuzz-test` (and optionally a fresh `make fuzz-run` campaign) before committing.
+
+For implementation details on cross-worker replay normalization, signature hashing, `inputs.tar.gz` compaction, `meta.json` / `metadata.json` schemas, and `verify_runner.c`, see [`test/fuzz/triage/triage.md`](../test/fuzz/triage/triage.md).
 
 ---
 
@@ -177,17 +263,17 @@ Inside the `tmux` session:
 
 ### Cleaning Up
 
-To delete the current campaign data (`tmp/fuzz/afl`, `tmp/fuzz/afl-ijon`, `tmp/fuzz/corpus`, `tmp/fuzz/seeds`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs in `tmp/fuzz/triage`:
+To delete the current campaign data (`tmp/fuzz/afl`, `tmp/fuzz/afl-ijon`, `tmp/fuzz/corpus`, `tmp/fuzz/seeds`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs and their `inputs.tar.gz` archives in `tmp/fuzz/triage`:
 
 ```bash
 make fuzz-clean
 ```
 
-Run `make fuzz-triage` before `make fuzz-clean` if your campaign has untriaged crashes or hangs.
+Run `make fuzz-triage` before `make fuzz-clean` if your campaign has untriaged crashes or hangs so both minimized reproducers and archived raw crashers are preserved for `make fuzz-verify`.
 
 ### Testing the Fuzzing Infrastructure
 
-To run the automated regression suites for both the custom AFL++ instrumentation patch (`test/fuzz/patches/test_afl_patch.sh`) and the crash triage/minimization pipeline (`test/fuzz/triage/test_triage.sh`):
+To run the automated regression suites for the custom AFL++ instrumentation patch (`test/fuzz/patches/test_afl_patch.sh`), crash triage, archiving, and post-fix verification pipeline (`test/fuzz/triage/test_triage.sh`), and grammar seed generator (`test/fuzz/runtime/test_grammar.sh`):
 
 ```bash
 make fuzz-test
