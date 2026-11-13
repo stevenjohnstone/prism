@@ -38,6 +38,7 @@ FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
 FUZZ_AFL_STAMP := ./build/.fuzz.afl.stamp
 FUZZ_BUILD_STAMP := ./build/.fuzz.build.stamp
 FUZZ_GEN_TEMPLATES_STAMP := ./build/.fuzz.gen_templates.stamp
+FUZZ_TEMPLATE_DEPS := config.yml $(shell find templates -type f 2>/dev/null)
 FUZZ_TMPFS_FLAGS := --tmpfs /tmp:rw,exec,mode=1777
 FUZZ_CONTAINER_NAME ?= prism-fuzz
 ifneq ($(FUZZ_DAEMON),)
@@ -127,7 +128,7 @@ fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP)
 	$(ECHO) "Templates up to date"
 
-$(FUZZ_GEN_TEMPLATES_STAMP):
+$(FUZZ_GEN_TEMPLATES_STAMP): $(FUZZ_TEMPLATE_DEPS) | $(FUZZ_DOCKER_STAMP)
 	$(ECHO) "generating templates"
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "bundle exec rake templates"
 	$(Q) $(MAKEDIRS) build
