@@ -127,12 +127,13 @@ ruby -rdigest -rjson -rfileutils -e '
   def normalize_source(src)
     return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
     return "ijon" if src =~ /\Aijon(?:_\d+|_peer)?\z/
+    return "diff" if src =~ /\Adiff(?:_\d+|_peer)?\z/
     src
   end
 
   worker_dirs = []
   seen_workers = {}
-  ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].each do |root|
+  ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon", "tmp/fuzz/afl-diff"].each do |root|
     next unless Dir.exist?(root)
     Dir.glob(File.join(root, "*")).sort.each do |d|
       w = File.basename(d)
@@ -291,8 +292,8 @@ ruby -rdigest -rjson -rfileutils -e '
     end
   end
 
-  # Sort origins in canonical display order: corpus, grammar, main, msan, ijon, slow, main-2..N
-  priority = { "corpus" => 0, "grammar" => 1, "main" => 2, "msan" => 3, "ijon" => 4, "slow" => 5 }
+  # Sort origins in canonical display order: corpus, grammar, main, msan, ijon, slow, diff, main-2..N
+  priority = { "corpus" => 0, "grammar" => 1, "main" => 2, "msan" => 3, "ijon" => 4, "slow" => 5, "diff" => 6 }
   sorted_origins = buckets.keys.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]

@@ -409,6 +409,20 @@ raise "bignum/native build.sh unexpected flags:\n#{bignum_build}" unless bignum_
 raise "expected nil when stream bit unset" unless normalize_ijon_crash_bytes("\x2a\x11\x22\x33abc".b).nil?
 raise "expected stream bit cleared" unless normalize_ijon_crash_bytes("\x6a\x11\x22\x33abc".b) == "\x2a\x11\x22\x33abc".b
 
+diff_inv = "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err [detail: prism_errs=0 cruby=SyntaxError]\n"
+raise "expected diff_parse_y profile for fuzz.diff" unless bucket_verify_profile(reason: "ABRT", executable: "./build/fuzz.diff") == "diff_parse_y"
+raise "expected diff_parse_y profile for INVARIANT[diff_parse_y]" unless bucket_verify_profile(reason: "ABRT", executable: "./build/fuzz", crash_output: diff_inv) == "diff_parse_y"
+diff_build = build_script(stream_slow_in, crash_output: diff_inv, reason: "ABRT", executable: "./build/fuzz.diff")
+raise "diff build.sh unexpected flags:\n#{diff_build}" if diff_build.include?("-DPRISM_DEPTH_MAXIMUM=128") || diff_build.include?("-DSLOW") || diff_build.include?("-DPM_ARENA_INITIAL_SIZE=0")
+diff_tc = c_program(stream_slow_in, "test diff", crash_output: diff_inv, reason: "ABRT", executable: "./build/fuzz.diff")
+raise "diff testcase.c unexpected content:\n#{diff_tc}" unless diff_tc.include?('pm_options_version_set(options, "4.0", 3);') && diff_tc.include?("ruby_ver=4.0") && !diff_tc.include?("pm_parse_stream")
+diff_io = input_and_options_metadata(stream_slow_in, reason: "ABRT", crash_output: diff_inv, executable: "./build/fuzz.diff")
+raise "diff io meta unexpected: #{diff_io["options"].inspect}" unless diff_io.dig("options", "ruby_version") == "4.0" && diff_io.dig("options", "stream_mode") == false
+parsed_diff = parse_crash_output(diff_inv)
+raise "unexpected diff invariant parse: #{parsed_diff.inspect}" unless parsed_diff.dig("symptom", "invariant", "namespace") == "diff_parse_y" &&
+                                                                       parsed_diff.dig("symptom", "invariant", "fields", "kind") == "syntax_mismatch" &&
+                                                                       parsed_diff.dig("symptom", "invariant", "fields", "sub") == "prism_ok_cruby_err"
+
 parsed_inv = parse_crash_output(
   "Reading 11 bytes from x\n" \
   "INVARIANT[node_location]: type=PM_WHILE_NODE kind=length_underflow [detail: parent=PM_STATEMENTS_NODE start=6 length=4294967294 parsed_size=12]\n" \
@@ -605,7 +619,7 @@ require "json"
 afl_dir, triage_dir = ARGV
 ENV["TRIAGE_COVERAGE_BIN"] = ""
 src = File.read("test/fuzz/triage/triage.rb")
-src.sub!('OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze', "OUTPUT_DIRS = [#{afl_dir.dump}].freeze")
+src.sub!(/OUTPUT_DIRS = \[.*?\]\.freeze/, "OUTPUT_DIRS = [#{afl_dir.dump}].freeze")
 src.sub!('TESTCASES_DIR = "tmp/fuzz/triage"', "TESTCASES_DIR = #{triage_dir.dump}")
 eval(src)
 EOF
@@ -747,7 +761,7 @@ ENV["TRIAGE_COVERAGE_BIN"] = File.join(workdir, "cov_target")
 ENV["TRIAGE_COVERAGE_IDS"] = File.join(workdir, "cov_target.ids")
 ENV["TRIAGE_CORPUS_DIR"] = File.join(workdir, "corpus")
 src = File.read("test/fuzz/triage/triage.rb")
-src.sub!('OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze', "OUTPUT_DIRS = [#{File.join(workdir, "afl_cov").dump}].freeze")
+src.sub!(/OUTPUT_DIRS = \[.*?\]\.freeze/, "OUTPUT_DIRS = [#{File.join(workdir, "afl_cov").dump}].freeze")
 src.sub!('TESTCASES_DIR = "tmp/fuzz/triage"', "TESTCASES_DIR = #{File.join(workdir, "triage_cov").dump}")
 eval(src)
 EOF
@@ -788,7 +802,7 @@ ENV["TRIAGE_COVERAGE_IDS"] = File.join(workdir, "cov_target.ids")
 ENV["TRIAGE_CORPUS_DIR"] = File.join(workdir, "corpus")
 ENV["TRIAGE_RECOUNT"] = "1"
 src = File.read("test/fuzz/triage/triage.rb")
-src.sub!('OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze', "OUTPUT_DIRS = [#{File.join(workdir, "afl_cov").dump}].freeze")
+src.sub!(/OUTPUT_DIRS = \[.*?\]\.freeze/, "OUTPUT_DIRS = [#{File.join(workdir, "afl_cov").dump}].freeze")
 src.sub!('TESTCASES_DIR = "tmp/fuzz/triage"', "TESTCASES_DIR = #{triage_dir.dump}")
 eval(src)
 EOF
@@ -2168,5 +2182,41 @@ grep -q "^${c15_sha} is the first bad commit$" "$WORKDIR/bisect_xyz_skip.out" ||
 [ ! -e "$WORKDIR/bisect_wt_xyz_skip" ] || fail "expected temporary xyz_skip worktree to be cleaned up"
 
 echo "  external target verification, template regen, 2026 API shims, exit 125/128, --invert/--fail-fast, and bisect.rb checks passed"
+
+# 1b. Differential parse.y signature deduplication & live verify_bucket.sh --profile diff_parse_y (when /opt/ruby oracle exists)
+ds1=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err [detail: a]\n' | ./test/fuzz/triage/signature.sh)
+ds2=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err [detail: b]\n' | ./test/fuzz/triage/signature.sh)
+ds3=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_err_cruby_ok [detail: b]\n' | ./test/fuzz/triage/signature.sh)
+[ "$ds1" = "$ds2" ] || fail "expected identical diff signature across details, got $ds1 vs $ds2"
+[ "$ds1" != "$ds3" ] || fail "expected distinct diff signatures across sub kinds ($ds1 == $ds3)"
+
+if [ -f /opt/ruby/libruby-static.a ] && [ -f /opt/ruby/parse.c ]; then
+  diff_bucket="$WORKDIR/diff_triage_test/ABRT/diff_bucket"
+  mkdir -p "$diff_bucket"
+  python3 - "$diff_bucket" << 'PY'
+import os, sys
+bdir = sys.argv[1]
+# Fixed known 4.0.9 parse.y divergence (`3.4-4.0/command_call_do_block_in_index_arguments`) fails verify_runner; valid `1 + 2` passes.
+open(os.path.join(bdir, "input.min"), "wb").write(b"\x00\x00\x03\x01a[b c do end]")
+PY
+  cat > "$diff_bucket/testcase.c" << 'C'
+/*
+INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err
+*/
+C
+  set +e
+  VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_fail.json"
+  diff_fail_rc=$?
+  set -e
+  [ "$diff_fail_rc" -eq 1 ] || fail "expected verify_bucket.sh diff_parse_y FAIL exit 1, got $diff_fail_rc"
+  python3 - "$diff_bucket/input.min" << 'PY'
+import sys
+open(sys.argv[1], "wb").write(b"\x00\x00\x03\x011 + 2")
+PY
+  VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_pass.json"
+  echo "  differential diff_parse_y verify_bucket.sh checks passed"
+fi
 
 echo "PASS: Fuzz crash triage and minimization suite verified."

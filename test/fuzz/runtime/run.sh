@@ -2,14 +2,15 @@
 
 AFL_DIR=${1:-./tmp/fuzz/afl}
 AFL_IJON_DIR="${AFL_DIR}-ijon"
+AFL_DIFF_DIR="${AFL_DIR}-diff"
 CORPUS_DIR=${2:-./tmp/fuzz/corpus}
 SEEDS_BACKUP_DIR="$(dirname "$AFL_DIR")/seeds"
 MAX_INPUT_SIZE=${FUZZ_MAX_INPUT_SIZE:-1024}
 SESSION="fuzzer"
 
 DEFAULT_WORKERS=$(( $(nproc) / 2 ))
-if [ "$DEFAULT_WORKERS" -lt 5 ]; then
-    DEFAULT_WORKERS=5
+if [ "$DEFAULT_WORKERS" -lt 6 ]; then
+    DEFAULT_WORKERS=6
 fi
 FUZZ_WORKERS=${FUZZ_WORKERS:-$DEFAULT_WORKERS}
 if [ "$FUZZ_WORKERS" -lt 1 ]; then
@@ -73,7 +74,30 @@ WORKER_CMDS=()
 shopt -s nullglob
 CORPUS_FILES=("$CORPUS_DIR"/*)
 shopt -u nullglob
-NUM_SHARDS=$(( FUZZ_WORKERS > 2 ? FUZZ_WORKERS - 2 : 1 ))
+NUM_SHARDS=$(( FUZZ_WORKERS >= 6 ? FUZZ_WORKERS - 3 : (FUZZ_WORKERS > 2 ? FUZZ_WORKERS - 2 : 1) ))
+
+prepare_diff_seeds() {
+    local seed_dir="/tmp/afl-tmpdir/diff/seeds"
+    rm -rf "$seed_dir"
+    mkdir -p "$seed_dir"
+
+    ruby -retc -rfileutils -e '
+      corpus_dir, seed_dir = ARGV
+      files = Dir.children(corpus_dir).map { |f| File.join(corpus_dir, f) }.select { |p| File.file?(p) }.sort
+      queue = Queue.new
+      files.each { |f| queue << f }
+      threads = [Etc.nprocessors, 1].max.times.map do
+        Thread.new do
+          while (f = queue.pop(true) rescue nil)
+            if system("./build/fuzz.diff", f, [:out, :err] => File::NULL)
+              FileUtils.cp(f, File.join(seed_dir, File.basename(f)))
+            end
+          end
+        end
+      end
+      threads.each(&:join)
+    ' "$CORPUS_DIR" "$seed_dir"
+}
 
 prepare_seed_shard() {
     local name=$1
@@ -138,6 +162,18 @@ else
     IJON_SYNC_FLAGS="-S ijon"
 fi
 
+# When diff (worker 5) is active, run it as an isolated master (-M diff) in
+# $AFL_DIFF_DIR (separate map size spanning both Prism and CRuby parse.c) seeded
+# only with parse.y-compatible corpus seeds, and expose its queue one-way to main
+# via $AFL_DIR/diff_peer/queue.
+if [ "$FUZZ_WORKERS" -ge 6 ]; then
+    mkdir -p "$AFL_DIFF_DIR/diff/queue" "$AFL_DIR/diff_peer"
+    ln -sfn "../../$(basename "$AFL_DIFF_DIR")/diff/queue" "$AFL_DIR/diff_peer/queue"
+    rm -f "$AFL_DIR/diff_peer/is_main_node"
+else
+    rm -rf "$AFL_DIR/diff_peer"
+fi
+
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
@@ -158,10 +194,14 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             prepare_seed_shard "slow" 2
             add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- ./build/fuzz.slow"
             ;;
+        5)
+            prepare_diff_seeds
+            add_worker "diff" "afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/diff/seeds -o $AFL_DIFF_DIR -M diff -p explore -- ./build/fuzz.diff"
+            ;;
         *)
-            idx=$(( i - 5 ))
-            name="main-$(( i - 3 ))"
-            prepare_seed_shard "$name" $(( i - 2 ))
+            idx=$(( i - 6 ))
+            name="main-$(( i - 4 ))"
+            prepare_seed_shard "$name" $(( i - 3 ))
             sched=${SCHEDULES[$(( idx % ${#SCHEDULES[@]} ))]}
             fmt=${INPUT_FORMATS[$(( idx % ${#INPUT_FORMATS[@]} ))]}
             strat=${MUTATION_STRATEGIES[$(( idx % ${#MUTATION_STRATEGIES[@]} ))]}

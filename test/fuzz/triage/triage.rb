@@ -19,7 +19,7 @@ require cluster_lib if cluster_lib
 
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
-OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze
+OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon", "tmp/fuzz/afl-diff"].freeze
 TESTCASES_DIR = "tmp/fuzz/triage"
 TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
 MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
@@ -116,6 +116,14 @@ def sanitizer_loupe_crash?(reason, crash_output)
     heap-use-after-free stack-use-after-return stack-use-after-scope
     attempting-double-free bad-free alloc-dealloc-mismatch SEGV
   ].include?(reason)
+end
+
+def diff_bucket?(executable: "", crash_output: "")
+  executable.to_s.end_with?("diff") || crash_output.to_s.include?("INVARIANT[diff_parse_y]")
+end
+
+def build_diff_loupe_url(source)
+  "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(source.b))}&ruby_ver=4.0"
 end
 
 # Decodes the 4-byte fuzzer option header consumed by harness() in
@@ -512,90 +520,97 @@ end
 def c_program(input_file, crash_details, crash_output: "", reason: "unknown", executable: "")
   h = decode_fuzz_header(File.binread(input_file))
   source = h[:source]
-  stream_mode = h[:stream_mode]
-  loupe_url = build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
+  is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
+  stream_mode = is_diff ? false : h[:stream_mode]
+  loupe_url = is_diff ? build_diff_loupe_url(source) : build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
 
   source_ptr = source.empty? ? "source_buf" : "source"
   plan = post_parse_plan(crash_output, executable, stream_mode, source_ptr)
 
-  need_limits = h[:need_limits]
+  need_limits = false
   need_stdbool = plan[:need_stdbool]
   need_shebang_cb = false
   option_lines = []
 
-  if h[:has_limit_opts]
-    option_lines << "pm_options_line_set(options, #{h[:start_line_c]});"
-  elsif h[:start_line] != 1
-    option_lines << "pm_options_line_set(options, #{h[:start_line_c]});"
-  end
+  if is_diff
+    option_lines << 'pm_options_version_set(options, "4.0", 3);'
+  else
+    need_limits = h[:need_limits]
 
-  option_lines << "pm_options_command_line_set(options, #{format_uint8_bitmask(h[:cmd_flags], COMMAND_LINE_FLAGS)});" if h[:cmd_flags] != 0
-  if h[:main_script]
-    need_stdbool = true
-    option_lines << "pm_options_main_script_set(options, true);"
-  end
-  if h[:freeze]
-    need_stdbool = true
-    option_lines << "pm_options_freeze_set(options, true);"
-  end
-  if h[:partial_script]
-    need_stdbool = true
-    option_lines << "pm_options_partial_script_set(options, true);"
-  end
-  if h[:attach_comments]
-    need_stdbool = true
-    option_lines << "pm_options_attach_comments_set(options, true);"
-  end
-  if h[:encoding_locked]
-    need_stdbool = true
-    option_lines << "pm_options_encoding_locked_set(options, true);"
-  end
-  option_lines << "pm_options_version_set(options, #{h[:version].dump}, #{h[:version].bytesize});" if h[:version] != "4.1"
-  if h[:has_frozen_string_literal]
-    need_stdbool = true
-    option_lines << "pm_options_frozen_string_literal_set(options, #{h[:frozen_string_literal]});"
-  end
-
-  if h[:has_encoding_opts]
-    option_lines << "pm_options_encoding_set(options, #{h[:encoding].dump});"
-    option_lines << 'pm_options_filepath_set(options, "fuzz.rb");'
-    if h[:shebang_callback]
-      need_shebang_cb = true
-      option_lines << "pm_options_shebang_callback_set(options, shebang_cb, NULL);"
+    if h[:has_limit_opts]
+      option_lines << "pm_options_line_set(options, #{h[:start_line_c]});"
+    elsif h[:start_line] != 1
+      option_lines << "pm_options_line_set(options, #{h[:start_line_c]});"
     end
-  end
 
-  option_lines << "pm_options_stack_budget_set(options, #{h[:stack_budget]});" unless h[:stack_budget] == "SIZE_MAX"
+    option_lines << "pm_options_command_line_set(options, #{format_uint8_bitmask(h[:cmd_flags], COMMAND_LINE_FLAGS)});" if h[:cmd_flags] != 0
+    if h[:main_script]
+      need_stdbool = true
+      option_lines << "pm_options_main_script_set(options, true);"
+    end
+    if h[:freeze]
+      need_stdbool = true
+      option_lines << "pm_options_freeze_set(options, true);"
+    end
+    if h[:partial_script]
+      need_stdbool = true
+      option_lines << "pm_options_partial_script_set(options, true);"
+    end
+    if h[:attach_comments]
+      need_stdbool = true
+      option_lines << "pm_options_attach_comments_set(options, true);"
+    end
+    if h[:encoding_locked]
+      need_stdbool = true
+      option_lines << "pm_options_encoding_locked_set(options, true);"
+    end
+    option_lines << "pm_options_version_set(options, #{h[:version].dump}, #{h[:version].bytesize});" if h[:version] != "4.1"
+    if h[:has_frozen_string_literal]
+      need_stdbool = true
+      option_lines << "pm_options_frozen_string_literal_set(options, #{h[:frozen_string_literal]});"
+    end
 
-  scopes_count = h[:scopes_count]
-  if scopes_count > 0
-    forwarding_scope = h[:forwarding_scope]
-    forwarding_bits = h[:forwarding_bits]
-    option_lines << "if (pm_options_scopes_init(options, #{scopes_count})) {"
-    scopes_count.times do |i|
-      locals_count = (i == 0 && !source.empty?) ? 3 : 2
-      locals_count = 0 if i == 0 && h[:has_encoding_opts] && (h[:b3] & 0x10) != 0
-      scope_var = "scope#{i}"
-      option_lines << "  pm_options_scope_t *#{scope_var} = pm_options_scope_mut(options, #{i});"
-      option_lines << "  pm_options_scope_init(#{scope_var}, #{locals_count});"
-      if i == forwarding_scope && forwarding_bits != 0
-        option_lines << "  pm_options_scope_forwarding_set(#{scope_var}, #{format_uint8_bitmask(forwarding_bits, FORWARDING_FLAGS)});"
-      end
-      [2, locals_count].min.times do |j|
-        name = SCOPE_BASE_LOCALS[i][j]
-        option_lines << "  pm_string_init(pm_options_scope_local_mut(#{scope_var}, #{j}), (const uint8_t *)#{name.dump}, #{name.bytesize});"
-      end
-      if locals_count == 3
-        local_len = [source.bytesize, 4].min
-        option_lines << "  pm_string_init(pm_options_scope_local_mut(#{scope_var}, 2), #{source_ptr}, #{local_len});"
+    if h[:has_encoding_opts]
+      option_lines << "pm_options_encoding_set(options, #{h[:encoding].dump});"
+      option_lines << 'pm_options_filepath_set(options, "fuzz.rb");'
+      if h[:shebang_callback]
+        need_shebang_cb = true
+        option_lines << "pm_options_shebang_callback_set(options, shebang_cb, NULL);"
       end
     end
-    option_lines << "}"
+
+    option_lines << "pm_options_stack_budget_set(options, #{h[:stack_budget]});" unless h[:stack_budget] == "SIZE_MAX"
+
+    scopes_count = h[:scopes_count]
+    if scopes_count > 0
+      forwarding_scope = h[:forwarding_scope]
+      forwarding_bits = h[:forwarding_bits]
+      option_lines << "if (pm_options_scopes_init(options, #{scopes_count})) {"
+      scopes_count.times do |i|
+        locals_count = (i == 0 && !source.empty?) ? 3 : 2
+        locals_count = 0 if i == 0 && h[:has_encoding_opts] && (h[:b3] & 0x10) != 0
+        scope_var = "scope#{i}"
+        option_lines << "  pm_options_scope_t *#{scope_var} = pm_options_scope_mut(options, #{i});"
+        option_lines << "  pm_options_scope_init(#{scope_var}, #{locals_count});"
+        if i == forwarding_scope && forwarding_bits != 0
+          option_lines << "  pm_options_scope_forwarding_set(#{scope_var}, #{format_uint8_bitmask(forwarding_bits, FORWARDING_FLAGS)});"
+        end
+        [2, locals_count].min.times do |j|
+          name = SCOPE_BASE_LOCALS[i][j]
+          option_lines << "  pm_string_init(pm_options_scope_local_mut(#{scope_var}, #{j}), (const uint8_t *)#{name.dump}, #{name.bytesize});"
+        end
+        if locals_count == 3
+          local_len = [source.bytesize, 4].min
+          option_lines << "  pm_string_init(pm_options_scope_local_mut(#{scope_var}, 2), #{source_ptr}, #{local_len});"
+        end
+      end
+      option_lines << "}"
+    end
   end
 
   # Note: pm_parser_init treats options == NULL as main_script == true for carriage-return
   # warnings on leading `#!...ruby...` lines, whereas pm_options_new() defaults main_script to false.
-  use_options = !option_lines.empty? || h[:has_shebang_prefix]
+  use_options = is_diff || !option_lines.empty? || h[:has_shebang_prefix]
   options_arg = use_options ? "options" : "NULL"
 
   need_assert = !source.empty? || plan[:need_assert]
@@ -932,9 +947,11 @@ def repo_root_lookup_bash
   SH
 end
 
-def bucket_verify_profile(reason:, executable: "")
+def bucket_verify_profile(reason:, executable: "", crash_output: "")
   exe = executable.to_s
-  if exe.end_with?("msan") || reason == "use-of-uninitialized-value"
+  if diff_bucket?(executable: exe, crash_output: crash_output)
+    "diff_parse_y"
+  elsif exe.end_with?("msan") || reason == "use-of-uninitialized-value"
     "msan_slow"
   elsif exe.end_with?("lsan") || reason == "memory-leak"
     "lsan_slow"
@@ -947,8 +964,8 @@ def bucket_verify_profile(reason:, executable: "")
   end
 end
 
-def verify_script(reason:, executable: "")
-  profile = bucket_verify_profile(reason: reason, executable: executable)
+def verify_script(reason:, executable: "", crash_output: "")
+  profile = bucket_verify_profile(reason: reason, executable: executable, crash_output: crash_output)
   <<~SH
     #!/usr/bin/env bash
     set -euo pipefail
@@ -967,6 +984,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
   raw = File.binread(input_file)
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
 
+  is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
   is_native_only = executable.end_with?("ijon", "native")
   is_invariant = crash_output.include?("INVARIANT[")
   is_arith_ub = reason == "undefined-behavior" && !crash_output.include?("arena")
@@ -975,7 +993,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
   defines = []
   defines << "-DPM_ARENA_INITIAL_SIZE=0" unless is_native_only || is_invariant || is_arith_ub
   defines << "-DPM_INTEGER_DIVIDE_THRESHOLD=8" if has_long_decimal || crash_output.match?(/\b(?:pm_integer|pm_bignum)_|(?:integer|bignum)\.c\b/)
-  defines << "-DPRISM_DEPTH_MAXIMUM=128" if source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep") || crash_output.include?("INVARIANT[recursion_depth]")
+  defines << "-DPRISM_DEPTH_MAXIMUM=128" if !is_diff && (source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep") || crash_output.include?("INVARIANT[recursion_depth]"))
   defines << "-DPRISM_BUILD_DEBUG" if crash_output.match?(/fuzz_(free|realloc)_sized/)
   defines << "-DSLOW" if executable.end_with?("slow") || crash_output.include?("INVARIANT[stream_diff]")
 
@@ -1337,11 +1355,56 @@ def parse_crash_output(crash_output)
   }
 end
 
-def input_and_options_metadata(minimized_input, reason:, crash_output:, raw_size_bytes: nil, raw_sha256: nil, minimized_matches_signature: nil)
+def input_and_options_metadata(minimized_input, reason:, crash_output:, raw_size_bytes: nil, raw_sha256: nil, minimized_matches_signature: nil, executable: "")
   raw_min = File.binread(minimized_input)
   h = decode_fuzz_header(raw_min)
-  loupe_url = build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
+  is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
+  loupe_url = is_diff ? build_diff_loupe_url(h[:source]) : build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
   min_sha256 = Digest::SHA256.hexdigest(raw_min)
+
+  options_meta = if is_diff
+                   {
+                     "ruby_version" => "4.0",
+                     "start_line" => 1,
+                     "start_line_expr" => nil,
+                     "encoding" => nil,
+                     "encoding_locked" => false,
+                     "freeze" => false,
+                     "partial_script" => false,
+                     "attach_comments" => false,
+                     "main_script" => false,
+                     "stream_mode" => false,
+                     "frozen_string_literal" => nil,
+                     "command_line_flags" => [],
+                     "filepath" => nil,
+                     "shebang_callback" => false,
+                     "stack_budget" => "SIZE_MAX",
+                     "scopes_count" => 0,
+                     "forwarding_scope" => nil,
+                     "forwarding_flags" => []
+                   }
+                 else
+                   {
+                     "ruby_version" => h[:version],
+                     "start_line" => h[:start_line],
+                     "start_line_expr" => h[:has_limit_opts] ? h[:start_line_c] : nil,
+                     "encoding" => h[:encoding],
+                     "encoding_locked" => h[:encoding_locked],
+                     "freeze" => h[:freeze],
+                     "partial_script" => h[:partial_script],
+                     "attach_comments" => h[:attach_comments],
+                     "main_script" => h[:main_script],
+                     "stream_mode" => h[:stream_mode],
+                     "frozen_string_literal" => h[:has_frozen_string_literal] ? h[:frozen_string_literal] : nil,
+                     "command_line_flags" => h[:command_line_chars],
+                     "filepath" => h[:filepath],
+                     "shebang_callback" => h[:shebang_callback],
+                     "stack_budget" => h[:stack_budget],
+                     "scopes_count" => h[:scopes_count],
+                     "forwarding_scope" => h[:forwarding_scope],
+                     "forwarding_flags" => h[:forwarding_chars]
+                   }
+                 end
 
   {
     "input" => {
@@ -1357,26 +1420,7 @@ def input_and_options_metadata(minimized_input, reason:, crash_output:, raw_size
       "minimized_matches_signature" => minimized_matches_signature,
       "loupe_url" => loupe_url
     },
-    "options" => {
-      "ruby_version" => h[:version],
-      "start_line" => h[:start_line],
-      "start_line_expr" => h[:has_limit_opts] ? h[:start_line_c] : nil,
-      "encoding" => h[:encoding],
-      "encoding_locked" => h[:encoding_locked],
-      "freeze" => h[:freeze],
-      "partial_script" => h[:partial_script],
-      "attach_comments" => h[:attach_comments],
-      "main_script" => h[:main_script],
-      "stream_mode" => h[:stream_mode],
-      "frozen_string_literal" => h[:has_frozen_string_literal] ? h[:frozen_string_literal] : nil,
-      "command_line_flags" => h[:command_line_chars],
-      "filepath" => h[:filepath],
-      "shebang_callback" => h[:shebang_callback],
-      "stack_budget" => h[:stack_budget],
-      "scopes_count" => h[:scopes_count],
-      "forwarding_scope" => h[:forwarding_scope],
-      "forwarding_flags" => h[:forwarding_chars]
-    }
+    "options" => options_meta
   }
 end
 
@@ -1477,7 +1521,8 @@ def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_
     crash_output: crash_output,
     raw_size_bytes: raw_size_bytes,
     raw_sha256: raw_sha256,
-    minimized_matches_signature: minimized_matches_signature
+    minimized_matches_signature: minimized_matches_signature,
+    executable: executable
   )
 
   {
@@ -1488,7 +1533,7 @@ def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_
     "reproducible" => reproducible,
     "timed_out" => timed_out,
     "reproduced_by" => File.basename(executable.to_s),
-    "verify_profile" => verify_profile || bucket_verify_profile(reason: reason, executable: executable),
+    "verify_profile" => verify_profile || bucket_verify_profile(reason: reason, executable: executable, crash_output: crash_output),
     "occurrences" => occurrences,
     "archive" => archive,
     "input" => io_meta["input"],
@@ -1524,12 +1569,12 @@ def classify_crash_execution(crash_dir, crash_input, executable)
         testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
       end
     end
-  elsif executable.end_with?("msan", "slow")
+  elsif executable.end_with?("msan", "slow", "diff")
     # Try the fast ASAN/UBSAN binary first: if it crashes (e.g. on an illegal write,
     # UBSAN check, assertion failure, SEGV, or fast invariant), prefer it for deterministic
     # classification, minimization, and deduplication against main/grammar;
-    # otherwise fall back to msan/slow for read issues (MSAN) or -DSLOW consumer /
-    # differential checks.
+    # otherwise fall back to msan/slow/diff for read issues (MSAN), -DSLOW consumer /
+    # differential checks, or CRuby parse.y differential invariants / crashes.
     testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
     if crashed
       executable = "./build/fuzz"
@@ -1951,9 +1996,9 @@ ensure
   FileUtils.rm_f(tmp_path) if tmp_path && File.exist?(tmp_path)
 end
 
-def ensure_bucket_verify_script(bucket_dir, reason:, executable:)
+def ensure_bucket_verify_script(bucket_dir, reason:, executable:, crash_output: "")
   verify_path = File.join(bucket_dir, "verify.sh")
-  content = verify_script(reason: reason, executable: executable)
+  content = verify_script(reason: reason, executable: executable, crash_output: crash_output)
   return if File.file?(verify_path) && File.read(verify_path) == content
 
   File.write(verify_path, content)
@@ -2019,12 +2064,15 @@ def backfill_bucket_meta(bucket_dir)
   if reproducible && File.file?(min_path)
     build_sh = File.join(bucket_dir, "build.sh")
     build_text = File.file?(build_sh) ? File.read(build_sh) : ""
+    verify_sh = File.join(bucket_dir, "verify.sh")
+    verify_text = File.file?(verify_sh) ? File.read(verify_sh) : ""
     candidates = []
+    candidates << "./build/fuzz.diff" if verify_text.include?("diff_parse_y")
     candidates << "./build/fuzz.msan" if build_text.include?("-fsanitize=memory")
     candidates << "./build/fuzz.lsan" if build_text.include?("-fsanitize=leak")
     candidates << "./build/fuzz.slow" if build_text.include?("-DSLOW")
     candidates << COVERAGE_BIN unless COVERAGE_BIN.empty?
-    candidates.concat(["./build/fuzz", "./build/fuzz.slow", "./build/fuzz.msan", "./build/fuzz.lsan", "./build/fuzz.native"])
+    candidates.concat(["./build/fuzz", "./build/fuzz.slow", "./build/fuzz.msan", "./build/fuzz.lsan", "./build/fuzz.native", "./build/fuzz.diff"])
     candidates.uniq!
 
     candidates.each do |cand|
@@ -2399,7 +2447,8 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
       )
       c_verify = verify_script(
         reason: bucket_dir_name,
-        executable: executable
+        executable: executable,
+        crash_output: effective_output
       )
 
       File.write(File.join(staging_dir, "testcase.c"), c_testcase)

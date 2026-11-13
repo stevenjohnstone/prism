@@ -1,6 +1,7 @@
 FUZZ_DIR = $(CURDIR)/tmp/fuzz
 FUZZ_AFL_DIR = $(FUZZ_DIR)/afl
 FUZZ_AFL_IJON_DIR = $(FUZZ_DIR)/afl-ijon
+FUZZ_AFL_DIFF_DIR = $(FUZZ_DIR)/afl-diff
 FUZZ_CORPUS_DIR = $(FUZZ_DIR)/corpus
 FUZZ_SEEDS_DIR = $(FUZZ_DIR)/seeds
 FUZZ_COVERAGE_DIR = $(FUZZ_DIR)/coverage
@@ -44,6 +45,7 @@ FUZZ_DEFAULT_DEFINES := $(strip \
 FUZZ_DEFAULT_WARNINGS := -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration
 override FUZZ_FLAGS := $(strip $(FUZZ_DEFAULT_DEFINES) $(filter-out $(FUZZ_DEFAULT_WARNINGS),$(FUZZ_USER_FLAGS)) $(FUZZ_DEFAULT_WARNINGS))
 FUZZ_SOURCES := $(SOURCES) test/fuzz/harness/parse.c test/fuzz/harness/fuzz.c
+FUZZ_DIFF_DEPS := test/fuzz/harness/diff.c test/fuzz/harness/build_diff.sh
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
 FUZZ_AFL_STAMP := ./build/.fuzz.afl.stamp
@@ -79,7 +81,7 @@ $(FUZZ_AFL_STAMP): test/fuzz/patches/aflplusplus.patch
 	$(Q) touch $@
 
 
-$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) $(wildcard ext/prism/*) test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
+$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(FUZZ_DIFF_DEPS) $(HEADERS) $(wildcard ext/prism/*) test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN (SLOW)"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
@@ -101,6 +103,8 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) $(wildcard ext
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
+	$(ECHO) "building differential fuzz binary (CRuby parse.y)"
+	$(Q) $(CURDIR)/test/fuzz/harness/build_diff.sh --mode fuzz --prism-root $(CURDIR) --afl-path $(CURDIR)/build/afl --max-input-size $(FUZZ_MAX_INPUT_SIZE) --output build/fuzz.diff
 	$(ECHO) "building workspace Ruby C extension for grammar generator"
 	$(Q) $(MAKEDIRS) build/fuzz-ruby-ext/prism
 	$(Q) cd build/fuzz-ruby-ext/prism && ruby $(CURDIR)/ext/prism/extconf.rb && $(MAKE)
@@ -219,7 +223,7 @@ fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 
 fuzz-plot: fuzz-docker-build fuzz-gen-templates
 	@if [ -z "$(FUZZ_SKIP_COVERAGE)" ] && [ -d "$(FUZZ_AFL_DIR)" ]; then \
-		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ] || [ -n "$$(find $(FUZZ_SEEDS_DIR) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
+		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_AFL_DIFF_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ] || [ -n "$$(find $(FUZZ_SEEDS_DIR) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
 			echo "collecting coverage (set FUZZ_SKIP_COVERAGE=1 to skip)"; \
 			$(FUZZ_RUN_COVERAGE); \
 		fi; \
@@ -244,6 +248,7 @@ define FUZZ_CLEAN_CONFIRM
 	echo "This will permanently delete:"; \
 	echo "  - tmp/fuzz/afl      ($(FUZZ_FINDINGS) crash/hang findings)"; \
 	echo "  - tmp/fuzz/afl-ijon"; \
+	echo "  - tmp/fuzz/afl-diff"; \
 	echo "  - tmp/fuzz/corpus"; \
 	echo "  - tmp/fuzz/seeds"; \
 	echo "  - tmp/fuzz/coverage"; \
@@ -265,11 +270,11 @@ define FUZZ_CLEAN_CONFIRM
 fi
 endef
 
-fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FUZZ_AFL_IJON_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FUZZ_AFL_IJON_DIR)/*/{crashes,hangs} $(FUZZ_AFL_DIFF_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 fuzz-clean:
 	$(FUZZ_CLEAN_CONFIRM)
 	$(ECHO) "Removing fuzz data (preserving tmp/fuzz/triage)"
-	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
+	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_AFL_DIFF_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
 	$(ECHO) "done"
 
 .PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
