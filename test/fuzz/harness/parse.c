@@ -553,18 +553,158 @@ static void fuzz_check_magic_comment(const pm_magic_comment_t *mc, void *data) {
     }
 }
 
+static inline const char *fuzz_safe_node_name(pm_node_type_t type) {
+    const char *name = fuzz_node_type_name(type);
+    return (name != NULL && name[0] != '\0') ? name : "UNKNOWN";
+}
+
+#if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+static void fuzz_check_node_list_relations(
+    const pm_node_t *parent,
+    fuzz_span_t parent_loc,
+    pm_location_t opening_loc,
+    pm_location_t closing_loc,
+    const pm_node_list_t *list,
+    const fuzz_node_check_t *ctx
+) {
+    fuzz_span_t opening = fuzz_loc_span(opening_loc, ctx->source);
+    fuzz_span_t closing = fuzz_loc_span(closing_loc, ctx->source);
+    bool opening_valid = opening.length > 0 && fuzz_span_violation_kind(opening.start, opening.length, ctx->parsed_size) == NULL;
+    bool closing_valid = closing.length > 0 && fuzz_span_violation_kind(closing.start, closing.length, ctx->parsed_size) == NULL;
+    bool is_heredoc = opening_valid && opening.length >= 2 && ctx->source[opening.start] == '<' && ctx->source[opening.start + 1] == '<';
+    const char *parent_name = fuzz_safe_node_name(parent->type);
+    uint64_t pend = (uint64_t) parent_loc.start + (uint64_t) parent_loc.length;
+    uint64_t opening_end = (uint64_t) opening.start + (uint64_t) opening.length;
+
+    bool has_prev = false;
+    uint32_t prev_start = 0;
+    uint32_t prev_len = 0;
+    uint64_t prev_end = 0;
+
+    for (size_t i = 0; i < list->size; i++) {
+        const pm_node_t *child = list->nodes[i];
+        if (child == NULL) continue;
+
+        fuzz_span_t cloc = fuzz_loc_span(child->location, ctx->source);
+        if (fuzz_span_violation_kind(cloc.start, cloc.length, ctx->parsed_size) != NULL) {
+            continue;
+        }
+
+        const char *child_name = fuzz_safe_node_name(child->type);
+        uint64_t cend = (uint64_t) cloc.start + (uint64_t) cloc.length;
+
+        if (has_prev && (uint64_t) cloc.start < prev_end) {
+            const char *kind = (cloc.start == prev_start && cloc.length == prev_len && prev_len > 0)
+                ? "duplicate_part"
+                : "sibling_overlap";
+            fuzz_invariant_fail(
+                "INVARIANT[node_relation]: parent=%s child=%s kind=%s [detail: idx=%zu prev_start=%u prev_len=%u start=%u len=%u]\n",
+                parent_name,
+                child_name,
+                kind,
+                i,
+                prev_start,
+                prev_len,
+                cloc.start,
+                cloc.length
+            );
+        }
+
+        if (!is_heredoc) {
+            if (cloc.start < parent_loc.start) {
+                fuzz_invariant_fail(
+                    "INVARIANT[node_relation]: parent=%s child=%s kind=start_after_child [detail: idx=%zu parent_start=%u child_start=%u]\n",
+                    parent_name,
+                    child_name,
+                    i,
+                    parent_loc.start,
+                    cloc.start
+                );
+            }
+            if (cend > pend) {
+                fuzz_invariant_fail(
+                    "INVARIANT[node_relation]: parent=%s child=%s kind=child_oob [detail: idx=%zu parent_end=%llu child_end=%llu]\n",
+                    parent_name,
+                    child_name,
+                    i,
+                    (unsigned long long) pend,
+                    (unsigned long long) cend
+                );
+            }
+            if (opening_valid && (uint64_t) cloc.start < opening_end) {
+                fuzz_invariant_fail(
+                    "INVARIANT[node_relation]: parent=%s child=%s kind=child_before_opening [detail: idx=%zu opening_end=%llu child_start=%u]\n",
+                    parent_name,
+                    child_name,
+                    i,
+                    (unsigned long long) opening_end,
+                    cloc.start
+                );
+            }
+            if (closing_valid && cend > (uint64_t) closing.start) {
+                fuzz_invariant_fail(
+                    "INVARIANT[node_relation]: parent=%s child=%s kind=child_after_closing [detail: idx=%zu closing_start=%u child_end=%llu]\n",
+                    parent_name,
+                    child_name,
+                    i,
+                    closing.start,
+                    (unsigned long long) cend
+                );
+            }
+        }
+
+        has_prev = true;
+        prev_start = cloc.start;
+        prev_len = cloc.length;
+        prev_end = cend;
+    }
+}
+
+static void fuzz_check_node_relations(const pm_node_t *node, fuzz_span_t loc, const fuzz_node_check_t *ctx) {
+    switch (node->type) {
+        case PM_ARRAY_NODE: {
+            const pm_array_node_t *arr = (const pm_array_node_t *) node;
+            fuzz_check_node_list_relations(node, loc, arr->opening_loc, arr->closing_loc, &arr->elements, ctx);
+            break;
+        }
+        case PM_INTERPOLATED_SYMBOL_NODE: {
+            const pm_interpolated_symbol_node_t *sym = (const pm_interpolated_symbol_node_t *) node;
+            fuzz_check_node_list_relations(node, loc, sym->opening_loc, sym->closing_loc, &sym->parts, ctx);
+            break;
+        }
+        case PM_INTERPOLATED_STRING_NODE: {
+            const pm_interpolated_string_node_t *str = (const pm_interpolated_string_node_t *) node;
+            fuzz_check_node_list_relations(node, loc, str->opening_loc, str->closing_loc, &str->parts, ctx);
+            break;
+        }
+        case PM_INTERPOLATED_X_STRING_NODE: {
+            const pm_interpolated_x_string_node_t *xstr = (const pm_interpolated_x_string_node_t *) node;
+            fuzz_check_node_list_relations(node, loc, xstr->opening_loc, xstr->closing_loc, &xstr->parts, ctx);
+            break;
+        }
+        case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE: {
+            const pm_interpolated_regular_expression_node_t *re = (const pm_interpolated_regular_expression_node_t *) node;
+            fuzz_check_node_list_relations(node, loc, re->opening_loc, re->closing_loc, &re->parts, ctx);
+            break;
+        }
+        default:
+            break;
+    }
+}
+#endif
+
 static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) {
     const fuzz_node_check_t *ctx = (const fuzz_node_check_t *) data;
     fuzz_span_t loc = fuzz_loc_span(node->location, ctx->source);
     const char *kind = fuzz_span_violation_kind(loc.start, loc.length, ctx->parsed_size);
     if (kind != NULL) {
-        const char *type_name = fuzz_node_type_name(node->type);
-        const char *parent_name = ctx->parent_type == 0 ? "ROOT" : fuzz_node_type_name(ctx->parent_type);
+        const char *type_name = fuzz_safe_node_name(node->type);
+        const char *parent_name = ctx->parent_type == 0 ? "ROOT" : fuzz_safe_node_name(ctx->parent_type);
         fuzz_invariant_fail(
             "INVARIANT[node_location]: type=%s kind=%s [detail: parent=%s start=%u length=%u parsed_size=%zu]\n",
-            type_name[0] != '\0' ? type_name : "UNKNOWN",
+            type_name,
             kind,
-            parent_name[0] != '\0' ? parent_name : "UNKNOWN",
+            parent_name,
             loc.start,
             loc.length,
             ctx->parsed_size
@@ -575,6 +715,9 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
     (void) node;
     (void) ctx;
 #else
+#if !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+    fuzz_check_node_relations(node, loc, ctx);
+#endif
     fuzz_node_check_t child_ctx = {
         .source = ctx->source,
         .parsed_size = ctx->parsed_size,
