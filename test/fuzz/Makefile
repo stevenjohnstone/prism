@@ -31,7 +31,18 @@ FUZZ_SANITIZER_FLAGS := -DPM_ARENA_INITIAL_SIZE=0
 # formatting, prettyprint, and JSON dumping.
 FUZZ_FAST_FLAGS := -DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT
 FUZZ_SLOW_FLAGS := -DSLOW
-FUZZ_FLAGS := -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -DFUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -DFUZZ_HARD_RSS_LIMIT=$(FUZZ_HARD_RSS_LIMIT) -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration $(FUZZ_FLAGS)
+# Capture caller-supplied FUZZ_FLAGS and omit any default -D macro already set so recursive make or overrides never collide under -Werror.
+FUZZ_USER_FLAGS := $(FUZZ_FLAGS)
+FUZZ_USER_FLAGS_NORM := $(subst =,= ,$(subst -D ,-D,$(FUZZ_USER_FLAGS)))
+fuzz_define_default = $(if $(filter -D$(1) -D$(1)=,$(FUZZ_USER_FLAGS_NORM)),,-D$(1)=$(2))
+FUZZ_DEFAULT_DEFINES := $(strip \
+	$(call fuzz_define_default,PM_INTEGER_DIVIDE_THRESHOLD,8) \
+	$(call fuzz_define_default,PRISM_DEPTH_MAXIMUM,128) \
+	$(call fuzz_define_default,FUZZ_MAX_INPUT_SIZE,$(FUZZ_MAX_INPUT_SIZE)) \
+	$(call fuzz_define_default,FUZZ_MAX_ALLOCATED,$(FUZZ_MAX_ALLOCATED)) \
+	$(call fuzz_define_default,FUZZ_HARD_RSS_LIMIT,$(FUZZ_HARD_RSS_LIMIT)))
+FUZZ_DEFAULT_WARNINGS := -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration
+override FUZZ_FLAGS := $(strip $(FUZZ_DEFAULT_DEFINES) $(filter-out $(FUZZ_DEFAULT_WARNINGS),$(FUZZ_USER_FLAGS)) $(FUZZ_DEFAULT_WARNINGS))
 FUZZ_SOURCES := $(SOURCES) test/fuzz/harness/parse.c test/fuzz/harness/fuzz.c
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
@@ -112,7 +123,7 @@ fuzz-debug: fuzz-docker-build
 
 fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "starting triage -- may take a long time"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make fuzz-build"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz make fuzz-build
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
@@ -154,7 +165,7 @@ fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
 
 fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP)
 	$(ECHO) "Templates up to date"
@@ -167,7 +178,7 @@ $(FUZZ_GEN_TEMPLATES_STAMP): $(FUZZ_TEMPLATE_DEPS) | $(FUZZ_DOCKER_STAMP)
 
 fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "running fuzzer"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "FUZZ_FLAGS=\"$(FUZZ_FLAGS)\" make fuzz-build"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz make fuzz-build
 	$(ECHO) "starting AFL++ run"
 	$(Q) $(MAKEDIRS) $(FUZZ_AFL_DIR)
 	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "exec ./test/fuzz/runtime/run.sh"
