@@ -536,6 +536,35 @@ grep -q "INVARIANT\[stream_diff\]: kind=ast_mismatch" "$WORKDIR/sd_str.err" || f
 
 FUZZ_MAX_INPUT_SIZE=8192 ruby test/fuzz/runtime/corpus.rb --no-minimize "$WORKDIR/corpus_8k" >/dev/null
 [ -f "$WORKDIR/corpus_8k/opt_stream_long_line.rb" ] || fail "expected opt_stream_long_line.rb when FUZZ_MAX_INPUT_SIZE=8192"
+
+run_plan=$(make -n -o ./build/.fuzz.docker.stamp -o ./build/.fuzz.gen_templates.stamp fuzz-run FUZZ_MAX_INPUT_SIZE=8192 FUZZ_MAX_ALLOCATED=256)
+printf '%s\n' "$run_plan" | grep -q -- '-e FUZZ_FLAGS="" -e FUZZ_MAX_INPUT_SIZE=8192 -e FUZZ_MAX_ALLOCATED=256' || fail "fuzz-run failed to forward raw FUZZ_MAX_INPUT_SIZE/FUZZ_MAX_ALLOCATED without pre-baked defaults: $run_plan"
+override_cmd=$(FUZZ_FLAGS="-DFUZZ_MAX_INPUT_SIZE=8192 -D PRISM_DEPTH_MAXIMUM=64 -DFUZZ_MAX_ALLOCATED=256" make -n -W test/fuzz/harness/parse.c -o ./build/.fuzz.afl.stamp fuzz-build | grep ' -o build/fuzz\.slow ')
+case "$override_cmd" in
+  *-DFUZZ_MAX_INPUT_SIZE=1024*|*-DPRISM_DEPTH_MAXIMUM=128*|*-DFUZZ_MAX_ALLOCATED=128*)
+    fail "test/fuzz/Makefile emitted duplicate default macro defines alongside FUZZ_FLAGS override: $override_cmd"
+    ;;
+esac
+override_defs=$(printf '%s\n' "$override_cmd" | ruby -e '
+  tokens = STDIN.read.split
+  out = []
+  i = 0
+  while i < tokens.length
+    t = tokens[i]
+    if t == "-D" && i + 1 < tokens.length
+      out << "-D#{tokens[i + 1]}"
+      i += 2
+    elsif t.start_with?("-D")
+      out << t
+      i += 1
+    else
+      i += 1
+    end
+  end
+  puts out.join(" ")
+')
+clang -c -O1 -std=c99 -Wall -Werror $override_defs -Iinclude test/fuzz/harness/parse.c -o "$WORKDIR/parse_override.o"
+
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
 echo "[4/8] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
