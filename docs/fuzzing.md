@@ -130,7 +130,7 @@ Every bucket therefore archives all of its unique raw crash inputs in `inputs.ta
 
 #### Running Verification
 
-After editing C files under `src/` (and running `bundle exec rake templates` if you modified `.erb` templates under `templates/`):
+After editing files under `src/`, `include/`, or `templates/` (templates are regenerated automatically):
 
 ```bash
 # Verify all buckets belonging to a root-cause cluster (cluster ID, index, or any member bucket):
@@ -157,7 +157,7 @@ make fuzz-verify VERIFY_ARGS=--list-clusters
 
 When `clusters.json` is absent or older than `metadata.json`, `make fuzz-verify CLUSTER=...` / `BY_CLUSTER=1` automatically refreshes it via [`cluster.rb`](../test/fuzz/triage/cluster.rb) and tests each cluster's canonical representative bucket first.
 
-`make fuzz-verify` incrementally compiles only the lightweight C batch verifier (`build/verify/verify_runner.<profile>`) for the required sanitizer profiles (`asan_ubsan`, `msan_slow`, `lsan_slow`, `xallocator`)—it does **not** trigger a slow rebuild of the full AFL++ instrumentation suite. When working inside `make fuzz-debug`, you can also execute a bucket's `verify.sh` directly:
+`make fuzz-verify` regenerates templates automatically if any file under `templates/` (or `config.yml`) changed, and incrementally compiles only the lightweight C batch verifier (`build/verify/verify_runner.<profile>`) for the required sanitizer profiles (`asan_ubsan`, `msan_slow`, `lsan_slow`, `xallocator`)—it does **not** trigger a slow rebuild of the full AFL++ instrumentation suite. When working inside `make fuzz-debug`, you can also execute a bucket's `verify.sh` directly:
 
 ```bash
 ./tmp/fuzz/triage/ABRT/14a9275da317ddd6/verify.sh
