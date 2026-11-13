@@ -1234,4 +1234,237 @@ raise "expected cluster headers, rollup table, and cluster summary in terminal o
 EOF
 echo "  cluster.rb cross-reason, single-bug, recovery-damping, fallback, CLI, and verify.rb cluster checks passed"
 
+# Exercise retriage.rb post-fix lifecycle (--dry-run, scoped --cluster PARTIAL split, occurrence preservation, #skip sentinels, and full PASS cleanup)
+cat << 'EOF' > "$WORKDIR/mock_retriage_target.c"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int contains_token(const uint8_t *data, size_t size, const char *tok) {
+    size_t tlen = strlen(tok);
+    if (size < tlen) return 0;
+    for (size_t i = 0; i <= size - tlen; i++) {
+        if (memcmp(data + i, tok, tlen) == 0) return 1;
+    }
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (contains_token(data, size, "CRASH_ALPHA")) {
+        fprintf(stderr, "INVARIANT[alpha]: kind=one\n");
+        abort();
+    }
+    if (contains_token(data, size, "CRASH_BETA")) {
+        fprintf(stderr, "INVARIANT[beta]: kind=two\n");
+        abort();
+    }
+    return 0;
+}
+
+#ifdef STANDALONE_MAIN
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return 0;
+    }
+    uint8_t *buf = (uint8_t *) malloc((size_t) sz);
+    if (!buf) {
+        fclose(f);
+        return 0;
+    }
+    size_t n = fread(buf, 1, (size_t) sz, f);
+    fclose(f);
+    LLVMFuzzerTestOneInput(buf, n);
+    free(buf);
+    return 0;
+}
+#endif
+EOF
+
+mkdir -p "$WORKDIR/mock_retriage_build"
+clang -O1 -g -std=c99 -fsanitize=address \
+    test/fuzz/triage/verify_runner.c "$WORKDIR/mock_retriage_target.c" \
+    -o "$WORKDIR/mock_retriage_build/verify_runner.asan_ubsan"
+touch "$WORKDIR/mock_retriage_build/verify_runner.asan_ubsan"
+clang -O1 -g -std=c99 -fsanitize=address -DSTANDALONE_MAIN \
+    "$WORKDIR/mock_retriage_target.c" -o "$WORKDIR/mock_retriage_fuzz"
+
+retriage_dir="$WORKDIR/retriage_work"
+mkdir -p \
+    "$retriage_dir/.processed" \
+    "$retriage_dir/ABRT/old_c1_pass" \
+    "$retriage_dir/ABRT/old_c1_part" \
+    "$retriage_dir/ABRT/old_c2_keep"
+
+ruby - "$retriage_dir" "$WORKDIR/mock_retriage_fuzz" << 'EOF'
+require "digest"
+require "json"
+require "rubygems/package"
+require "zlib"
+
+triage_dir, mock_fuzz = ARGV
+
+write_bucket = lambda do |sig, raw_inputs, meta_extra = {}|
+  dir = File.join(triage_dir, "ABRT", sig)
+  File.binwrite(File.join(dir, "input.min"), raw_inputs.first[:bytes])
+  File.write(File.join(dir, "testcase.c"), "/* old #{sig} */\n")
+  Zlib::GzipWriter.open(File.join(dir, "inputs.tar.gz")) do |gz|
+    Gem::Package::TarWriter.new(gz) do |tar|
+      raw_inputs.each do |item|
+        tar.add_file_simple(item[:sha], 0o644, item[:bytes].bytesize) { |io| io.write(item[:bytes]) }
+      end
+    end
+  end
+  File.open(File.join(dir, "occurrences.jsonl"), "w") do |f|
+    raw_inputs.each_with_index do |item, idx|
+      rec = {
+        "sha256" => item[:sha],
+        "path" => "/orig/afl/fuzz01/crashes/id:#{format('%06d', idx)}",
+        "filename" => "id:#{format('%06d', idx)},sig:06",
+        "fuzzer" => "afl",
+        "worker" => item[:worker] || "fuzz01",
+        "queue" => "crashes",
+        "size_bytes" => item[:bytes].bytesize,
+        "mtime" => "2026-11-01T00:00:00Z"
+      }
+      f.puts(JSON.generate(rec))
+      File.write(File.join(triage_dir, ".processed", item[:sha]), "ABRT/#{sig}\n")
+    end
+  end
+  meta = {
+    "schema_version" => 1,
+    "bucket_id" => "ABRT/#{sig}",
+    "reason" => "ABRT",
+    "signature" => sig,
+    "reproducible" => true,
+    "reproduced_by" => mock_fuzz,
+    "verify_profile" => "asan_ubsan",
+    "occurrences" => { "count" => raw_inputs.size },
+    "input" => { "min_size_bytes" => raw_inputs.first[:bytes].bytesize, "raw_sha256" => raw_inputs.first[:sha] },
+    "symptom" => { "headline" => meta_extra[:headline] || "old assert" },
+    "frames" => [{ "function" => meta_extra[:frame] || "parse_heredoc", "scope" => "prism" }],
+    "coverage" => { "available" => true, "edges" => meta_extra[:edges] || { "10" => 1 } }
+  }
+  File.write(File.join(dir, "meta.json"), JSON.pretty_generate(meta))
+  meta
+end
+
+mk = lambda do |bytes, worker = "fuzz01"|
+  b = bytes.b
+  { bytes: b, sha: Digest::SHA256.hexdigest(b), worker: worker }
+end
+
+c1_pass_inputs = [mk.call("\x00\x00\x03\x01cured_bucket_a\n"), mk.call("\x00\x00\x03\x01cured_bucket_b\n")]
+c1_part_inputs = [
+  mk.call("\x00\x00\x03\x01cured_in_partial\n", "fuzz02"),
+  mk.call("\x00\x00\x03\x01padding_prefix CRASH_ALPHA padding_suffix\n", "fuzz03"),
+  mk.call("\x00\x00\x03\x01padding_prefix CRASH_BETA padding_suffix\n", "fuzz04")
+]
+c2_keep_inputs = [mk.call("\x00\x00\x03\x01untouched CRASH_ALPHA\n", "fuzz09")]
+
+File.write(File.join(triage_dir, ".hashes.json"), JSON.generate({
+  "c1_pass" => c1_pass_inputs.map { |i| i[:sha] },
+  "c1_part_cured" => c1_part_inputs[0][:sha],
+  "c1_part_alpha" => c1_part_inputs[1][:sha],
+  "c1_part_beta" => c1_part_inputs[2][:sha],
+  "c2_keep" => c2_keep_inputs.map { |i| i[:sha] }
+}))
+
+m1 = write_bucket.call("old_c1_pass", c1_pass_inputs, edges: { "10" => 1, "11" => 1 }, frame: "parse_heredoc")
+m2 = write_bucket.call("old_c1_part", c1_part_inputs, edges: { "10" => 1, "11" => 1 }, frame: "parse_heredoc")
+m3 = write_bucket.call("old_c2_keep", c2_keep_inputs, edges: { "20" => 1 }, frame: "parse_for")
+
+metadata = {
+  "schema_version" => 1,
+  "corpus" => {
+    "available" => true,
+    "corpus_count" => 100,
+    "edge_df" => { "10" => 0, "11" => 0, "20" => 0 },
+    "edge_functions" => { "10" => "parse_heredoc", "11" => "parse_heredoc", "20" => "parse_for" }
+  },
+  "buckets" => [m2, m1, m3]
+}
+File.write(File.join(triage_dir, "metadata.json"), JSON.pretty_generate(metadata))
+EOF
+
+# 1) --dry-run must inspect cluster-01 without deleting/modifying anything on disk
+VERIFY_BUILD_DIR="$WORKDIR/mock_retriage_build" TRIAGE_COVERAGE_BIN="" \
+    ruby ./test/fuzz/triage/retriage.rb \
+    --triage-dir "$retriage_dir" \
+    --cluster cluster-01 \
+    --no-build \
+    --dry-run > "$WORKDIR/retriage_dry.out"
+
+grep -q "1 bucket(s) cured/empty" "$WORKDIR/retriage_dry.out" || fail "expected dry-run plan to identify 1 cured bucket"
+grep -q "2 surviving inputs to re-triage" "$WORKDIR/retriage_dry.out" || fail "expected dry-run plan to identify 2 surviving inputs"
+[ -d "$retriage_dir/ABRT/old_c1_pass" ] || fail "dry-run must not remove cured bucket"
+[ -d "$retriage_dir/ABRT/old_c1_part" ] || fail "dry-run must not remove partial bucket"
+
+# 2) Scoped retriage of cluster-01 removes cured old_c1_pass, splits old_c1_part into 2 fresh buckets, and preserves untouched cluster-02
+VERIFY_BUILD_DIR="$WORKDIR/mock_retriage_build" TRIAGE_COVERAGE_BIN="" TRIAGE_MINIMIZE=0 \
+    ruby ./test/fuzz/triage/retriage.rb \
+    --triage-dir "$retriage_dir" \
+    --cluster cluster-01 \
+    --no-build > "$WORKDIR/retriage_run.out"
+
+[ ! -e "$retriage_dir/ABRT/old_c1_pass" ] || fail "expected cured old_c1_pass bucket to be removed"
+[ ! -e "$retriage_dir/ABRT/old_c1_part" ] || fail "expected stale old_c1_part bucket to be removed"
+[ -d "$retriage_dir/ABRT/old_c2_keep" ] || fail "expected unscoped cluster-02 bucket old_c2_keep to remain untouched"
+
+ruby - "$retriage_dir" << 'EOF'
+require "json"
+triage_dir = ARGV.fetch(0)
+hashes = JSON.parse(File.read(File.join(triage_dir, ".hashes.json")))
+
+# Cured hashes must now be marked #skip in .processed/
+(hashes["c1_pass"] + [hashes["c1_part_cured"]]).each do |sha|
+  sentinel = File.join(triage_dir, ".processed", sha)
+  raise "expected #skip sentinel for cured input #{sha}" unless File.file?(sentinel) && File.read(sentinel).strip == "#skip"
+end
+
+# Both surviving hashes must be re-triaged into 2 distinct new ABRT/* buckets (1 alpha, 1 beta), keeping original worker names
+alpha_bucket = File.read(File.join(triage_dir, ".processed", hashes["c1_part_alpha"])).strip
+beta_bucket = File.read(File.join(triage_dir, ".processed", hashes["c1_part_beta"])).strip
+raise "expected valid new bucket sentinels, got #{alpha_bucket.inspect} / #{beta_bucket.inspect}" if alpha_bucket.start_with?("#") || beta_bucket.start_with?("#")
+raise "expected survivors from different bugs to split into separate buckets" if alpha_bucket == beta_bucket
+raise "survivors must not reuse removed old_c1_part" if [alpha_bucket, beta_bucket].include?("ABRT/old_c1_part")
+
+alpha_meta = JSON.parse(File.read(File.join(triage_dir, alpha_bucket, "meta.json")))
+beta_meta = JSON.parse(File.read(File.join(triage_dir, beta_bucket, "meta.json")))
+raise "expected preserved fuzz03 worker provenance on alpha bucket: #{alpha_meta["occurrences"].inspect}" unless alpha_meta.dig("occurrences", "by_worker", "fuzz03") == 1
+raise "expected preserved fuzz04 worker provenance on beta bucket: #{beta_meta["occurrences"].inspect}" unless beta_meta.dig("occurrences", "by_worker", "fuzz04") == 1
+
+idx = JSON.parse(File.read(File.join(triage_dir, "metadata.json")))
+raise "expected 3 total buckets (2 new from cluster-01 + 1 kept old_c2_keep), got #{idx.dig("summary", "bucket_count")}" unless idx.dig("summary", "bucket_count") == 3
+clusters = JSON.parse(File.read(File.join(triage_dir, "clusters.json")))
+raise "expected clusters.json schema_version 1" unless clusters["schema_version"] == 1
+EOF
+
+# 3) All-PASS retriage cleans up 100% of cured buckets and prunes empty reason directories
+all_pass_retriage="$WORKDIR/retriage_all_pass"
+mkdir -p "$all_pass_retriage/.processed" "$all_pass_retriage/ABRT/only_cured"
+printf '\x00\x00\x03\x01completely_fixed\n' > "$all_pass_retriage/ABRT/only_cured/input.min"
+VERIFY_BUILD_DIR="$WORKDIR/mock_retriage_build" TRIAGE_COVERAGE_BIN="" \
+    ruby ./test/fuzz/triage/retriage.rb \
+    --triage-dir "$all_pass_retriage" \
+    --no-build > "$WORKDIR/retriage_all_pass.out"
+
+[ ! -e "$all_pass_retriage/ABRT" ] || fail "expected empty ABRT/ reason directory to be pruned when all buckets PASS"
+ruby - "$all_pass_retriage" << 'EOF'
+require "json"
+dir = ARGV.fetch(0)
+idx = JSON.parse(File.read(File.join(dir, "metadata.json")))
+cl = JSON.parse(File.read(File.join(dir, "clusters.json")))
+raise "expected 0 buckets remaining" unless idx.dig("summary", "bucket_count") == 0
+raise "expected 0 clusters remaining" unless cl.dig("summary", "cluster_count") == 0
+EOF
+echo "  retriage.rb (--dry-run, scoped cluster survivor split, occurrence provenance, #skip sentinels, and full PASS cleanup) checks passed"
+
 echo "PASS: Fuzz crash triage and minimization suite verified."
