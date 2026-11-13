@@ -220,8 +220,8 @@ fuzz-bench: fuzz-docker-build fuzz-gen-templates
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/runtime/grammar_bench.rb --json tmp/fuzz/grammar-bench.json $(GRAMMAR_BENCH_ARGS)
 
 fuzz-test: fuzz-docker-build fuzz-gen-templates
-	$(ECHO) "testing AFL++ instrumentation patch, crash triage, and grammar generator"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh && ./test/fuzz/triage/test_triage.sh && ./test/fuzz/runtime/test_grammar.sh"
+	$(ECHO) "testing AFL++ instrumentation patch, crash triage, grammar generator, and OSS-Fuzz build"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh && ./test/fuzz/triage/test_triage.sh && ./test/fuzz/runtime/test_grammar.sh && ./test/fuzz/oss-fuzz/test_oss_fuzz.sh"
 
 define FUZZ_CLEAN_CONFIRM
 @if [ -t 1 ]; then \

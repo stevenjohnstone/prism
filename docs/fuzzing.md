@@ -14,6 +14,14 @@ test/fuzz
 │   ├── include
 │   │   └── prism_xallocator.h    custom allocator header for fast leak detection
 │   └── parse.c                   fuzz harness for parsing, serialization, and formatting
+├── oss-fuzz
+│   ├── Dockerfile                OSS-Fuzz builder image setup
+│   ├── README.md                 OSS-Fuzz targets, usage, and differences from local fuzzing
+│   ├── build.sh                  OSS-Fuzz build script (prism_parse_fuzzer and prism_full_fuzzer)
+│   ├── prism_full_fuzzer.options options for the -DSLOW full pipeline target
+│   ├── prism_parse_fuzzer.options options for the fast parse-only target
+│   ├── project.yaml              OSS-Fuzz project metadata, engines, and sanitizers
+│   └── test_oss_fuzz.sh          smoke test for OSS-Fuzz build and seed corpus replay
 ├── patches
 │   ├── aflplusplus.md            explanation of the AFL++ sanitizer coverage patch
 │   ├── aflplusplus.patch         patch for AFL++ LTO/PCGUARD passes to skip sanitizer checks
@@ -339,9 +347,13 @@ make fuzz-clean
 
 Run `make fuzz-triage` before `make fuzz-clean` if your campaign has untriaged crashes or hangs so both minimized reproducers and archived raw crashers are preserved for `make fuzz-verify`.
 
+### OSS-Fuzz Integration
+
+Standalone OSS-Fuzz configuration lives in [`test/fuzz/oss-fuzz/`](../test/fuzz/oss-fuzz/README.md) (`project.yaml`, `Dockerfile`, `build.sh`, and `.options` for `prism_parse_fuzzer` and `prism_full_fuzzer`). It builds both parse-only and `-DSLOW` targets without local AFL++ IJON/`lrama-fuzz`/`tmux` infrastructure while reusing `test/fuzz/harness/parse.c`, `test/fuzz/harness/fuzz.c`, `test/fuzz/dict`, and `test/fuzz/runtime/corpus.rb --no-minimize`.
+
 ### Testing the Fuzzing Infrastructure
 
-To run the automated regression suites for the custom AFL++ instrumentation patch (`test/fuzz/patches/test_afl_patch.sh`), crash triage, archiving, and post-fix verification pipeline (`test/fuzz/triage/test_triage.sh`), and grammar seed generator (`test/fuzz/runtime/test_grammar.sh`):
+To run the automated regression suites for the custom AFL++ instrumentation patch (`test/fuzz/patches/test_afl_patch.sh`), crash triage, archiving, and post-fix verification pipeline (`test/fuzz/triage/test_triage.sh`), grammar seed generator (`test/fuzz/runtime/test_grammar.sh`), and OSS-Fuzz build/corpus smoke test (`test/fuzz/oss-fuzz/test_oss_fuzz.sh`):
 
 ```bash
 make fuzz-test

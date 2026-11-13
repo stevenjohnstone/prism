@@ -2,8 +2,22 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "optparse"
 require "tmpdir"
 
+minimize = true
+OptionParser.new do |opts|
+  opts.banner = "Usage: corpus.rb [options] [OUTPUT_DIR]"
+  opts.on("--no-minimize", "Copy generated seed files without running afl-cmin") do
+    minimize = false
+  end
+  opts.on("-h", "--help", "Show this help message") do
+    puts opts
+    exit 0
+  end
+end.parse!(ARGV)
+
+MINIMIZE = minimize
 OUTPUT_DIR = File.absolute_path(ARGV[0] || "./tmp/fuzz/corpus")
 CORPUS_DIR = "./test/prism/fixtures"
 MAX_INPUT_SIZE = Integer(ENV.fetch("FUZZ_MAX_INPUT_SIZE", "1024"))
@@ -58,7 +72,7 @@ def split_payload_chunks(bytes, max_len)
 end
 
 FileUtils.mkdir_p(File.dirname(OUTPUT_DIR))
-executable = File.absolute_path("./build/fuzz")
+executable = File.absolute_path("./build/fuzz") if MINIMIZE
 
 Dir.chdir(CORPUS_DIR)
 
@@ -128,10 +142,14 @@ begin
     end
 
     puts "------------------------------------------------"
-    puts "Total corpus size: #{count} files. Now minimizing"
-
     FileUtils.mkdir_p(staging_dir)
-    system("afl-cmin", "-o", staging_dir, "-i", tmpdir, "--", executable, "@@", exception: true)
+    if MINIMIZE
+      puts "Total corpus size: #{count} files. Now minimizing"
+      system("afl-cmin", "-o", staging_dir, "-i", tmpdir, "--", executable, "@@", exception: true)
+    else
+      puts "Total corpus size: #{count} files. Skipping minimization (--no-minimize)"
+      FileUtils.cp_r(File.join(tmpdir, "."), staging_dir)
+    end
     FileUtils.rm_rf(OUTPUT_DIR)
     File.rename(staging_dir, OUTPUT_DIR)
   end
