@@ -224,10 +224,17 @@ static inline fuzz_span_t fuzz_magic_comment_value_span(const pm_magic_comment_t
 #endif
 }
 
+#ifndef PRISM_DEPTH_MAXIMUM
+#define PRISM_DEPTH_MAXIMUM 10000
+#endif
+#define FUZZ_MAX_NON_ITER_DEPTH ((size_t) (PRISM_DEPTH_MAXIMUM) * 2u + 64u)
+
 typedef struct {
     const uint8_t *source;
     size_t parsed_size;
     pm_node_type_t parent_type;
+    pm_parser_t *parser;
+    size_t depth;
 } fuzz_node_check_t;
 
 typedef struct {
@@ -736,6 +743,58 @@ static void fuzz_check_node_relations(const pm_node_t *node, fuzz_span_t loc, co
 }
 #endif
 
+static void fuzz_for_each_error_diag(pm_parser_t *parser, void (*fn)(const pm_diagnostic_t *, void *), void *ctx) {
+#ifdef PRISM_FUZZ_LIST_ITERATORS
+    for (const pm_diagnostic_t *d = (const pm_diagnostic_t *) parser->error_list.head; d != NULL; d = (const pm_diagnostic_t *) d->node.next) {
+        fn(d, ctx);
+    }
+#elif defined(PRISM_FUZZ_ITER_OBJS)
+    pm_diagnostics_iter_t *err_iter = pm_parser_errors(parser);
+    for (const pm_diagnostic_t *d = pm_diagnostics_iter_next(err_iter); d != NULL; d = pm_diagnostics_iter_next(err_iter)) {
+        fn(d, ctx);
+    }
+    pm_diagnostics_iter_free(err_iter);
+#elif defined(PRISM_FUZZ_EACH_ITERATORS)
+    pm_parser_errors_each(parser, fn, ctx);
+#else
+    for (const pm_diagnostic_t *d = pm_parser_errors_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
+        fn(d, ctx);
+    }
+#endif
+}
+
+#if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_NO_DIAGNOSTIC_TYPE) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+static bool fuzz_is_iterative_chain_node(pm_node_type_t parent, pm_node_type_t child) {
+    if (parent != child) return false;
+    switch (child) {
+        case PM_CALL_NODE:
+        case PM_AND_NODE:
+        case PM_OR_NODE:
+        case PM_CONSTANT_PATH_NODE:
+        case PM_IF_NODE:
+        case PM_RESCUE_NODE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void fuzz_check_depth_or_stack_cb(const pm_diagnostic_t *d, void *data) {
+    bool *found = (bool *) data;
+    if (*found) return;
+    const char *diag_type = fuzz_diag_type(d);
+    if (diag_type != NULL && (strcmp(diag_type, "nesting_too_deep") == 0 || strcmp(diag_type, "stack_exhausted") == 0)) {
+        *found = true;
+    }
+}
+
+static bool fuzz_parser_has_depth_or_stack_error(pm_parser_t *parser) {
+    bool found = false;
+    fuzz_for_each_error_diag(parser, fuzz_check_depth_or_stack_cb, &found);
+    return found;
+}
+#endif
+
 static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) {
     const fuzz_node_check_t *ctx = (const fuzz_node_check_t *) data;
     fuzz_span_t loc = fuzz_loc_span(node->location, ctx->source);
@@ -761,10 +820,26 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
 #if !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
     fuzz_check_node_relations(node, loc, ctx);
 #endif
+#if !defined(PRISM_FUZZ_NO_DIAGNOSTIC_TYPE) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+    size_t cur_depth = ctx->depth + (fuzz_is_iterative_chain_node(ctx->parent_type, node->type) ? 0u : 1u);
+    if (cur_depth > FUZZ_MAX_NON_ITER_DEPTH && ctx->parser != NULL && !fuzz_parser_has_depth_or_stack_error(ctx->parser)) {
+        fuzz_invariant_fail(
+            "INVARIANT[recursion_depth]: type=%s kind=depth_exceeded [detail: depth=%zu limit=%zu max=%u]\n",
+            fuzz_safe_node_name(node->type),
+            cur_depth,
+            (size_t) FUZZ_MAX_NON_ITER_DEPTH,
+            (unsigned) (PRISM_DEPTH_MAXIMUM)
+        );
+    }
+#else
+    size_t cur_depth = ctx->depth + 1u;
+#endif
     fuzz_node_check_t child_ctx = {
         .source = ctx->source,
         .parsed_size = ctx->parsed_size,
         .parent_type = node->type,
+        .parser = ctx->parser,
+        .depth = cur_depth,
     };
     pm_visit_child_nodes(node, check_node_location, &child_ctx);
 #endif
@@ -1168,6 +1243,8 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         .source = source_buf,
         .parsed_size = parsed_size,
         .parent_type = 0,
+        .parser = parser,
+        .depth = 0,
     };
     if (node != NULL) {
 #ifdef PRISM_FUZZ_NO_VISIT_NODE
@@ -1181,21 +1258,13 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         .source = source_buf,
         .parsed_size = parsed_size,
     };
+    fuzz_for_each_error_diag(parser, fuzz_check_error_diag, &diag_ctx);
 #ifdef PRISM_FUZZ_LIST_ITERATORS
-    for (const pm_diagnostic_t *d = (const pm_diagnostic_t *) parser->error_list.head; d != NULL; d = (const pm_diagnostic_t *) d->node.next) {
-        fuzz_check_error_diag(d, &diag_ctx);
-    }
     for (const pm_diagnostic_t *d = (const pm_diagnostic_t *) parser->warning_list.head; d != NULL; d = (const pm_diagnostic_t *) d->node.next) {
         fuzz_check_warning_diag(d, &diag_ctx);
     }
 #elif defined(PRISM_FUZZ_ITER_OBJS)
     {
-        pm_diagnostics_iter_t *err_iter = pm_parser_errors(parser);
-        for (const pm_diagnostic_t *d = pm_diagnostics_iter_next(err_iter); d != NULL; d = pm_diagnostics_iter_next(err_iter)) {
-            fuzz_check_error_diag(d, &diag_ctx);
-        }
-        pm_diagnostics_iter_free(err_iter);
-
         pm_diagnostics_iter_t *warn_iter = pm_parser_warnings(parser);
         for (const pm_diagnostic_t *d = pm_diagnostics_iter_next(warn_iter); d != NULL; d = pm_diagnostics_iter_next(warn_iter)) {
             fuzz_check_warning_diag(d, &diag_ctx);
@@ -1203,12 +1272,8 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
         pm_diagnostics_iter_free(warn_iter);
     }
 #elif defined(PRISM_FUZZ_EACH_ITERATORS)
-    pm_parser_errors_each(parser, fuzz_check_error_diag, &diag_ctx);
     pm_parser_warnings_each(parser, fuzz_check_warning_diag, &diag_ctx);
 #else
-    for (const pm_diagnostic_t *d = pm_parser_errors_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
-        fuzz_check_error_diag(d, &diag_ctx);
-    }
     for (const pm_diagnostic_t *d = pm_parser_warnings_first(parser); d != NULL; d = pm_diagnostic_next(d)) {
         fuzz_check_warning_diag(d, &diag_ctx);
     }

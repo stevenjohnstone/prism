@@ -312,6 +312,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     need_parsed_size: false,
     need_check_node_helper: false,
     need_check_node_relation_helper: false,
+    need_check_recursion_depth_helper: false,
     need_stream_helpers: stream_mode,
     need_assert: false,
     need_stdbool: stream_mode,
@@ -350,6 +351,26 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:lines] = [
       "node_relation_ctx_t rel_ctx = {.source = #{source_ptr}, .parsed_size = parsed_size};",
       "pm_visit_node(node, check_node_relation, &rel_ctx);"
+    ]
+  elsif crash_output.include?("INVARIANT[recursion_depth]:")
+    plan[:need_node] = true
+    plan[:need_check_recursion_depth_helper] = true
+    plan[:need_assert] = true
+    plan[:need_stdbool] = true
+    plan[:need_string] = true
+    plan[:lines] = [
+      "bool has_depth_error = false;",
+      "for (const pm_diagnostic_t *d = pm_parser_errors_first(parser); d != NULL; d = pm_diagnostic_next(d)) {",
+      "  const char *diag_type = pm_diagnostic_type(d);",
+      "  if (strcmp(diag_type, \"nesting_too_deep\") == 0 || strcmp(diag_type, \"stack_exhausted\") == 0) {",
+      "    has_depth_error = true;",
+      "    break;",
+      "  }",
+      "}",
+      "if (!has_depth_error) {",
+      "  rec_depth_ctx_t depth_ctx = {.parent_type = 0, .depth = 0};",
+      "  pm_visit_node(node, check_recursion_depth, &depth_ctx);",
+      "}"
     ]
   elsif crash_output.include?("INVARIANT[diagnostic_semantic]:")
     plan[:need_parsed_size] = true
@@ -725,6 +746,39 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
     C
   end
 
+  if plan[:need_check_recursion_depth_helper]
+    helpers << <<~C.chomp
+      typedef struct {
+        pm_node_type_t parent_type;
+        size_t depth;
+      } rec_depth_ctx_t;
+
+      static bool is_iterative_chain_node(pm_node_type_t parent, pm_node_type_t child) {
+        if (parent != child) return false;
+        switch (child) {
+          case PM_CALL_NODE:
+          case PM_AND_NODE:
+          case PM_OR_NODE:
+          case PM_CONSTANT_PATH_NODE:
+          case PM_IF_NODE:
+          case PM_RESCUE_NODE:
+            return true;
+          default:
+            return false;
+        }
+      }
+
+      static pm_visit_result_t check_recursion_depth(const pm_node_t *node, void *data) {
+        const rec_depth_ctx_t *ctx = (const rec_depth_ctx_t *)data;
+        size_t cur_depth = ctx->depth + (is_iterative_chain_node(ctx->parent_type, node->type) ? 0u : 1u);
+        assert(cur_depth <= (size_t)128 * 2u + 64u);
+        rec_depth_ctx_t child_ctx = {.parent_type = node->type, .depth = cur_depth};
+        pm_visit_child_nodes(node, check_recursion_depth, &child_ctx);
+        return PM_VISIT_SKIP;
+      }
+    C
+  end
+
   main_lines = []
   if source.empty?
     main_lines << "uint8_t *source = malloc(input_size);"
@@ -849,7 +903,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
   defines = []
   defines << "-DPM_ARENA_INITIAL_SIZE=0" unless is_native_only || is_invariant || is_arith_ub
   defines << "-DPM_INTEGER_DIVIDE_THRESHOLD=8" if has_long_decimal || crash_output.match?(/\b(?:pm_integer|pm_bignum)_|(?:integer|bignum)\.c\b/)
-  defines << "-DPRISM_DEPTH_MAXIMUM=128" if source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep")
+  defines << "-DPRISM_DEPTH_MAXIMUM=128" if source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep") || crash_output.include?("INVARIANT[recursion_depth]")
   defines << "-DPRISM_BUILD_DEBUG" if crash_output.match?(/fuzz_(free|realloc)_sized/)
 
   sanitizers = if executable.end_with?("msan") || reason == "use-of-uninitialized-value"
