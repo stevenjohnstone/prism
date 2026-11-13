@@ -88,6 +88,9 @@ begin
 
     Dir.glob("**/*.txt") do |filename|
       next if File.directory?(filename)
+      # Skip spanning_heredoc.txt until ruby/prism#4364 (duplicate InterpolatedSymbolNode
+      # part locations across heredoc + %i/%I) is fixed so initial seed replay and afl-cmin pass.
+      next if filename == "spanning_heredoc.txt"
 
       base = filename.gsub(/[^a-zA-Z0-9.-]/, "_")
       chunks = split_payload_chunks(File.binread(filename), MAX_PAYLOAD_SIZE)

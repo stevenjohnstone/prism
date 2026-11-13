@@ -311,6 +311,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     need_node: false,
     need_parsed_size: false,
     need_check_node_helper: false,
+    need_check_node_relation_helper: false,
     need_stream_helpers: stream_mode,
     need_assert: false,
     need_stdbool: stream_mode,
@@ -339,6 +340,16 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_check_node_helper] = true
     plan[:need_assert] = true
     plan[:lines] = ["pm_visit_node(node, check_node_location, &parsed_size);"]
+  elsif crash_output.include?("INVARIANT[node_relation]:")
+    plan[:need_node] = true
+    plan[:need_parsed_size] = true
+    plan[:need_check_node_relation_helper] = true
+    plan[:need_assert] = true
+    plan[:need_stdbool] = true
+    plan[:lines] = [
+      "node_relation_ctx_t rel_ctx = {.source = #{source_ptr}, .parsed_size = parsed_size};",
+      "pm_visit_node(node, check_node_relation, &rel_ctx);"
+    ]
   elsif crash_output.include?("INVARIANT[diagnostic]: list=error")
     plan[:need_parsed_size] = stream_mode
     plan[:need_assert] = true
@@ -605,6 +616,83 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
         size_t parsed_size = *(const size_t *)data;
         assert((size_t)node->location.start <= parsed_size);
         assert((size_t)node->location.length <= parsed_size - (size_t)node->location.start);
+        return PM_VISIT_DESCEND;
+      }
+    C
+  end
+
+  if plan[:need_check_node_relation_helper]
+    helpers << <<~C.chomp
+      typedef struct {
+        const uint8_t *source;
+        size_t parsed_size;
+      } node_relation_ctx_t;
+
+      static void check_node_list_relations(
+          const pm_node_t *parent,
+          pm_location_t opening_loc,
+          pm_location_t closing_loc,
+          const pm_node_list_t *list,
+          const node_relation_ctx_t *ctx) {
+        bool opening_valid = opening_loc.length > 0 &&
+            (size_t)opening_loc.start <= ctx->parsed_size &&
+            (size_t)opening_loc.length <= ctx->parsed_size - (size_t)opening_loc.start;
+        bool closing_valid = closing_loc.length > 0 &&
+            (size_t)closing_loc.start <= ctx->parsed_size &&
+            (size_t)closing_loc.length <= ctx->parsed_size - (size_t)closing_loc.start;
+        bool is_heredoc = opening_valid && opening_loc.length >= 2 &&
+            ctx->source[opening_loc.start] == '<' && ctx->source[opening_loc.start + 1] == '<';
+        uint64_t pend = (uint64_t)parent->location.start + (uint64_t)parent->location.length;
+        uint64_t opening_end = (uint64_t)opening_loc.start + (uint64_t)opening_loc.length;
+        uint64_t prev_end = 0;
+
+        for (size_t i = 0; i < list->size; i++) {
+          const pm_node_t *child = list->nodes[i];
+          uint64_t cstart = (uint64_t)child->location.start;
+          uint64_t cend = cstart + (uint64_t)child->location.length;
+          assert(i == 0 || cstart >= prev_end);
+          if (!is_heredoc) {
+            assert(child->location.start >= parent->location.start);
+            assert(cend <= pend);
+            assert(!opening_valid || cstart >= opening_end);
+            assert(!closing_valid || cend <= (uint64_t)closing_loc.start);
+          }
+          prev_end = cend;
+        }
+      }
+
+      static pm_visit_result_t check_node_relation(const pm_node_t *node, void *data) {
+        const node_relation_ctx_t *ctx = (const node_relation_ctx_t *)data;
+        switch (node->type) {
+          case PM_ARRAY_NODE: {
+            const pm_array_node_t *arr = (const pm_array_node_t *)node;
+            check_node_list_relations(node, arr->opening_loc, arr->closing_loc, &arr->elements, ctx);
+            break;
+          }
+          case PM_INTERPOLATED_SYMBOL_NODE: {
+            const pm_interpolated_symbol_node_t *sym = (const pm_interpolated_symbol_node_t *)node;
+            check_node_list_relations(node, sym->opening_loc, sym->closing_loc, &sym->parts, ctx);
+            break;
+          }
+          case PM_INTERPOLATED_STRING_NODE: {
+            const pm_interpolated_string_node_t *str = (const pm_interpolated_string_node_t *)node;
+            check_node_list_relations(node, str->opening_loc, str->closing_loc, &str->parts, ctx);
+            break;
+          }
+          case PM_INTERPOLATED_X_STRING_NODE: {
+            const pm_interpolated_x_string_node_t *xstr = (const pm_interpolated_x_string_node_t *)node;
+            check_node_list_relations(node, xstr->opening_loc, xstr->closing_loc, &xstr->parts, ctx);
+            break;
+          }
+          case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE: {
+            const pm_interpolated_regular_expression_node_t *re =
+                (const pm_interpolated_regular_expression_node_t *)node;
+            check_node_list_relations(node, re->opening_loc, re->closing_loc, &re->parts, ctx);
+            break;
+          }
+          default:
+            break;
+        }
         return PM_VISIT_DESCEND;
       }
     C

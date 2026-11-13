@@ -375,6 +375,13 @@ build_verify_runner() {
     end
     out << "-DPRISM_FUZZ_NO_VISIT_NODE" unless code.match?(/\bpm_visit_node\b/)
     out << "-DPRISM_FUZZ_LEGACY_VISIT_BOOL" unless code.match?(/\bpm_visit_result_t\b/)
+    unless code.match?(/\bpm_node_list_t\b/) &&
+           code.match?(/\bpm_interpolated_symbol_node_t\b/) &&
+           code.match?(/\bpm_interpolated_x_string_node_t\b/) &&
+           code.match?(/\bpm_interpolated_regular_expression_node_t\b/) &&
+           code.match?(/\bPM_ARRAY_NODE\b/)
+      out << "-DPRISM_FUZZ_NO_NODE_RELATIONS"
+    end
 
     # Buffer, stream, errors_format, json
     unless code.match?(/\bpm_buffer_new\b/)
