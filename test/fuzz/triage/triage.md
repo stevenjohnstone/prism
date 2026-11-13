@@ -121,7 +121,7 @@ Because triage collapses many raw findings into one bucket directory and keeps o
 
 ## Metadata and Coverage Schema
 
-At the end of triage, `finalize_triage_metadata` updates stale `meta.json` files (atomic rename), ensures `verify.sh` exists, collects `afl-showmap` coverage, and rewrites `tmp/fuzz/triage/metadata.json`.
+At the end of triage, `finalize_triage_metadata` updates stale `meta.json` files (atomic rename), ensures `verify.sh` exists, collects `afl-showmap` coverage, rewrites `tmp/fuzz/triage/metadata.json`, and generates `tmp/fuzz/triage/clusters.json`.
 
 ### Per-Bucket Files (`occurrences.jsonl` and `meta.json`)
 
@@ -181,9 +181,9 @@ To keep bulk failure sweeps fast, `verify_bucket.sh` appends `:symbolize=0` to `
 
 > **Note:** On macOS hosts where `build/verify/` is shared with the Linux Docker container, host-built and container-built binaries share `verify_runner.<profile>`. Prefer running `make fuzz-verify` from the host (runs inside Docker) or running `./verify.sh` inside `make fuzz-debug`, or override `VERIFY_BUILD_DIR` when mixing host and container runs.
 
-### Multi-Bucket Statuses (`verify.rb`)
+### Multi-Bucket and Cluster Verification (`verify.rb`)
 
-`verify.rb` builds each needed profile once (`--build-only`), skips `unreproducible/` unless explicitly targeted (`--include-unreproducible`, `VERIFY_UNREPRODUCIBLE=1`, `--reason unreproducible`, or a matching `--bucket` / `BUCKET` filter), checks `input.min` first followed by `.inputs.pending` and `inputs.tar.gz`, and classifies every bucket:
+`verify.rb` builds each needed profile once (`--build-only`), skips `unreproducible/` unless explicitly targeted (`--include-unreproducible`, `VERIFY_UNREPRODUCIBLE=1`, `--reason unreproducible`, a matching `--bucket` / `BUCKET` filter, or an explicit `--cluster` containing it), checks `input.min` first followed by `.inputs.pending` and `inputs.tar.gz`, and classifies every bucket:
 
 | Status | Meaning | Exit Code Contribution |
 | :--- | :--- | :--- |
@@ -191,6 +191,8 @@ To keep bulk failure sweeps fast, `verify_bucket.sh` appends `:symbolize=0` to `
 | `PARTIAL` | `input.min` passed, but at least one archived raw input (or pending input) still failed. Indicates an incomplete fix or distinct bugs sharing a signature. | Failing (`1`) |
 | `FAIL` | `input.min` failed (or bucket has no `input.min` and an archived input failed). | Failing (`1`) |
 | `EMPTY` | Bucket contained zero verifiable inputs. | Ignored |
+
+When verifying by cluster (`--cluster` / `CLUSTER`) or in grouped mode (`--by-cluster` / `BY_CLUSTER=1`), `verify.rb` resolves `<triage_dir>/clusters.json` (auto-generating or refreshing it from `metadata.json` when missing or stale), orders each cluster's canonical representative first, and rolls up per-cluster statuses (`PASS` if all non-empty buckets pass, `FAIL` if all non-empty buckets fail, `PARTIAL` if some buckets or representatives pass while sibling buckets or archived inputs still fail). Unknown `--cluster` filters exit `1` and print the cluster summary table to prevent silent false positives on typos.
 
 ---
 
@@ -216,6 +218,11 @@ Forwarded by `make fuzz-verify` (in [`test/fuzz/Makefile`](../Makefile)) or acce
 
 | Env Var (`make fuzz-verify`) | `verify.rb` / `verify_bucket.sh` Flag | Default | Purpose |
 | :--- | :--- | :--- | :--- |
+| `TRIAGE_DIR` | `--triage-dir DIR` (`verify.rb`) | `tmp/fuzz/triage` | Triage directory to verify. |
+| `CLUSTER` | `--cluster PATTERN` (`verify.rb`, repeatable) | all | Comma-separated cluster IDs (`cluster-01`), numeric indices (`1`), globs, or member `bucket_id`/signatures; auto-enables `--by-cluster`. |
+| `BY_CLUSTER` | `--by-cluster` (`verify.rb`) | `0` | Group verification order, progress headers, JSON rollups, and summary by root-cause cluster. |
+| `CLUSTERS_FILE` | `--clusters-file PATH` (`verify.rb`) | `<triage_dir>/clusters.json` | Override the clusters JSON input file. |
+| — | `--list-clusters` (`verify.rb`) | unset | Print available clusters (auto-refreshing `clusters.json` if stale) and exit. |
 | `BUCKET` | `--bucket PATTERN` (`verify.rb`, repeatable) | all | Comma-separated bucket IDs, signatures, or glob/substring patterns. |
 | `REASON` | `--reason REASON` (`verify.rb`, repeatable) | all | Filter by reason directory (e.g., `ABRT`, `undefined-behavior`). |
 | `VERIFY_TIMEOUT` | `--timeout SEC` | `5` | Per-input `alarm()` timeout in seconds (`0` disables in `verify_runner`). |
@@ -238,7 +245,7 @@ Forwarded by `make fuzz-verify` (in [`test/fuzz/Makefile`](../Makefile)) or acce
 1. **`[1/7]` Signature normalization**: Verifies `signature.sh` redaction rules, `INVARIANT[...]` precedence + `[detail: ...]` stripping, and `SIGPIPE` safety on 5,000-line traces.
 2. **`[2/7]` `halfempty.sh` minimization**: Verifies 4-byte header preservation, crash-drift rejection, `INVARIANT` symmetry breaking, `SIGSEGV` handling, and 4-byte minimum bounds.
 3. **`[3/7]` Standalone C reproducer synthesis**: Checks generated `testcase.c` + `build.sh` compiles strictly with `-std=c99 -Werror` using only `-Iinclude` and reproduces under ASAN+UBSAN.
-4. **`[4/7]` Concurrent triage**: Tests parallel `triage.rb` deduplication, header minimization, coalescing of simultaneous duplicates, `.processed` sentinels, and `meta.json` / `occurrences.jsonl` / `metadata.json` schema.
+4. **`[4/7]` Concurrent triage**: Tests parallel `triage.rb` deduplication, header minimization, coalescing of simultaneous duplicates, `.processed` sentinels, and `meta.json` / `occurrences.jsonl` / `metadata.json` / `clusters.json` output.
 5. **`[5/7]` `afl-showmap` coverage & recount** (Docker only; skips outside Docker): Verifies bucket `edges`, corpus `edge_df`, `AFL_LLVM_DOCUMENT_IDS` loading, `.corpus-coverage.json` caching, and `TRIAGE_RECOUNT=1` archive/occurrence backfill.
 6. **`[6/7]` Post-fix verification**: Compiles `verify_runner` natively, verifies crash/timeout/`atexit`-leak binary-split isolation, runs generated `verify.sh` end-to-end, and tests `verify.rb`'s `FAIL` -> `PARTIAL` -> `PASS` lifecycle with survivor extraction (`--extract-survivors`) and JSON output.
-7. **`[7/7]` Root-cause clustering (`cluster.rb`)**: Verifies cross-reason leaf-frame merging (`SEGV` + `use-of-uninitialized-value` + 1-frame shift), frame-presence mismatch rejection, single-bug short-campaign stability, recovery-helper downweighting, empty/singleton/no-coverage fallbacks, permutation invariance, and CLI output.
+7. **`[7/7]` Root-cause clustering and cluster verification (`cluster.rb`, `verify.rb`)**: Verifies cross-reason leaf-frame merging (`SEGV` + `use-of-uninitialized-value` + 1-frame shift), frame-presence mismatch rejection, single-bug short-campaign stability, recovery-helper downweighting, empty/singleton/no-coverage fallbacks, CLI output, and `verify.rb` cluster workflows (`--cluster`, `--by-cluster`, `--list-clusters`, stale `clusters.json` refresh, representative-first execution, and unknown-cluster failure).

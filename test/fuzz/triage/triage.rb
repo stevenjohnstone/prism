@@ -14,6 +14,9 @@ require "time"
 require "tmpdir"
 require "zlib"
 
+cluster_lib = [(__dir__ && File.join(__dir__, "cluster.rb")), File.expand_path("test/fuzz/triage/cluster.rb")].compact.find { |p| File.file?(p) }
+require cluster_lib if cluster_lib
+
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
 OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze
@@ -1985,7 +1988,12 @@ def finalize_triage_metadata(triage_dir)
     "buckets" => buckets
   }
 
-  write_json_atomic(File.join(triage_dir, "metadata.json"), index_data)
+  metadata_path = File.join(triage_dir, "metadata.json")
+  write_json_atomic(metadata_path, index_data)
+  if defined?(FuzzClustering)
+    clusters_report = FuzzClustering.cluster_metadata(index_data, metadata_path: normalize_repo_path(metadata_path))
+    write_json_atomic(File.join(triage_dir, "clusters.json"), clusters_report)
+  end
 end
 
 def binary_build_id(bin_path)
