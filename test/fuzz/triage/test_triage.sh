@@ -275,6 +275,11 @@ tc_node_rel_c = c_program(
   "test node rel",
   crash_output: "INVARIANT[node_relation]: parent=PM_INTERPOLATED_SYMBOL_NODE child=PM_STRING_NODE kind=duplicate_part\n"
 )
+tc_diag_sem_c = c_program(
+  node_loc_in,
+  "test diag semantic",
+  crash_output: "INVARIANT[diagnostic_semantic]: type=mixed_encoding kind=wrong_byte\n"
+)
 
 expected_nonempty_url = "https://stevenjohnstone.github.io/prism-loupe/?code=MSArIDIK&ruby_ver=4.1&line=-1&cmd=al&partial=1&enc_lock=1&scopes=a%2Cfoo%2C~MSArIA%3Bp%3Ab%2Cit"
 raise "unexpected Loupe URL in tc_nonempty.c:\n#{tc_nonempty_c}" unless tc_nonempty_c.include?("Prism Loupe: #{expected_nonempty_url}")
@@ -294,7 +299,7 @@ tc_ubsan_c = c_program(
 expected_ubsan_url = "https://stevenjohnstone.github.io/prism-loupe/?code=&san=1&ruby_ver=4.1"
 raise "expected san=1 in UBSAN Loupe URL:\n#{tc_ubsan_c}" unless tc_ubsan_c.include?("Prism Loupe: #{expected_ubsan_url}")
 
-[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c, tc_node_rel_c].each do |src|
+[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c, tc_node_rel_c, tc_diag_sem_c].each do |src|
   %w[harness( harness_parse fuzz_options_t PRISM_FUZZ_IJON prism/internal/ #ifdef\ SLOW].each do |forbidden|
     raise "forbidden harness noise #{forbidden.inspect} found in:\n#{src}" if src.include?(forbidden)
   end
@@ -311,6 +316,7 @@ File.write(File.join(workdir, "tc_min_oob.c"), tc_min_oob_c)
 File.write(File.join(workdir, "tc_stream_slow.c"), tc_stream_slow_c)
 File.write(File.join(workdir, "tc_node_loc.c"), tc_node_loc_c)
 File.write(File.join(workdir, "tc_node_rel.c"), tc_node_rel_c)
+File.write(File.join(workdir, "tc_diag_sem.c"), tc_diag_sem_c)
 
 inv_build = build_script(
   min_oob_in,
@@ -397,7 +403,7 @@ mkdir -p "$WORKDIR/prism_objs"
 )
 ar rcs "$WORKDIR/libprism_test.a" "$WORKDIR/prism_objs/"*.o
 
-for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_node_rel; do
+for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_node_rel tc_diag_sem; do
     clang -O1 -c -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror \
         -fsanitize=address,undefined -Iinclude "$WORKDIR/$name.c" -o "$WORKDIR/$name.o"
     clang -fsanitize=address,undefined "$WORKDIR/$name.o" "$WORKDIR/libprism_test.a" -o "$WORKDIR/$name"
@@ -409,6 +415,7 @@ done
 "$WORKDIR/tc_stream_slow"
 "$WORKDIR/tc_node_loc"
 "$WORKDIR/tc_node_rel"
+"$WORKDIR/tc_diag_sem"
 PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"

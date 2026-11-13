@@ -477,6 +477,49 @@ static void fuzz_check_error_diag(const pm_diagnostic_t *d, void *data) {
             ctx->parsed_size
         );
     }
+
+#ifndef PRISM_FUZZ_NO_DIAGNOSTIC_TYPE
+    const char *diag_type = fuzz_diag_type(d);
+    if (diag_type != NULL) {
+        if (strcmp(diag_type, "mixed_encoding") == 0) {
+            if (loc.length == 0) {
+                fuzz_invariant_fail(
+                    "INVARIANT[diagnostic_semantic]: type=mixed_encoding kind=zero_length [detail: level=%u start=%u length=%u parsed_size=%zu]\n",
+                    fuzz_diag_error_level(d),
+                    loc.start,
+                    loc.length,
+                    ctx->parsed_size
+                );
+            }
+            bool has_non_ascii_or_escape = false;
+            for (uint32_t i = 0; i < loc.length; i++) {
+                uint8_t byte = ctx->source[loc.start + i];
+                if (byte >= 0x80 || byte == '\\') {
+                    has_non_ascii_or_escape = true;
+                    break;
+                }
+            }
+            if (!has_non_ascii_or_escape) {
+                fuzz_invariant_fail(
+                    "INVARIANT[diagnostic_semantic]: type=mixed_encoding kind=wrong_byte [detail: level=%u byte=0x%02x start=%u length=%u parsed_size=%zu]\n",
+                    fuzz_diag_error_level(d),
+                    (unsigned) ctx->source[loc.start],
+                    loc.start,
+                    loc.length,
+                    ctx->parsed_size
+                );
+            }
+        } else if (strcmp(diag_type, "escape_invalid_unicode_literal") == 0 && loc.length == 0) {
+            fuzz_invariant_fail(
+                "INVARIANT[diagnostic_semantic]: type=escape_invalid_unicode_literal kind=zero_length [detail: level=%u start=%u length=%u parsed_size=%zu]\n",
+                fuzz_diag_error_level(d),
+                loc.start,
+                loc.length,
+                ctx->parsed_size
+            );
+        }
+    }
+#endif
 }
 
 static void fuzz_check_warning_diag(const pm_diagnostic_t *d, void *data) {
