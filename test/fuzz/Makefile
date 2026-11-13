@@ -77,7 +77,7 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) $(wildcard ext
 	$(ECHO) "building native leak detector for SAND workers"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.native $(FUZZ_SOURCES)
 	$(ECHO) "building main fuzz binary"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
+	$(Q) rm -f $(CURDIR)/build/fuzz.ids && AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_DOCUMENT_IDS=$(CURDIR)/build/fuzz.ids AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
 	$(ECHO) "building SAND sanitizer binary (forkserver-only ASAN+UBSAN)"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_ONLY_FSRV=1 AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.sand $(FUZZ_SOURCES)
 	$(ECHO) "building cmplog binary"
@@ -110,7 +110,7 @@ fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
 
 fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP)
 	$(ECHO) "Templates up to date"

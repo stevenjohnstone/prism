@@ -5,9 +5,11 @@ require "cgi"
 require "concurrent"
 require "digest"
 require "fileutils"
+require "json"
 require "open3"
 require "set"
 require "tempfile"
+require "time"
 require "tmpdir"
 
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
@@ -18,6 +20,13 @@ TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
 MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
 HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 16
 HALFEMPTY_THREADS = Integer(ENV.fetch("HALFEMPTY_THREADS", "2"))
+COVERAGE_BIN = ENV.fetch("TRIAGE_COVERAGE_BIN", "./build/fuzz")
+COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_COVERAGE_IDS", COVERAGE_BIN.empty? ? "" : "#{COVERAGE_BIN}.ids")
+CORPUS_DIR = ENV.fetch("TRIAGE_CORPUS_DIR", "tmp/fuzz/corpus")
+AFL_SHOWMAP_BIN = ENV.fetch("AFL_SHOWMAP", "afl-showmap")
+SHOWMAP_TIMEOUT_MS = Integer(ENV.fetch("TRIAGE_SHOWMAP_TIMEOUT_MS", "1000"))
+TRIAGE_RECOUNT = ENV["TRIAGE_RECOUNT"] == "1"
+META_SCHEMA_VERSION = 1
 
 SANITIZER_ENV = {
   "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}",
@@ -101,6 +110,84 @@ def sanitizer_loupe_crash?(reason, crash_output)
   ].include?(reason)
 end
 
+# Decodes the 4-byte fuzzer option header consumed by harness() in
+# test/fuzz/harness/parse.c into structured fields shared by C reproducers,
+# Loupe URLs, and bucket metadata JSON.
+def decode_fuzz_header(raw)
+  raw = raw.b
+  valid_header = raw.bytesize >= 4
+  padded_raw = valid_header ? raw : (raw + ("\x00".b * (4 - raw.bytesize)))
+  b0, b1, b2, b3 = padded_raw.bytes[0, 4]
+  source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
+
+  freeze = (b0 & 0x01) != 0
+  partial_script = (b0 & 0x02) != 0
+  attach_comments = (b0 & 0x04) != 0
+  encoding_locked = (b0 & 0x08) != 0
+  has_frozen_string_literal = (b0 & 0x10) != 0
+  frozen_string_literal = (b0 & 0x20) != 0
+  stream_mode = (b0 & 0x40) != 0
+  has_encoding_opts = (b0 & 0x80) != 0
+
+  cmd_flags = b1 & 0x3f
+  main_script = (b1 & 0x40) != 0
+  has_limit_opts = (b1 & 0x80) != 0
+
+  version = VERSIONS[b2 & 0x03]
+  scopes_count = (b2 >> 2) & 0x03
+  forwarding_bits = (b2 >> 4) & 0x0f
+
+  extreme_idx = has_limit_opts ? ((b3 >> 4) & 0x03) : nil
+  start_line = has_limit_opts ? EXTREME_LINES[extreme_idx] : [b3].pack("C").unpack1("c")
+  start_line_c = has_limit_opts ? EXTREME_LINES_C[extreme_idx] : start_line.to_s
+  need_limits = has_limit_opts && extreme_idx != 3
+  stack_budget = has_limit_opts ? STACK_BUDGETS[(b3 >> 6) & 0x03] : "SIZE_MAX"
+
+  encoding = has_encoding_opts ? ENCODINGS[b3 & 0x07] : nil
+  filepath = has_encoding_opts ? "fuzz.rb" : nil
+  shebang_callback = has_encoding_opts && (b3 & 0x08) != 0
+
+  forwarding_scope = scopes_count > 0 ? (has_encoding_opts ? (b3 % scopes_count) : (scopes_count - 1)) : nil
+  cmd_chars = COMMAND_LINE_CHARS.filter_map { |bit, ch| ch if (cmd_flags & bit) != 0 }
+  fwd_chars = FORWARDING_CHARS.filter_map { |bit, ch| ch if (forwarding_bits & bit) != 0 }
+  has_shebang_prefix = source.start_with?("#!".b) || source.start_with?("\xef\xbb\xbf#!".b)
+
+  {
+    raw: raw,
+    valid_header: valid_header,
+    padded_raw: padded_raw,
+    header_bytes: [b0, b1, b2, b3],
+    b3: b3,
+    source: source,
+    freeze: freeze,
+    partial_script: partial_script,
+    attach_comments: attach_comments,
+    encoding_locked: encoding_locked,
+    has_frozen_string_literal: has_frozen_string_literal,
+    frozen_string_literal: frozen_string_literal,
+    stream_mode: stream_mode,
+    has_encoding_opts: has_encoding_opts,
+    cmd_flags: cmd_flags,
+    command_line_chars: cmd_chars,
+    main_script: main_script,
+    has_limit_opts: has_limit_opts,
+    extreme_idx: extreme_idx,
+    need_limits: need_limits,
+    start_line: start_line,
+    start_line_c: start_line_c,
+    stack_budget: stack_budget,
+    version: version,
+    scopes_count: scopes_count,
+    forwarding_bits: forwarding_bits,
+    forwarding_chars: fwd_chars,
+    forwarding_scope: forwarding_scope,
+    encoding: encoding,
+    filepath: filepath,
+    shebang_callback: shebang_callback,
+    has_shebang_prefix: has_shebang_prefix
+  }
+end
+
 def build_prism_loupe_url(raw, sanitize: false)
   return nil if raw.nil? || raw.empty?
   if raw.bytesize < 4
@@ -108,49 +195,41 @@ def build_prism_loupe_url(raw, sanitize: false)
     return "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(raw))}#{san_part}"
   end
 
-  b0, b1, b2, b3 = raw.bytes[0, 4]
-  source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
-  has_encoding_opts = (b0 & 0x80) != 0
-  has_limit_opts = (b1 & 0x80) != 0
+  h = decode_fuzz_header(raw)
+  source = h[:source]
 
   params = [["code", Base64.strict_encode64(source)]]
   params << ["san", "1"] if sanitize
-  params << ["enc", ENCODINGS[b3 & 0x07]] if has_encoding_opts
-  params << ["ruby_ver", VERSIONS[b2 & 0x03]]
+  params << ["enc", h[:encoding]] if h[:has_encoding_opts]
+  params << ["ruby_ver", h[:version]]
+  params << ["line", h[:start_line].to_s] if h[:start_line] != 1
 
-  start_line = has_limit_opts ? EXTREME_LINES[(b3 >> 4) & 0x03] : [b3].pack("C").unpack1("c")
-  params << ["line", start_line.to_s] if start_line != 1
-
-  cmd = COMMAND_LINE_CHARS.filter_map { |bit, ch| ch if (b1 & bit) != 0 }.join
+  cmd = h[:command_line_chars].join
   params << ["cmd", cmd] unless cmd.empty?
 
-  params << ["main", "1"] if (b1 & 0x40) != 0
-  params << ["partial", "1"] if (b0 & 0x02) != 0
-  params << ["freeze", "1"] if (b0 & 0x01) != 0
-  params << ["comments", "1"] if (b0 & 0x04) != 0
-  params << ["enc_lock", "1"] if (b0 & 0x08) != 0
-  params << ["frozen_lit", (b0 & 0x20) != 0 ? "1" : "0"] if (b0 & 0x10) != 0
-  params << ["stream", "1"] if (b0 & 0x40) != 0
+  params << ["main", "1"] if h[:main_script]
+  params << ["partial", "1"] if h[:partial_script]
+  params << ["freeze", "1"] if h[:freeze]
+  params << ["comments", "1"] if h[:attach_comments]
+  params << ["enc_lock", "1"] if h[:encoding_locked]
+  params << ["frozen_lit", h[:frozen_string_literal] ? "1" : "0"] if h[:has_frozen_string_literal]
+  params << ["stream", "1"] if h[:stream_mode]
 
-  if has_encoding_opts
-    params << ["filepath", "fuzz.rb"]
-    params << ["shebang_cb", "1"] if (b3 & 0x08) != 0
+  if h[:has_encoding_opts]
+    params << ["filepath", h[:filepath]]
+    params << ["shebang_cb", "1"] if h[:shebang_callback]
   end
 
-  if has_limit_opts
-    budget = STACK_BUDGETS[(b3 >> 6) & 0x03]
-    params << ["budget", budget] unless budget == "SIZE_MAX"
-  end
+  params << ["budget", h[:stack_budget]] unless h[:stack_budget] == "SIZE_MAX"
 
-  scopes_count = (b2 >> 2) & 0x03
+  scopes_count = h[:scopes_count]
   if scopes_count > 0
-    fwd_bits = (b2 >> 4) & 0x0f
-    fwd_chars = FORWARDING_CHARS.filter_map { |bit, ch| ch if (fwd_bits & bit) != 0 }.join
-    forwarding_scope = has_encoding_opts ? (b3 % scopes_count) : (scopes_count - 1)
+    fwd_chars = h[:forwarding_chars].join
+    forwarding_scope = h[:forwarding_scope]
 
     scope_segments = (0...scopes_count).map do |i|
       locals_count = (i == 0 && source.bytesize > 0) ? 3 : 2
-      locals_count = 0 if i == 0 && has_encoding_opts && (b3 & 0x10) != 0
+      locals_count = 0 if i == 0 && h[:has_encoding_opts] && (h[:b3] & 0x10) != 0
       locals = (0...[2, locals_count].min).map { |j| SCOPE_BASE_LOCALS[i][j].b }
       locals << source.byteslice(0, [source.bytesize, 4].min) if locals_count == 3
       encoded_locals = locals.map { |loc| encode_loupe_scope_local(loc) }
@@ -356,93 +435,71 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
 end
 
 def c_program(input_file, crash_details, crash_output: "", reason: "unknown", executable: "")
-  raw = File.binread(input_file)
-  padded_raw = raw.bytesize >= 4 ? raw : (raw + ("\x00".b * (4 - raw.bytesize)))
-  b0, b1, b2, b3 = padded_raw.bytes[0, 4]
-  source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
-  loupe_url = build_prism_loupe_url(padded_raw, sanitize: sanitizer_loupe_crash?(reason, crash_output))
-
-  freeze = (b0 & 0x01) != 0
-  partial_script = (b0 & 0x02) != 0
-  attach_comments = (b0 & 0x04) != 0
-  encoding_locked = (b0 & 0x08) != 0
-  has_frozen_string_literal = (b0 & 0x10) != 0
-  frozen_string_literal = (b0 & 0x20) != 0
-  stream_mode = (b0 & 0x40) != 0
-  has_encoding_opts = (b0 & 0x80) != 0
-
-  cmd_flags = b1 & 0x3f
-  main_script = (b1 & 0x40) != 0
-  has_limit_opts = (b1 & 0x80) != 0
-
-  version = VERSIONS[b2 & 0x03]
-  scopes_count = (b2 >> 2) & 0x03
-  forwarding_bits = (b2 >> 4) & 0x0f
+  h = decode_fuzz_header(File.binread(input_file))
+  source = h[:source]
+  stream_mode = h[:stream_mode]
+  loupe_url = build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
 
   source_ptr = source.empty? ? "source_buf" : "source"
   plan = post_parse_plan(crash_output, executable, stream_mode, source_ptr)
 
-  need_limits = false
+  need_limits = h[:need_limits]
   need_stdbool = plan[:need_stdbool]
   need_shebang_cb = false
   option_lines = []
 
-  if has_limit_opts
-    extreme_idx = (b3 >> 4) & 0x03
-    need_limits = true if extreme_idx != 3
-    option_lines << "pm_options_line_set(options, #{EXTREME_LINES_C[extreme_idx]});"
-  else
-    start_line = [b3].pack("C").unpack1("c")
-    option_lines << "pm_options_line_set(options, #{start_line});" if start_line != 1
+  if h[:has_limit_opts]
+    option_lines << "pm_options_line_set(options, #{h[:start_line_c]});"
+  elsif h[:start_line] != 1
+    option_lines << "pm_options_line_set(options, #{h[:start_line_c]});"
   end
 
-  option_lines << "pm_options_command_line_set(options, #{format_uint8_bitmask(cmd_flags, COMMAND_LINE_FLAGS)});" if cmd_flags != 0
-  if main_script
+  option_lines << "pm_options_command_line_set(options, #{format_uint8_bitmask(h[:cmd_flags], COMMAND_LINE_FLAGS)});" if h[:cmd_flags] != 0
+  if h[:main_script]
     need_stdbool = true
     option_lines << "pm_options_main_script_set(options, true);"
   end
-  if freeze
+  if h[:freeze]
     need_stdbool = true
     option_lines << "pm_options_freeze_set(options, true);"
   end
-  if partial_script
+  if h[:partial_script]
     need_stdbool = true
     option_lines << "pm_options_partial_script_set(options, true);"
   end
-  if attach_comments
+  if h[:attach_comments]
     need_stdbool = true
     option_lines << "pm_options_attach_comments_set(options, true);"
   end
-  if encoding_locked
+  if h[:encoding_locked]
     need_stdbool = true
     option_lines << "pm_options_encoding_locked_set(options, true);"
   end
-  option_lines << "pm_options_version_set(options, #{version.dump}, #{version.bytesize});" if version != "4.1"
-  if has_frozen_string_literal
+  option_lines << "pm_options_version_set(options, #{h[:version].dump}, #{h[:version].bytesize});" if h[:version] != "4.1"
+  if h[:has_frozen_string_literal]
     need_stdbool = true
-    option_lines << "pm_options_frozen_string_literal_set(options, #{frozen_string_literal});"
+    option_lines << "pm_options_frozen_string_literal_set(options, #{h[:frozen_string_literal]});"
   end
 
-  if has_encoding_opts
-    option_lines << "pm_options_encoding_set(options, #{ENCODINGS[b3 & 0x07].dump});"
+  if h[:has_encoding_opts]
+    option_lines << "pm_options_encoding_set(options, #{h[:encoding].dump});"
     option_lines << 'pm_options_filepath_set(options, "fuzz.rb");'
-    if (b3 & 0x08) != 0
+    if h[:shebang_callback]
       need_shebang_cb = true
       option_lines << "pm_options_shebang_callback_set(options, shebang_cb, NULL);"
     end
   end
 
-  if has_limit_opts
-    budget = STACK_BUDGETS[(b3 >> 6) & 0x03]
-    option_lines << "pm_options_stack_budget_set(options, #{budget});" unless budget == "SIZE_MAX"
-  end
+  option_lines << "pm_options_stack_budget_set(options, #{h[:stack_budget]});" unless h[:stack_budget] == "SIZE_MAX"
 
+  scopes_count = h[:scopes_count]
   if scopes_count > 0
-    forwarding_scope = has_encoding_opts ? (b3 % scopes_count) : (scopes_count - 1)
+    forwarding_scope = h[:forwarding_scope]
+    forwarding_bits = h[:forwarding_bits]
     option_lines << "if (pm_options_scopes_init(options, #{scopes_count})) {"
     scopes_count.times do |i|
       locals_count = (i == 0 && !source.empty?) ? 3 : 2
-      locals_count = 0 if i == 0 && has_encoding_opts && (b3 & 0x10) != 0
+      locals_count = 0 if i == 0 && h[:has_encoding_opts] && (h[:b3] & 0x10) != 0
       scope_var = "scope#{i}"
       option_lines << "  pm_options_scope_t *#{scope_var} = pm_options_scope_mut(options, #{i});"
       option_lines << "  pm_options_scope_init(#{scope_var}, #{locals_count});"
@@ -463,8 +520,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
 
   # Note: pm_parser_init treats options == NULL as main_script == true for carriage-return
   # warnings on leading `#!...ruby...` lines, whereas pm_options_new() defaults main_script to false.
-  has_shebang_prefix = source.start_with?("#!".b) || source.start_with?("\xef\xbb\xbf#!".b)
-  use_options = !option_lines.empty? || has_shebang_prefix
+  use_options = !option_lines.empty? || h[:has_shebang_prefix]
   options_arg = use_options ? "options" : "NULL"
 
   need_assert = !source.empty? || plan[:need_assert]
@@ -829,13 +885,880 @@ def normalize_ijon_crash_bytes(raw)
   out
 end
 
-def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels)
+def utf8_safe(text)
+  return "" if text.nil?
+
+  text.to_s.encode("UTF-8", invalid: :replace, undef: :replace, replace: "?")
+end
+
+def normalize_repo_path(path)
+  clean = utf8_safe(path).strip
+  pwd_prefix = "#{Dir.pwd}/"
+  clean = if clean.start_with?(pwd_prefix)
+            clean.delete_prefix(pwd_prefix)
+          elsif clean.start_with?("/prism/")
+            clean.delete_prefix("/prism/")
+          else
+            clean
+          end
+  clean.start_with?("prism/src/", "prism/include/", "prism/templates/") ? clean.delete_prefix("prism/") : clean
+end
+
+def frame_scope(file)
+  return "external" if file.nil? || file.empty?
+  return "prism" if file.start_with?("src/", "include/", "templates/")
+  return "harness" if file.start_with?("test/fuzz/harness/")
+
+  "external"
+end
+
+def parse_kv_pairs(text)
+  result = {}
+  text.to_s.scan(/([A-Za-z0-9_]+)=([^\s\]]+)/) do |k, v|
+    result[k] = v.match?(/\A-?\d+\z/) ? v.to_i : v
+  end
+  result
+end
+
+def parse_frame_location(loc)
+  clean_loc = loc.sub(/\s+\(BuildId:[^)]*\)\z/, "").strip
+  if clean_loc =~ /\A(.+?):(\d+):(\d+)\z/
+    [normalize_repo_path(Regexp.last_match(1)), Regexp.last_match(2).to_i, Regexp.last_match(3).to_i, nil]
+  elsif clean_loc =~ /\A(.+?):(\d+)\z/
+    [normalize_repo_path(Regexp.last_match(1)), Regexp.last_match(2).to_i, nil, nil]
+  elsif clean_loc =~ /\A\(([^)]+)\)\z/
+    [nil, nil, nil, Regexp.last_match(1)]
+  else
+    [normalize_repo_path(clean_loc), nil, nil, nil]
+  end
+end
+
+# Extracts structured symptom, invariant, sanitizer, assertion, and full stack
+# frames from raw sanitizer/abort output so downstream clustering never needs
+# to scrape testcase.c comments or re-run testcases.
+def parse_crash_output(crash_output)
+  clean = utf8_safe(crash_output)
+  lines = clean.lines.map(&:chomp)
+
+  summary = nil
+  invariant = nil
+  ubsan = nil
+  sanitizer = nil
+  assertion = nil
+  frames = []
+  preamble_lines = []
+  seen_frames = false
+
+  lines.each do |line|
+    next if line.match?(/\AReading \d+ bytes from /) || line == "Execution successful."
+
+    if line =~ /\A\s*#(\d+)\s+0x[0-9a-fA-F]+\s+in\s+(.+?)\s+((?:\/|\(|<|[^\s]+\/|[^\s]+:\d+)\S*(?:\s+\(BuildId:[^)]*\))?)\s*\z/ ||
+       line =~ /\A\s*#(\d+)\s+0x[0-9a-fA-F]+\s+in\s+(\S+)\s+(.+?)\s*\z/
+      seen_frames = true
+      next if frames.size >= 64
+
+      depth = Regexp.last_match(1).to_i
+      func = Regexp.last_match(2)
+      file, line_no, col_no, mod = parse_frame_location(Regexp.last_match(3))
+      frames << {
+        "depth" => depth,
+        "func" => func,
+        "file" => file,
+        "line" => line_no,
+        "col" => col_no,
+        "module" => mod,
+        "scope" => frame_scope(file)
+      }.compact
+      next
+    elsif line =~ /\A\s*#(\d+)\s+0x[0-9a-fA-F]+\s+\(([^)]+)\)(?:\s+\(BuildId:.*\))?\s*\z/
+      seen_frames = true
+      next if frames.size >= 64
+
+      frames << {
+        "depth" => Regexp.last_match(1).to_i,
+        "module" => Regexp.last_match(2),
+        "scope" => "external"
+      }
+      next
+    end
+
+    if line.start_with?("SUMMARY: ")
+      summary ||= line.delete_prefix("SUMMARY: ").strip
+    elsif !seen_frames && preamble_lines.size < 20 && !line.strip.empty?
+      preamble_lines << line
+    end
+
+    if invariant.nil? && line =~ /\AINVARIANT\[([^\]]+)\]:\s*(.+)\z/
+      ns = Regexp.last_match(1)
+      rest = Regexp.last_match(2)
+      before_detail, detail_body = rest.split(/\s*\[detail:\s*(.*?)\]\s*\z/, 2)
+      invariant = {
+        "namespace" => ns,
+        "fields" => parse_kv_pairs(before_detail),
+        "detail" => detail_body ? parse_kv_pairs(detail_body) : {}
+      }
+    end
+
+    if ubsan.nil? && line =~ /\A(.+?):(\d+):(\d+): runtime error: (.+?)\z/
+      msg = Regexp.last_match(4).strip
+      check, detail = msg.split(": ", 2)
+      ubsan = {
+        "file" => normalize_repo_path(Regexp.last_match(1)),
+        "line" => Regexp.last_match(2).to_i,
+        "col" => Regexp.last_match(3).to_i,
+        "check" => check,
+        "message" => detail
+      }.compact
+    end
+
+    if line =~ /ERROR: (AddressSanitizer|MemorySanitizer|LeakSanitizer): (detected memory leaks|\S+)(.*)\z/
+      sanitizer ||= {
+        "tool" => Regexp.last_match(1),
+        "kind" => Regexp.last_match(2).tr(" ", "-")
+      }
+    end
+
+    if line =~ /\A(READ|WRITE) of size (\d+)\b/
+      sanitizer ||= { "tool" => "AddressSanitizer" }
+      sanitizer["access"] ||= {
+        "op" => Regexp.last_match(1),
+        "size" => Regexp.last_match(2).to_i
+      }
+    end
+
+    if assertion.nil? && line =~ /(?:([^:\s]+):(\d+): (?:([^:]+): )?)?Assertion `(.+?)' failed\.\z/
+      assertion = {
+        "file" => Regexp.last_match(1) ? normalize_repo_path(Regexp.last_match(1)) : nil,
+        "line" => Regexp.last_match(2)&.to_i,
+        "func" => Regexp.last_match(3),
+        "expr" => Regexp.last_match(4)
+      }.compact
+    end
+  end
+
+  headline = preamble_lines.find { |l| !l.start_with?("====") && l != "AddressSanitizer:DEADLYSIGNAL" } || summary || preamble_lines.first
+
+  {
+    "symptom" => {
+      "headline" => headline,
+      "summary" => summary,
+      "preamble_lines" => preamble_lines,
+      "invariant" => invariant,
+      "ubsan" => ubsan,
+      "sanitizer" => sanitizer,
+      "assertion" => assertion
+    },
+    "frames" => frames
+  }
+end
+
+def input_and_options_metadata(minimized_input, reason:, crash_output:, raw_size_bytes: nil, raw_sha256: nil, minimized_matches_signature: nil)
+  raw_min = File.binread(minimized_input)
+  h = decode_fuzz_header(raw_min)
+  loupe_url = build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
+  min_sha256 = Digest::SHA256.hexdigest(raw_min)
+
+  {
+    "input" => {
+      "raw_size_bytes" => raw_size_bytes,
+      "raw_sha256" => raw_sha256,
+      "min_size_bytes" => raw_min.bytesize,
+      "min_sha256" => min_sha256,
+      "payload_size_bytes" => h[:source].bytesize,
+      "header_bytes" => h[:header_bytes],
+      "header_hex" => h[:header_bytes].map { |b| format("%02x", b) }.join,
+      "valid_header" => h[:valid_header],
+      "has_shebang_prefix" => h[:has_shebang_prefix],
+      "minimized_matches_signature" => minimized_matches_signature,
+      "loupe_url" => loupe_url
+    },
+    "options" => {
+      "ruby_version" => h[:version],
+      "start_line" => h[:start_line],
+      "start_line_expr" => h[:has_limit_opts] ? h[:start_line_c] : nil,
+      "encoding" => h[:encoding],
+      "encoding_locked" => h[:encoding_locked],
+      "freeze" => h[:freeze],
+      "partial_script" => h[:partial_script],
+      "attach_comments" => h[:attach_comments],
+      "main_script" => h[:main_script],
+      "stream_mode" => h[:stream_mode],
+      "frozen_string_literal" => h[:has_frozen_string_literal] ? h[:frozen_string_literal] : nil,
+      "command_line_flags" => h[:command_line_chars],
+      "filepath" => h[:filepath],
+      "shebang_callback" => h[:shebang_callback],
+      "stack_budget" => h[:stack_budget],
+      "scopes_count" => h[:scopes_count],
+      "forwarding_scope" => h[:forwarding_scope],
+      "forwarding_flags" => h[:forwarding_chars]
+    }
+  }
+end
+
+def build_occurrence_record(crash_dir, crash, crash_hash)
+  worker_dir = File.dirname(crash_dir)
+  {
+    "sha256" => crash_hash,
+    "path" => utf8_safe(crash),
+    "filename" => utf8_safe(File.basename(crash)),
+    "fuzzer" => utf8_safe(File.basename(File.dirname(worker_dir))),
+    "worker" => utf8_safe(File.basename(worker_dir)),
+    "queue" => utf8_safe(File.basename(crash_dir)),
+    "size_bytes" => File.size(crash),
+    "mtime" => File.mtime(crash).utc.iso8601
+  }
+end
+
+def append_occurrences(bucket_dir, records)
+  return if records.nil? || records.empty?
+
+  occ_path = File.join(bucket_dir, "occurrences.jsonl")
+  File.open(occ_path, "a") do |f|
+    records.each { |rec| f.puts(JSON.generate(rec)) }
+    f.flush
+  end
+end
+
+def read_occurrences(bucket_dir)
+  occ_path = File.join(bucket_dir, "occurrences.jsonl")
+  return [] unless File.file?(occ_path)
+
+  by_sha = {}
+  File.foreach(occ_path) do |line|
+    line = line.strip
+    next if line.empty?
+
+    rec = JSON.parse(line)
+    sha = rec["sha256"]
+    next if sha.nil? || sha.empty?
+
+    by_sha[sha] ||= rec
+  rescue JSON::ParserError
+    next
+  end
+
+  by_sha.values.sort_by { |r| [r["mtime"].to_s, r["sha256"].to_s] }
+end
+
+def summarize_occurrences(bucket_dir)
+  records = read_occurrences(bucket_dir)
+  by_fuzzer = Hash.new(0)
+  by_worker = Hash.new(0)
+  by_queue = Hash.new(0)
+  mtimes = []
+
+  records.each do |rec|
+    by_fuzzer[rec["fuzzer"] || "unknown"] += 1
+    by_worker[rec["worker"] || "unknown"] += 1
+    by_queue[rec["queue"] || "unknown"] += 1
+    mtimes << rec["mtime"] if rec["mtime"]
+  end
+
+  {
+    "count" => records.size,
+    "by_fuzzer" => by_fuzzer.sort.to_h,
+    "by_worker" => by_worker.sort.to_h,
+    "by_queue" => by_queue.sort.to_h,
+    "first_seen" => mtimes.min,
+    "last_seen" => mtimes.max,
+    "sample_crashes" => records.first(5).map do |r|
+      {
+        "sha256" => r["sha256"],
+        "fuzzer" => r["fuzzer"],
+        "worker" => r["worker"],
+        "path" => r["path"],
+        "mtime" => r["mtime"]
+      }
+    end
+  }
+end
+
+def write_json_atomic(path, data)
+  dir = File.dirname(path)
+  FileUtils.mkdir_p(dir)
+  tmp_path = File.join(dir, ".#{File.basename(path)}.tmp.#{Process.pid}.#{Thread.current.object_id}")
+  File.write(tmp_path, "#{JSON.pretty_generate(data)}\n")
+  File.chmod(0o666 & ~File.umask, tmp_path)
+  File.rename(tmp_path, path)
+ensure
+  FileUtils.rm_f(tmp_path) if tmp_path && File.exist?(tmp_path)
+end
+
+def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_out:, executable:, crash_output:, minimized_input:, raw_size_bytes:, raw_sha256:, minimized_matches_signature:, occurrences:, coverage: nil)
+  parsed = parse_crash_output(crash_output)
+  io_meta = input_and_options_metadata(
+    minimized_input,
+    reason: reason,
+    crash_output: crash_output,
+    raw_size_bytes: raw_size_bytes,
+    raw_sha256: raw_sha256,
+    minimized_matches_signature: minimized_matches_signature
+  )
+
+  {
+    "schema_version" => META_SCHEMA_VERSION,
+    "bucket_id" => bucket_id,
+    "reason" => reason,
+    "signature" => signature,
+    "reproducible" => reproducible,
+    "timed_out" => timed_out,
+    "reproduced_by" => File.basename(executable.to_s),
+    "occurrences" => occurrences,
+    "input" => io_meta["input"],
+    "options" => io_meta["options"],
+    "symptom" => parsed["symptom"],
+    "frames" => parsed["frames"],
+    "coverage" => coverage
+  }
+end
+
+def classify_crash_execution(crash_dir, crash_input, executable)
+  reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
+  timed_out = false
+
+  if reason == "hang"
+    testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+    return { transient_timeout: true } if !crashed && !timed_out
+  elsif executable.end_with?("ijon", "native")
+    # fuzz.ijon and fuzz.native are built without sanitizers (and SAND workers
+    # record fuzz.native in cmdline while running fuzz.sand under -w), so try
+    # ./build/fuzz (ASAN/UBSAN) first for sanitizer crashes and assertions so
+    # they deduplicate with main; next try ./build/fuzz.lsan for memory leaks;
+    # finally fall back to executable for cumulative allocation limit assertions
+    # in PRISM_XALLOCATOR.
+    testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
+    if crashed
+      executable = "./build/fuzz"
+    else
+      testcase_output, crashed, timed_out = run_testcase("./build/fuzz.lsan", crash_input)
+      if crashed
+        executable = "./build/fuzz.lsan"
+      else
+        testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+      end
+    end
+  elsif executable.end_with?("msan")
+    # Try the ASAN/UBSAN binary first: if it crashes (e.g. on an illegal write,
+    # UBSAN check, assertion failure, or SEGV), prefer it for deterministic
+    # classification, minimization, and deduplication against main/grammar;
+    # otherwise fall back to MSAN for read issues (uninitialized or out-of-bounds
+    # reads, since ./build/fuzz has ASAN read instrumentation disabled).
+    testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
+    if crashed
+      executable = "./build/fuzz"
+    else
+      testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+    end
+  else
+    testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+  end
+
+  unreproducible = !crashed && !(reason == "hang" && timed_out)
+
+  if crashed
+    reason = "unknown" if reason == "hang"
+    testcase_output.match(/SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: ([[:alpha:]-]*) .*/) do |m|
+      reason = m.captures[1]
+    end
+    if reason == "unknown"
+      if testcase_output.match?(/ERROR: LeakSanitizer: detected memory leaks/) || testcase_output.include?("Assertion `allocated == 0' failed")
+        reason = "memory-leak"
+      elsif testcase_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
+        reason = "allocation-size-too-big"
+      elsif testcase_output.include?("Assertion `") || testcase_output.include?("INVARIANT[")
+        reason = "ABRT"
+      end
+    end
+  end
+
+  sig_lines = case reason
+              when "undefined-behavior"
+                3
+              when "ABRT"
+                15
+              when "use-of-uninitialized-value"
+                5
+              when "heap-use-after-free"
+                7
+              when "stack-use-after-return"
+                50
+              else
+                10
+              end
+
+  {
+    transient_timeout: false,
+    reason: reason,
+    executable: executable,
+    testcase_output: testcase_output,
+    crashed: crashed,
+    timed_out: timed_out,
+    unreproducible: unreproducible,
+    sig_lines: sig_lines
+  }
+end
+
+def find_executable_in_path(cmd)
+  return nil if cmd.nil? || cmd.empty?
+  return cmd if cmd.include?("/") && File.executable?(cmd) && !File.directory?(cmd)
+
+  ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
+    cand = File.join(dir, cmd)
+    return cand if File.executable?(cand) && !File.directory?(cand)
+  end
+  nil
+end
+
+def showmap_env
+  SANITIZER_ENV.merge(
+    "AFL_NO_IJON" => "1",
+    "AFL_CMIN_ALLOW_ANY" => "1",
+    "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=1:symbolize=0:detect_leaks=0:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}",
+    "UBSAN_OPTIONS" => "abort_on_error=1:symbolize=0",
+    "MSAN_OPTIONS" => "abort_on_error=1:handle_abort=1:symbolize=0:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}"
+  )
+end
+
+def parse_showmap_file(path)
+  edges = {}
+  return edges unless File.file?(path)
+
+  File.foreach(path) do |line|
+    next unless line =~ /\A\s*(\d+):(\d+)\s*\z/
+
+    edges[Regexp.last_match(1).to_i] = Regexp.last_match(2).to_i
+  end
+  edges.sort.to_h { |k, v| [k.to_s, v] }
+end
+
+# Runs afl-showmap in a single persistent forkserver batch across inputs_by_key
+# (mapping caller key -> input file path), using numeric symlink filenames so
+# arbitrary source paths cannot collide or trigger shell/filename issues.
+def collect_showmap_batch(inputs_by_key, bin_path, showmap_path)
+  return { ok: true, maps: {} } if inputs_by_key.empty?
+
+  Dir.mktmpdir("showmap-") do |tmpdir|
+    in_dir = File.join(tmpdir, "in")
+    out_dir = File.join(tmpdir, "out")
+    FileUtils.mkdir_p(in_dir)
+    FileUtils.mkdir_p(out_dir)
+
+    key_by_id = {}
+    inputs_by_key.each_with_index do |(key, input_path), idx|
+      sym_name = format("%06d", idx)
+      File.symlink(File.expand_path(input_path), File.join(in_dir, sym_name))
+      key_by_id[sym_name] = key
+    end
+
+    out, status = Open3.capture2e(
+      showmap_env,
+      showmap_path, "-q", "-t", SHOWMAP_TIMEOUT_MS.to_s,
+      "-i", in_dir, "-o", out_dir, "--", bin_path, "@@"
+    )
+
+    if out.include?("Fork server handshake failed") || out.include?("PROGRAM ABORT")
+      return { ok: false, reason: "afl-showmap forkserver handshake failed for #{bin_path}: #{out.lines.last&.strip}" }
+    end
+
+    maps = {}
+    key_by_id.each do |sym_name, key|
+      map_file = File.join(out_dir, sym_name)
+      maps[key] = parse_showmap_file(map_file) if File.file?(map_file)
+    end
+
+    if maps.empty? && !status.success?
+      return { ok: false, reason: "afl-showmap exited with #{status.exitstatus} and produced no maps" }
+    end
+
+    { ok: true, maps: maps }
+  end
+end
+
+def load_coverage_ids(ids_path)
+  return { available: false, path: nil, sha256: nil, edge_count_total: nil, edge_functions: {} } if ids_path.nil? || ids_path.empty? || !File.file?(ids_path)
+
+  edge_functions = {}
+  File.foreach(ids_path) do |line|
+    next unless line =~ /\bFunction=(\S+)\s+edgeID=(\d+)\s*\z/
+
+    edge_functions[Regexp.last_match(2).to_i] = Regexp.last_match(1)
+  end
+
+  sorted = edge_functions.sort.to_h { |k, v| [k.to_s, v] }
+  {
+    available: true,
+    path: ids_path,
+    sha256: Digest::SHA256.file(ids_path).hexdigest,
+    edge_count_total: sorted.size,
+    edge_functions: sorted
+  }
+end
+
+def corpus_dir_fingerprint(corpus_dir)
+  return nil, [] unless !corpus_dir.nil? && !corpus_dir.empty? && File.directory?(corpus_dir)
+
+  files = Dir.glob(File.join(corpus_dir, "**", "*")).select { |p| File.file?(p) }.sort
+  digest = Digest::SHA256.new
+  files.each do |path|
+    st = File.stat(path)
+    rel = path.delete_prefix("#{corpus_dir}/")
+    digest.update("#{rel}\0#{st.size}\0#{st.mtime.to_i}:#{st.mtime.nsec}\n")
+  end
+  [digest.hexdigest, files]
+end
+
+def load_or_build_corpus_coverage(bin_path, build_id, ids_info, corpus_dir, showmap_path, cache_path)
+  fingerprint, corpus_files = corpus_dir_fingerprint(corpus_dir)
+  if fingerprint.nil?
+    return {
+      "available" => false,
+      "reason" => "corpus directory not found: #{corpus_dir}",
+      "dir" => corpus_dir
+    }
+  end
+
+  if File.file?(cache_path)
+    begin
+      cached = JSON.parse(File.read(cache_path))
+      if cached["available"] &&
+         cached["build_id"] == build_id &&
+         cached["corpus_fingerprint"] == fingerprint &&
+         cached["ids_sha256"] == ids_info[:sha256]
+        return cached
+      end
+    rescue JSON::ParserError
+      # Rebuild stale or corrupt cache.
+    end
+  end
+
+  puts "Collecting afl-showmap corpus baseline (#{corpus_files.size} files)..."
+  inputs = {}
+  corpus_files.each_with_index { |p, i| inputs[i.to_s] = p }
+  batch = collect_showmap_batch(inputs, bin_path, showmap_path)
+  unless batch[:ok]
+    return {
+      "available" => false,
+      "reason" => batch[:reason],
+      "dir" => corpus_dir,
+      "build_id" => build_id
+    }
+  end
+
+  df = Hash.new(0)
+  batch[:maps].each_value do |edges|
+    edges.each_key { |edge_id| df[edge_id.to_i] += 1 }
+  end
+
+  result = {
+    "available" => true,
+    "dir" => corpus_dir,
+    "binary" => normalize_repo_path(bin_path),
+    "build_id" => build_id,
+    "ids_sha256" => ids_info[:sha256],
+    "corpus_fingerprint" => fingerprint,
+    "corpus_count" => corpus_files.size,
+    "edge_df" => df.sort.to_h { |k, v| [k.to_s, v] },
+    "edge_functions" => ids_info[:edge_functions]
+  }
+  write_json_atomic(cache_path, result)
+  result
+end
+
+def discover_bucket_dirs(triage_dir)
+  return [] unless File.directory?(triage_dir)
+
+  Dir.glob(File.join(triage_dir, "*", "*")).select do |d|
+    next false unless File.directory?(d)
+
+    reason_name = File.basename(File.dirname(d))
+    sig_name = File.basename(d)
+    !reason_name.start_with?(".") && !sig_name.start_with?(".") &&
+      (File.file?(File.join(d, "input.min")) || File.file?(File.join(d, "meta.json")))
+  end.sort
+end
+
+def load_all_recorded_occurrence_hashes(triage_dir)
+  hashes = Set.new
+  discover_bucket_dirs(triage_dir).each do |bucket_dir|
+    read_occurrences(bucket_dir).each { |rec| hashes.add(rec["sha256"]) if rec["sha256"] }
+  end
+  hashes
+end
+
+# Populates occurrences.jsonl for buckets created before metadata tracking existed.
+def seed_legacy_occurrences(bucket_dir)
+  occ_path = File.join(bucket_dir, "occurrences.jsonl")
+  return if File.file?(occ_path)
+
+  tc_path = File.join(bucket_dir, "testcase.c")
+  recorded_crash_path = nil
+  if File.file?(tc_path)
+    head = File.read(tc_path, 4096)
+    recorded_crash_path = head[/^(?:Crash|Unreproducible crash):\s*(.+)$/, 1]&.strip
+  end
+
+  raw_files = Dir.glob(File.join(bucket_dir, "id*")).select { |p| File.file?(p) }.sort
+  records = raw_files.each_with_index.map do |raw_path, idx|
+    sha = Digest::SHA256.hexdigest(File.binread(raw_path))
+    crash_path = (idx == 0 && recorded_crash_path) ? recorded_crash_path : raw_path
+    parts = crash_path.split(File::SEPARATOR)
+    queue_name = parts[-2] || "crashes"
+    worker_name = parts[-3] || "unknown"
+    fuzzer_name = parts[-4] || "afl"
+    if idx > 0 || recorded_crash_path.nil?
+      fuzzer_name = "triage"
+      worker_name = "legacy"
+      queue_name = "crashes"
+    end
+    {
+      "sha256" => sha,
+      "path" => utf8_safe(crash_path),
+      "filename" => utf8_safe(File.basename(raw_path)),
+      "fuzzer" => utf8_safe(fuzzer_name),
+      "worker" => utf8_safe(worker_name),
+      "queue" => utf8_safe(queue_name),
+      "size_bytes" => File.size(raw_path),
+      "mtime" => File.mtime(raw_path).utc.iso8601
+    }
+  end
+
+  append_occurrences(bucket_dir, records)
+end
+
+def backfill_bucket_meta(bucket_dir)
+  sig = File.basename(bucket_dir)
+  reason = File.basename(File.dirname(bucket_dir))
+  bucket_id = "#{reason}/#{sig}"
+  min_path = File.join(bucket_dir, "input.min")
+  occurrences = summarize_occurrences(bucket_dir)
+  first_occ = occurrences["sample_crashes"]&.first
+  raw_file = Dir.glob(File.join(bucket_dir, "id*")).select { |p| File.file?(p) }.min
+  raw_size_bytes = raw_file ? File.size(raw_file) : (File.file?(min_path) ? File.size(min_path) : nil)
+  raw_sha256 = first_occ ? first_occ["sha256"] : (raw_file ? Digest::SHA256.hexdigest(File.binread(raw_file)) : nil)
+
+  crash_output = ""
+  reproducible = reason != "unreproducible"
+  timed_out = false
+  used_exec = "unknown"
+
+  if reproducible && File.file?(min_path)
+    build_sh = File.join(bucket_dir, "build.sh")
+    build_text = File.file?(build_sh) ? File.read(build_sh) : ""
+    candidates = []
+    candidates << "./build/fuzz.msan" if build_text.include?("-fsanitize=memory")
+    candidates << "./build/fuzz.lsan" if build_text.include?("-fsanitize=leak")
+    candidates << COVERAGE_BIN unless COVERAGE_BIN.empty?
+    candidates.concat(["./build/fuzz", "./build/fuzz.msan", "./build/fuzz.lsan", "./build/fuzz.native"])
+    candidates.uniq!
+
+    candidates.each do |cand|
+      next unless File.executable?(cand)
+
+      out, crashed, t_out = run_testcase(cand, min_path)
+      if crashed || (reason == "hang" && t_out)
+        crash_output = out
+        timed_out = t_out
+        used_exec = cand
+        break
+      end
+    end
+    reproducible = (used_exec != "unknown")
+  end
+
+  build_bucket_metadata(
+    bucket_id: bucket_id,
+    reason: reason,
+    signature: sig,
+    reproducible: reproducible,
+    timed_out: timed_out,
+    executable: used_exec,
+    crash_output: crash_output,
+    minimized_input: min_path,
+    raw_size_bytes: raw_size_bytes,
+    raw_sha256: raw_sha256,
+    minimized_matches_signature: nil,
+    occurrences: occurrences,
+    coverage: nil
+  )
+end
+
+def finalize_triage_metadata(triage_dir)
+  bucket_dirs = discover_bucket_dirs(triage_dir)
+
+  metas_by_dir = {}
+  dirty_dirs = Set.new
+  bucket_dirs.each do |bucket_dir|
+    seed_legacy_occurrences(bucket_dir)
+    occ_summary = summarize_occurrences(bucket_dir)
+    meta_path = File.join(bucket_dir, "meta.json")
+    meta = nil
+    if File.file?(meta_path)
+      begin
+        meta = JSON.parse(File.read(meta_path))
+      rescue JSON::ParserError
+        meta = nil
+      end
+    end
+
+    if meta.nil? || meta["schema_version"] != META_SCHEMA_VERSION
+      meta = backfill_bucket_meta(bucket_dir)
+      dirty_dirs.add(bucket_dir)
+    elsif meta["occurrences"] != occ_summary
+      meta["occurrences"] = occ_summary
+      dirty_dirs.add(bucket_dir)
+    end
+    metas_by_dir[bucket_dir] = meta
+  end
+
+  showmap_path = find_executable_in_path(AFL_SHOWMAP_BIN)
+  cov_disabled_reason = if COVERAGE_BIN.empty?
+                          "TRIAGE_COVERAGE_BIN is empty"
+                        elsif !File.executable?(COVERAGE_BIN)
+                          "reference binary not found or not executable: #{COVERAGE_BIN}"
+                        elsif showmap_path.nil?
+                          "afl-showmap not found in PATH"
+                        end
+
+  ref_binary_meta = {
+    "available" => false,
+    "path" => COVERAGE_BIN.empty? ? nil : normalize_repo_path(COVERAGE_BIN),
+    "build_id" => nil,
+    "ids_path" => nil,
+    "ids_available" => false,
+    "edge_count_total" => nil
+  }
+
+  if cov_disabled_reason
+    corpus_info = { "available" => false, "reason" => cov_disabled_reason, "dir" => CORPUS_DIR }
+    metas_by_dir.each do |dir, meta|
+      next if meta["coverage"] && meta["coverage"]["available"] == false && meta["coverage"]["reason"] == cov_disabled_reason
+
+      meta["coverage"] = { "available" => false, "reason" => cov_disabled_reason }
+      dirty_dirs.add(dir)
+    end
+  else
+    build_id = binary_build_id(COVERAGE_BIN)
+    ids_info = load_coverage_ids(COVERAGE_IDS_PATH)
+    ref_binary_meta = {
+      "available" => true,
+      "path" => normalize_repo_path(COVERAGE_BIN),
+      "build_id" => build_id,
+      "ids_path" => ids_info[:path] ? normalize_repo_path(ids_info[:path]) : nil,
+      "ids_available" => ids_info[:available],
+      "edge_count_total" => ids_info[:edge_count_total]
+    }
+
+    corpus_info = load_or_build_corpus_coverage(
+      COVERAGE_BIN,
+      build_id,
+      ids_info,
+      CORPUS_DIR,
+      showmap_path,
+      File.join(triage_dir, ".corpus-coverage.json")
+    )
+
+    stale_inputs = {}
+    metas_by_dir.each do |dir, meta|
+      min_path = File.join(dir, "input.min")
+      next unless File.file?(min_path)
+
+      cov = meta["coverage"]
+      next if cov && cov["available"] == true && cov["build_id"] == build_id
+
+      stale_inputs[dir] = min_path
+    end
+
+    unless stale_inputs.empty?
+      puts "Collecting afl-showmap bucket coverage (#{stale_inputs.size} buckets)..."
+      batch = collect_showmap_batch(stale_inputs, COVERAGE_BIN, showmap_path)
+      if batch[:ok]
+        stale_inputs.each_key do |dir|
+          edges = batch[:maps][dir]
+          metas_by_dir[dir]["coverage"] = if edges
+                                            {
+                                              "available" => true,
+                                              "binary" => normalize_repo_path(COVERAGE_BIN),
+                                              "build_id" => build_id,
+                                              "edge_count" => edges.size,
+                                              "edges" => edges
+                                            }
+                                          else
+                                            {
+                                              "available" => false,
+                                              "binary" => normalize_repo_path(COVERAGE_BIN),
+                                              "build_id" => build_id,
+                                              "reason" => "no coverage map produced"
+                                            }
+                                          end
+          dirty_dirs.add(dir)
+        end
+      else
+        ref_binary_meta["available"] = false
+        ref_binary_meta["reason"] = batch[:reason]
+        stale_inputs.each_key do |dir|
+          metas_by_dir[dir]["coverage"] = { "available" => false, "reason" => batch[:reason] }
+          dirty_dirs.add(dir)
+        end
+      end
+    end
+  end
+
+  dirty_dirs.each do |dir|
+    write_json_atomic(File.join(dir, "meta.json"), metas_by_dir[dir])
+  end
+
+  buckets = metas_by_dir.values.sort_by { |m| [-(m.dig("occurrences", "count") || 0), m["bucket_id"].to_s] }
+  by_reason = Hash.new(0)
+  by_worker = Hash.new(0)
+  total_occurrences = 0
+  buckets.each do |b|
+    occ_count = b.dig("occurrences", "count") || 0
+    total_occurrences += occ_count
+    by_reason[b["reason"]] += 1
+    (b.dig("occurrences", "by_worker") || {}).each { |w, c| by_worker[w] += c }
+  end
+
+  corpus_payload = corpus_info.reject { |k, _| %w[corpus_fingerprint ids_sha256].include?(k) }
+  index_data = {
+    "schema_version" => META_SCHEMA_VERSION,
+    "generated_at" => Time.now.utc.iso8601,
+    "triage_dir" => normalize_repo_path(triage_dir),
+    "reference_binary" => ref_binary_meta,
+    "corpus" => corpus_payload,
+    "summary" => {
+      "bucket_count" => buckets.size,
+      "total_occurrences" => total_occurrences,
+      "by_reason" => by_reason.sort.to_h,
+      "by_worker" => by_worker.sort.to_h
+    },
+    "buckets" => buckets
+  }
+
+  write_json_atomic(File.join(triage_dir, "metadata.json"), index_data)
+end
+
+def binary_build_id(bin_path)
+  Digest::SHA256.file(bin_path).hexdigest
+end
+
+def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, recorded_hashes = Set.new)
   raw_crash = File.binread(crash)
   crash_hash = Digest::SHA2.hexdigest(raw_crash)
   sentinel = File.join(TESTCASES_PROCESSED_DIR, crash_hash)
 
+  recount_only = false
   claimed = semaphore.synchronize do
-    !File.exist?(sentinel) && !in_progress.add?(crash_hash).nil?
+    if File.exist?(sentinel)
+      if TRIAGE_RECOUNT && !recorded_hashes.include?(crash_hash) && !in_progress.include?(crash_hash)
+        recount_only = true
+        in_progress.add(crash_hash)
+        true
+      else
+        false
+      end
+    else
+      !in_progress.add?(crash_hash).nil?
+    end
   end
   return unless claimed
 
@@ -853,106 +1776,48 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
       end
     end
 
-    reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
-    timed_out = false
-
-    if reason == "hang"
-      testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
-      if !crashed && !timed_out
-        puts "Skipping #{crash} (transient timeout)"
-        semaphore.synchronize { FileUtils.touch(sentinel) }
-        return
-      end
-    elsif executable.end_with?("ijon", "native")
-      # fuzz.ijon and fuzz.native are built without sanitizers (and SAND workers
-      # record fuzz.native in cmdline while running fuzz.sand under -w), so try
-      # ./build/fuzz (ASAN/UBSAN) first for sanitizer crashes and assertions so
-      # they deduplicate with main; next try ./build/fuzz.lsan for memory leaks;
-      # finally fall back to executable for cumulative allocation limit assertions
-      # in PRISM_XALLOCATOR.
-      testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
-      if crashed
-        executable = "./build/fuzz"
-      else
-        testcase_output, crashed, timed_out = run_testcase("./build/fuzz.lsan", crash_input)
-        if crashed
-          executable = "./build/fuzz.lsan"
-        else
-          testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
-        end
-      end
-    elsif executable.end_with?("msan")
-      # Try the ASAN/UBSAN binary first: if it crashes (e.g. on an illegal write,
-      # UBSAN check, assertion failure, or SEGV), prefer it for deterministic
-      # classification, minimization, and deduplication against main/grammar;
-      # otherwise fall back to MSAN for read issues (uninitialized or out-of-bounds
-      # reads, since ./build/fuzz has ASAN read instrumentation disabled).
-      testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
-      if crashed
-        executable = "./build/fuzz"
-      else
-        testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
-      end
-    else
-      testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
-    end
-
-    unreproducible = !crashed && !(reason == "hang" && timed_out)
-    if unreproducible && File.basename(crash).include?("sig:09")
-      puts "Skipping #{crash} (external SIGKILL / OOM)"
-      semaphore.synchronize { FileUtils.touch(sentinel) }
+    info = classify_crash_execution(crash_dir, crash_input, executable)
+    if info[:transient_timeout]
+      puts "Skipping #{crash} (transient timeout)"
+      semaphore.synchronize { FileUtils.touch(sentinel) } unless recount_only
       return
     end
 
-    if crashed
-      reason = "unknown" if reason == "hang"
-      testcase_output.match(/SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: ([[:alpha:]-]*) .*/) do |m|
-        reason = m.captures[1]
-      end
-      if reason == "unknown"
-        if testcase_output.match?(/ERROR: LeakSanitizer: detected memory leaks/) || testcase_output.include?("Assertion `allocated == 0' failed")
-          reason = "memory-leak"
-        elsif testcase_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
-          reason = "allocation-size-too-big"
-        elsif testcase_output.include?("Assertion `") || testcase_output.include?("INVARIANT[")
-          reason = "ABRT"
-        end
-      end
+    reason = info[:reason]
+    executable = info[:executable]
+    testcase_output = info[:testcase_output]
+    timed_out = info[:timed_out]
+    unreproducible = info[:unreproducible]
+    sig_lines = info[:sig_lines]
+
+    if unreproducible && File.basename(crash).include?("sig:09")
+      puts "Skipping #{crash} (external SIGKILL / OOM)"
+      semaphore.synchronize { FileUtils.touch(sentinel) } unless recount_only
+      return
     end
 
-    sig_lines = case reason
-                when "undefined-behavior"
-                  3
-                when "ABRT"
-                  15
-                when "use-of-uninitialized-value"
-                  5
-                when "heap-use-after-free"
-                  7
-                when "stack-use-after-return"
-                  50
-                else
-                  10
-                end
-
-    target_directory = if unreproducible
-                         File.join(TESTCASES_DIR, "unreproducible", crash_hash[0, 16])
-                       else
-                         File.join(TESTCASES_DIR, reason, testcase_output_signature(testcase_output, sig_lines))
-                       end
+    signature = unreproducible ? crash_hash[0, 16] : testcase_output_signature(testcase_output, sig_lines)
+    bucket_dir_name = unreproducible ? "unreproducible" : reason
+    target_directory = File.join(TESTCASES_DIR, bucket_dir_name, signature)
+    occ_record = build_occurrence_record(crash_dir, crash, crash_hash)
 
     skip_duplicate = semaphore.synchronize do
       if File.directory?(target_directory) && !Dir.empty?(target_directory)
         puts "#{crash} is a duplicate of #{target_directory}"
-        FileUtils.touch(sentinel)
+        append_occurrences(target_directory, [occ_record])
+        recorded_hashes.add(crash_hash)
+        FileUtils.touch(sentinel) unless recount_only
         true
       elsif pending_sentinels.key?(target_directory)
         puts "#{crash} is a duplicate of in-progress #{target_directory}"
         pending_sentinels[target_directory] << sentinel
+        pending_occurrences[target_directory] ||= []
+        pending_occurrences[target_directory] << occ_record
         true
       else
         puts "#{crash} is new"
         pending_sentinels[target_directory] = [sentinel]
+        pending_occurrences[target_directory] = []
         false
       end
     end
@@ -964,6 +1829,7 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
     published = false
     begin
       minimized_input = File.join(staging_dir, "input.min")
+      minimized_matches_sig = nil
 
       if ENV["TRIAGE_MINIMIZE"] == "0" || unreproducible
         FileUtils.cp(crash_input, minimized_input)
@@ -971,7 +1837,12 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
         minimize(crash_input, reason, minimized_input, executable, sig_lines)
         if reason != "hang"
           min_output, min_crashed, = run_testcase(executable, minimized_input)
-          testcase_output = min_output if min_crashed
+          if min_crashed
+            minimized_matches_sig = testcase_output_signature(min_output, sig_lines) == signature
+            testcase_output = min_output
+          else
+            minimized_matches_sig = false
+          end
         end
       end
 
@@ -985,13 +1856,13 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
         minimized_input,
         details,
         crash_output: effective_output,
-        reason: reason,
+        reason: bucket_dir_name,
         executable: executable
       )
       c_build = build_script(
         minimized_input,
         crash_output: effective_output,
-        reason: reason,
+        reason: bucket_dir_name,
         executable: executable
       )
 
@@ -1000,6 +1871,23 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
       File.write(build_path, c_build)
       File.chmod(0o755, build_path)
       FileUtils.cp(crash, File.join(staging_dir, File.basename(crash)))
+      append_occurrences(staging_dir, [occ_record])
+      initial_meta = build_bucket_metadata(
+        bucket_id: "#{bucket_dir_name}/#{signature}",
+        reason: bucket_dir_name,
+        signature: signature,
+        reproducible: !unreproducible,
+        timed_out: timed_out,
+        executable: executable,
+        crash_output: effective_output,
+        minimized_input: minimized_input,
+        raw_size_bytes: occ_record["size_bytes"],
+        raw_sha256: crash_hash,
+        minimized_matches_signature: minimized_matches_sig,
+        occurrences: summarize_occurrences(staging_dir),
+        coverage: nil
+      )
+      write_json_atomic(File.join(staging_dir, "meta.json"), initial_meta)
       File.chmod(0o777 & ~File.umask, staging_dir)
 
       semaphore.synchronize do
@@ -1008,12 +1896,25 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
           File.rename(staging_dir, target_directory)
           published = true
         end
+        extra_occurrences = pending_occurrences.delete(target_directory) || []
+        if published
+          append_occurrences(target_directory, extra_occurrences)
+        else
+          append_occurrences(target_directory, [occ_record] + extra_occurrences)
+        end
+        recorded_hashes.add(crash_hash)
+        extra_occurrences.each { |r| recorded_hashes.add(r["sha256"]) if r["sha256"] }
         sentinels = pending_sentinels.delete(target_directory) || [sentinel]
         sentinels.uniq.each { |s| FileUtils.touch(s) }
       end
     ensure
       FileUtils.rm_rf(staging_dir) if !published && staging_dir && File.exist?(staging_dir)
-      semaphore.synchronize { pending_sentinels.delete(target_directory) } unless published
+      unless published
+        semaphore.synchronize do
+          pending_sentinels.delete(target_directory)
+          pending_occurrences.delete(target_directory)
+        end
+      end
     end
     puts "#{crash} complete => #{target_directory}"
   ensure
@@ -1026,6 +1927,8 @@ pool = Concurrent::FixedThreadPool.new([Concurrent.processor_count / 2, 1].max)
 semaphore = Mutex.new
 in_progress = Set.new
 pending_sentinels = {}
+pending_occurrences = {}
+recorded_hashes = TRIAGE_RECOUNT ? load_all_recorded_occurrence_hashes(TESTCASES_DIR) : Set.new
 OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each do |crash_dir|
   cmdline_file = File.join(crash_dir, "../cmdline")
   next unless File.exist?(cmdline_file)
@@ -1033,7 +1936,7 @@ OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each
   executable = File.read(cmdline_file).strip
   Dir.glob(File.join(crash_dir, "/id*")) do |crash|
     pool.post do
-      process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels)
+      process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, recorded_hashes)
     rescue StandardError => e
       warn "Error processing #{crash}: #{e.class}: #{e.message}\n#{e.backtrace.join("\n")}"
     end
@@ -1041,3 +1944,4 @@ OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each
 end
 pool.shutdown
 pool.wait_for_termination
+finalize_triage_metadata(TESTCASES_DIR)
