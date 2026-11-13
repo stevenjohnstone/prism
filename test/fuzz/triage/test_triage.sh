@@ -10,8 +10,10 @@
 #    compiled under strict C99 (-Wall -Wextra -Wconversion -Wstrict-prototypes -Werror)
 #    with ASAN+UBSAN.
 # 4. Concurrent triage.rb deduplication, 4-byte options header minimization,
-#    in-flight minimization coalescing, transient hang / sig:09 filtering, and
-#    atomic staging + .processed sentinels.
+#    in-flight minimization coalescing, transient hang / sig:09 filtering,
+#    atomic staging + .processed sentinels, and per-bucket / index JSON metadata.
+# 5. afl-showmap per-bucket edge coverage, corpus edge document frequencies,
+#    AFL_LLVM_DOCUMENT_IDS function resolution, corpus cache hits, and recount.
 
 set -euo pipefail
 
@@ -23,7 +25,7 @@ fail() {
     exit 1
 }
 
-echo "[1/4] Checking signature.sh normalization and SIGPIPE safety..."
+echo "[1/5] Checking signature.sh normalization and SIGPIPE safety..."
 s1=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int32_t'\n#0 0x1234 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s2=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s3=$(printf "src/prism.c:20:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
@@ -64,7 +66,7 @@ ruby -e 'File.write(ARGV.fetch(0), "INVARIANT[stream]: kind=parsed_size_oob [det
 SIGLINES=15 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_inv_trace.txt" >/dev/null
 echo "  signature.sh normalization and 5,000-line trace check passed"
 
-echo "[2/4] Checking halfempty.sh minimization, header preservation, and drift protection..."
+echo "[2/5] Checking halfempty.sh minimization, header preservation, and drift protection..."
 cat << 'EOF' > "$WORKDIR/synth_target.c"
 #define _GNU_SOURCE
 #include <signal.h>
@@ -220,7 +222,7 @@ ruby -e '
 ' "$WORKDIR/inv.in" "$WORKDIR/inv.min"
 echo "  halfempty.sh header preservation, drift protection, INVARIANT symmetry breaking, SIGSEGV, and 4-byte checks passed"
 
-echo "[3/4] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
+echo "[3/5] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
 ruby - "$WORKDIR" << 'EOF'
 workdir = ARGV.fetch(0)
 code = File.read("test/fuzz/triage/triage.rb")
@@ -334,6 +336,33 @@ raise "bignum/native build.sh unexpected flags:\n#{bignum_build}" unless bignum_
 raise "expected nil when stream bit unset" unless normalize_ijon_crash_bytes("\x2a\x11\x22\x33abc".b).nil?
 raise "expected stream bit cleared" unless normalize_ijon_crash_bytes("\x6a\x11\x22\x33abc".b) == "\x2a\x11\x22\x33abc".b
 
+parsed_inv = parse_crash_output(
+  "Reading 11 bytes from x\n" \
+  "INVARIANT[node_location]: type=PM_WHILE_NODE kind=length_underflow [detail: parent=PM_STATEMENTS_NODE start=6 length=4294967294 parsed_size=12]\n" \
+  "    #0 0xffff9c3374d8 in abort stdlib/abort.c:79:7\n" \
+  "    #1 0xaaaa in fuzz_invariant_fail /prism/test/fuzz/harness/parse.c:94:5\n" \
+  "    #2 0xaaab in pm_visit_node /prism/prism/templates/src/node.c.erb:409:32\n" \
+  "    #3 0xaaac in parse_while /prism/src/prism.c:20046:5\n"
+)
+raise "unexpected invariant parse: #{parsed_inv.inspect}" unless parsed_inv.dig("symptom", "invariant", "namespace") == "node_location" &&
+                                                                 parsed_inv.dig("symptom", "invariant", "fields", "type") == "PM_WHILE_NODE" &&
+                                                                 parsed_inv.dig("symptom", "invariant", "detail", "length") == 4_294_967_294 &&
+                                                                 parsed_inv["frames"].map { |f| f["scope"] } == %w[external harness prism prism] &&
+                                                                 parsed_inv["frames"][2]["file"] == "templates/src/node.c.erb" &&
+                                                                 parsed_inv["frames"][3]["file"] == "src/prism.c" &&
+                                                                 parsed_inv["frames"][3]["line"] == 20_046
+
+parsed_ub = parse_crash_output(
+  "src/prism.c:15213:5: runtime error: signed integer overflow: 1 + 2147483647 cannot be represented in type 'int32_t'\n" \
+  "    #0 0xaaaa in parser_warn_indentation_mismatch /prism/src/prism.c:15213:5\n" \
+  "    #1 0xaaab in _start (/prism/build/fuzz+0x10d9ec) (BuildId: abc)\n" \
+  "SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/prism.c:15213:5\n"
+)
+raise "unexpected ubsan parse: #{parsed_ub.inspect}" unless parsed_ub.dig("symptom", "ubsan", "file") == "src/prism.c" &&
+                                                             parsed_ub.dig("symptom", "ubsan", "line") == 15_213 &&
+                                                             parsed_ub.dig("symptom", "ubsan", "check") == "signed integer overflow" &&
+                                                             parsed_ub["frames"][1]["module"] == "/prism/build/fuzz+0x10d9ec"
+
 repro_dir = File.join(workdir, "standalone_repro")
 FileUtils.mkdir_p(repro_dir)
 File.write(File.join(repro_dir, "testcase.c"), tc_min_oob_c)
@@ -369,7 +398,7 @@ PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
-echo "[4/4] Checking concurrent triage.rb deduplication, header minimization, coalescing, and sentinels..."
+echo "[4/5] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
 mkdir -p "$WORKDIR/afl/w1/crashes" "$WORKDIR/afl/w2/crashes" "$WORKDIR/afl/w1/hangs"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w1/cmdline"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w2/cmdline"
@@ -403,7 +432,9 @@ File.binwrite(File.join(afl, "w1/hangs/id:000000,src:000001"), "\x00\x00\x03\x01
 EOF
 
 ruby - "$WORKDIR/afl" "$WORKDIR/triage" << 'EOF' > "$WORKDIR/triage.log"
+require "json"
 afl_dir, triage_dir = ARGV
+ENV["TRIAGE_COVERAGE_BIN"] = ""
 src = File.read("test/fuzz/triage/triage.rb")
 src.sub!('OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze', "OUTPUT_DIRS = [#{afl_dir.dump}].freeze")
 src.sub!('TESTCASES_DIR = "tmp/fuzz/triage"', "TESTCASES_DIR = #{triage_dir.dump}")
@@ -411,6 +442,7 @@ eval(src)
 EOF
 
 ruby - "$WORKDIR/triage" "$WORKDIR/triage.log" << 'EOF'
+require "json"
 triage_dir, log_path = ARGV
 log = File.read(log_path)
 
@@ -418,14 +450,20 @@ abrt_dirs = Dir.glob(File.join(triage_dir, "ABRT", "*")).sort
 raise "expected 3 ABRT dirs (BOOM + heredoc_term + escape_invalid_meta), got #{abrt_dirs.inspect}\nlog:\n#{log}" unless abrt_dirs.size == 3
 
 tokens_found = []
+counts_by_token = {}
 abrt_dirs.each do |abrt_dir|
   mode = File.stat(abrt_dir).mode & 0o777
   raise "expected world-readable/traversable dir mode, got #{format('%#o', mode)}" unless (mode & 0o755) == 0o755
   tc_path = File.join(abrt_dir, "testcase.c")
   build_path = File.join(abrt_dir, "build.sh")
+  meta_path = File.join(abrt_dir, "meta.json")
+  occ_path = File.join(abrt_dir, "occurrences.jsonl")
   raise "missing testcase.c in #{abrt_dir}" unless File.file?(tc_path)
   raise "missing executable build.sh in #{abrt_dir}" unless File.executable?(build_path)
+  raise "missing meta.json in #{abrt_dir}" unless File.file?(meta_path)
+  raise "missing occurrences.jsonl in #{abrt_dir}" unless File.file?(occ_path)
   tc = File.read(tc_path)
+  meta = JSON.parse(File.read(meta_path))
 
   min_data = File.binread(File.join(abrt_dir, "input.min"))
   body = min_data.byteslice(4..)
@@ -433,26 +471,38 @@ abrt_dirs.each do |abrt_dir|
     raise "expected BOOM header minimized to \\x02\\x00\\x03\\x01, got #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x02\x00\x03\x01".b
     raise "unexpected BOOM input.min size: #{min_data.dump}" unless min_data.bytesize <= 12
     raise "expected only partial_script option in BOOM testcase.c:\n#{tc}" unless tc.include?("pm_options_partial_script_set(options, true);") && !tc.include?("pm_options_command_line_set") && !tc.include?("pm_options_scopes_init") && !tc.include?("pm_parser_errors_first")
+    raise "unexpected BOOM meta options: #{meta["options"].inspect}" unless meta.dig("options", "partial_script") == true && meta.dig("options", "ruby_version") == "4.1"
+    raise "unexpected BOOM assertion meta: #{meta.dig("symptom", "assertion").inspect}" unless meta.dig("symptom", "assertion", "expr") == "0"
     tokens_found << "BOOM"
+    counts_by_token["BOOM"] = meta.dig("occurrences", "count")
   elsif body.include?("INV_TARGET".b)
     raise "expected INV_TARGET header minimized to \\x10\\x00\\x03\\x01, got #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x00\x03\x01".b
     raise "unexpected INV_TARGET input.min size: #{min_data.dump}" unless min_data.bytesize <= 18
     raise "expected frozen_string_literal + error invariant in INV_TARGET testcase.c:\n#{tc}" unless tc.include?("pm_options_frozen_string_literal_set(options, false);") && tc.include?("pm_parser_errors_first(parser)")
+    raise "unexpected INV_TARGET invariant meta: #{meta.dig("symptom", "invariant").inspect}" unless meta.dig("symptom", "invariant", "namespace") == "diagnostic" && meta.dig("symptom", "invariant", "fields", "type") == "heredoc_term"
+    raise "unexpected INV_TARGET frames: #{meta["frames"].inspect}" unless meta["frames"].size == 2 && meta["frames"][0]["func"] == "fail_invariant_at_shared_site"
+    raise "unexpected INV_TARGET by_worker: #{meta.dig("occurrences", "by_worker").inspect}" unless meta.dig("occurrences", "by_worker") == { "w1" => 1, "w2" => 1 }
     tokens_found << "INV_TARGET"
+    counts_by_token["INV_TARGET"] = meta.dig("occurrences", "count")
   elsif body.include?("INV_DECOY".b)
     raise "expected INV_DECOY header minimized to \\x10\\x00\\x03\\x01, got #{min_data.byteslice(0, 4).dump}" unless min_data.byteslice(0, 4) == "\x10\x00\x03\x01".b
     raise "unexpected INV_DECOY input.min size: #{min_data.dump}" unless min_data.bytesize <= 18
+    raise "unexpected INV_DECOY invariant meta: #{meta.dig("symptom", "invariant").inspect}" unless meta.dig("symptom", "invariant", "fields", "type") == "escape_invalid_meta"
     tokens_found << "INV_DECOY"
+    counts_by_token["INV_DECOY"] = meta.dig("occurrences", "count")
   else
     raise "unexpected minimized body in #{abrt_dir}: #{min_data.dump}"
   end
+  raise "expected coverage disabled in uninstrumented test, got #{meta["coverage"].inspect}" unless meta.dig("coverage", "available") == false
 end
 raise "expected all 3 distinct ABRT tokens, got #{tokens_found.inspect}" unless tokens_found.sort == %w[BOOM INV_DECOY INV_TARGET]
+raise "expected counts {BOOM=>4, INV_TARGET=>2, INV_DECOY=>1}, got #{counts_by_token.inspect}" unless counts_by_token == { "BOOM" => 4, "INV_TARGET" => 2, "INV_DECOY" => 1 }
 
 unrepro_dirs = Dir.glob(File.join(triage_dir, "unreproducible", "*"))
 raise "expected 1 unreproducible dir, got #{unrepro_dirs.inspect}" unless unrepro_dirs.size == 1
 raise "missing testcase.c in unreproducible dir" unless File.file?(File.join(unrepro_dirs.first, "testcase.c"))
 raise "missing executable build.sh in unreproducible dir" unless File.executable?(File.join(unrepro_dirs.first, "build.sh"))
+raise "missing meta.json in unreproducible dir" unless File.file?(File.join(unrepro_dirs.first, "meta.json"))
 
 raise "transient hang should not create hang dir" if File.exist?(File.join(triage_dir, "hang"))
 min_runs = log.scan(/^minimizing /).size
@@ -460,7 +510,117 @@ raise "expected exactly 3 minimization runs across duplicates, got #{min_runs}:\
 
 sentinels = Dir.glob(File.join(triage_dir, ".processed", "*"))
 raise "expected 10 .processed sentinels (4 BOOM + 2 INV_TARGET + 1 INV_DECOY + 1 unrepro + 1 sig:09 + 1 hang), got #{sentinels.size}" unless sentinels.size == 10
+
+index_path = File.join(triage_dir, "metadata.json")
+raise "missing consolidated metadata.json" unless File.file?(index_path)
+index = JSON.parse(File.read(index_path))
+raise "unexpected metadata summary: #{index["summary"].inspect}" unless index.dig("summary", "bucket_count") == 4 && index.dig("summary", "total_occurrences") == 8
 EOF
-echo "  concurrent deduplication, header minimization, coalescing, and sentinel checks passed"
+echo "  concurrent deduplication, header minimization, coalescing, sentinel, and JSON metadata checks passed"
+
+if command -v afl-clang-lto >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1 && [ -d build/afl ]; then
+    echo "[5/5] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
+    cat << 'EOF' > "$WORKDIR/cov_target.c"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+__attribute__((noinline)) static void common_path(void) { asm volatile(""); }
+__attribute__((noinline)) static void rare_corpus_path(void) { asm volatile(""); }
+__attribute__((noinline)) static void bug_recovery_helper(void) {
+    fprintf(stderr, "INVARIANT[node_location]: type=PM_CALL_NODE kind=length_underflow [detail: start=1 length=9 parsed_size=2]\n");
+    abort();
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) return 0;
+    uint8_t buf[64];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    if (n < 5) return 0;
+    uint8_t op = buf[4];
+    common_path();
+    if (op == 'R') rare_corpus_path();
+    if (op == 'B') bug_recovery_helper();
+    return 0;
+}
+EOF
+    rm -f "$WORKDIR/cov_target.ids"
+    AFL_PATH="$PWD/build/afl" AFL_LLVM_DOCUMENT_IDS="$WORKDIR/cov_target.ids" afl-clang-lto -O1 -g "$WORKDIR/cov_target.c" -o "$WORKDIR/cov_target" >/dev/null 2>&1
+
+    mkdir -p "$WORKDIR/corpus" "$WORKDIR/afl_cov/m1/crashes" "$WORKDIR/afl_cov/m2/crashes"
+    printf '\x00\x00\x03\x01cccc' > "$WORKDIR/corpus/c1.rb"
+    printf '\x00\x00\x03\x01dddd' > "$WORKDIR/corpus/c2.rb"
+    printf '\x00\x00\x03\x01Rrrr' > "$WORKDIR/corpus/r1.rb"
+
+    printf '%s\n' "$WORKDIR/cov_target" > "$WORKDIR/afl_cov/m1/cmdline"
+    printf '%s\n' "$WORKDIR/cov_target" > "$WORKDIR/afl_cov/m2/cmdline"
+    printf '\x00\x00\x03\x01Bxyz' > "$WORKDIR/afl_cov/m1/crashes/id:000001,sig:06"
+    printf '\x00\x00\x03\x01B123' > "$WORKDIR/afl_cov/m2/crashes/id:000002,sig:06"
+
+    ruby - "$WORKDIR" << 'EOF' > "$WORKDIR/cov_triage1.log"
+workdir = ARGV.fetch(0)
+ENV["TRIAGE_COVERAGE_BIN"] = File.join(workdir, "cov_target")
+ENV["TRIAGE_COVERAGE_IDS"] = File.join(workdir, "cov_target.ids")
+ENV["TRIAGE_CORPUS_DIR"] = File.join(workdir, "corpus")
+src = File.read("test/fuzz/triage/triage.rb")
+src.sub!('OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze', "OUTPUT_DIRS = [#{File.join(workdir, "afl_cov").dump}].freeze")
+src.sub!('TESTCASES_DIR = "tmp/fuzz/triage"', "TESTCASES_DIR = #{File.join(workdir, "triage_cov").dump}")
+eval(src)
+EOF
+
+    ruby - "$WORKDIR" << 'EOF'
+require "json"
+workdir = ARGV.fetch(0)
+triage_dir = File.join(workdir, "triage_cov")
+index = JSON.parse(File.read(File.join(triage_dir, "metadata.json")))
+
+raise "expected reference binary available" unless index.dig("reference_binary", "available") && index.dig("reference_binary", "ids_available")
+raise "expected 3 corpus files, got #{index.dig("corpus", "corpus_count")}" unless index.dig("corpus", "corpus_count") == 3
+edge_df = index.dig("corpus", "edge_df") || {}
+edge_fns = index.dig("corpus", "edge_functions") || {}
+raise "expected non-empty edge_df and edge_functions" if edge_df.empty? || edge_fns.empty?
+raise "expected at least one df==3 edge and df==1 rare edge in corpus: #{edge_df.inspect}" unless edge_df.values.include?(3) && edge_df.values.include?(1)
+
+raise "expected 1 bucket totaling 2 occurrences, got #{index["summary"].inspect}" unless index.dig("summary", "bucket_count") == 1 && index.dig("summary", "total_occurrences") == 2
+bucket = index["buckets"].first
+edges = bucket.dig("coverage", "edges") || {}
+raise "expected available bucket coverage edges, got #{bucket["coverage"].inspect}" unless bucket.dig("coverage", "available") && !edges.empty?
+unseen_edges = edges.keys.reject { |e| edge_df.key?(e) }
+raise "expected bug-specific edge unseen in corpus (#{edges.keys.inspect} vs corpus #{edge_df.keys.inspect})" if unseen_edges.empty?
+EOF
+
+    # Second run with no changes must reuse the corpus cache, and a recount test on
+    # a pre-existing processed sentinel without occurrences must add the missing count.
+    ruby - "$WORKDIR" << 'EOF' > "$WORKDIR/cov_triage2.log"
+workdir = ARGV.fetch(0)
+triage_dir = File.join(workdir, "triage_cov")
+require "digest"
+late_crash = File.join(workdir, "afl_cov/m2/crashes/id:000003,sig:06")
+File.binwrite(late_crash, "\x00\x00\x03\x01B999")
+File.write(File.join(triage_dir, ".processed", Digest::SHA2.hexdigest(File.binread(late_crash))), "")
+
+ENV["TRIAGE_COVERAGE_BIN"] = File.join(workdir, "cov_target")
+ENV["TRIAGE_COVERAGE_IDS"] = File.join(workdir, "cov_target.ids")
+ENV["TRIAGE_CORPUS_DIR"] = File.join(workdir, "corpus")
+ENV["TRIAGE_RECOUNT"] = "1"
+src = File.read("test/fuzz/triage/triage.rb")
+src.sub!('OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze', "OUTPUT_DIRS = [#{File.join(workdir, "afl_cov").dump}].freeze")
+src.sub!('TESTCASES_DIR = "tmp/fuzz/triage"', "TESTCASES_DIR = #{triage_dir.dump}")
+eval(src)
+EOF
+
+    grep -q "Collecting afl-showmap corpus baseline" "$WORKDIR/cov_triage2.log" && fail "expected second run to hit corpus cache"
+    ruby - "$WORKDIR/triage_cov/metadata.json" << 'EOF'
+require "json"
+index = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected recount to raise count to 3, got #{index.dig("summary", "total_occurrences")}" unless index.dig("summary", "total_occurrences") == 3
+EOF
+    echo "  afl-showmap coverage, corpus DF, DOCUMENT_IDS, caching, and recount checks passed"
+else
+    echo "[5/5] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
+fi
 
 echo "PASS: Fuzz crash triage and minimization suite verified."
