@@ -174,6 +174,12 @@ Useful verification options (pass as env vars to `make fuzz-verify` or CLI flags
 - `VERIFY_MAX_FAILURES=1` (`--max-failures 1`): Stop checking a bucket on its first failing archived input for quick `PASS` vs `PARTIAL`/`FAIL` checks.
 - `VERIFY_TIMEOUT=10` (`--timeout 10`): Override the default 5-second per-input timeout.
 - `VERIFY_UNREPRODUCIBLE=1` (`--include-unreproducible`): Include `unreproducible/` buckets in full sweeps (`BUCKET=...` and `REASON=unreproducible` already include them automatically).
+- `VERIFY_INPUT_MIN_ONLY=1` (`--input-min-only`): Check only each bucket's minimized `input.min` (ignoring archived raw inputs in `inputs.tar.gz`). Useful when bisecting regressions across historical commits where old unminimized archive inputs fail on unrelated pre-existing bugs.
+- `VERIFY_SKIP_MIN=1` (`--skip-min`): Skip `input.min` and check archived inputs only.
+- `TARGET=/path/to/worktree` (`PRISM_TARGET=...`, `--target DIR`): Verify against another Prism checkout or `git worktree` (templates in the target tree are regenerated automatically, and `verify_runner` compiles against the target's `src/` and `include/` using this checkout's harnesses).
+- `REV=<git-ref>` (`PRISM_REV=...`): Check out a git revision into a temporary detached worktree under `build/.fuzz-target-worktree` and run verification against it.
+- `VERIFY_FAIL_FAST=1` (`--fail-fast`): Stop verifying further buckets after the first `FAIL` or `PARTIAL` bucket.
+- `VERIFY_INVERT=1` (`--invert`): Invert the verdict exit code (`0` on `FAIL`/`PARTIAL`, `1` on `PASS`), useful when manually driving `git bisect run` to find a fix.
 
 #### What the Results Mean (`PASS`, `PARTIAL`, `FAIL`, `EMPTY`)
 
@@ -225,6 +231,35 @@ From there:
    ```
    `make fuzz-retriage` verifies the selected buckets first, marks cured raw hashes `#skip` in `.processed/` (so an uncleaned `tmp/fuzz/afl/` won't dump fixed crashes into `unreproducible/`), rebuilds the classifying fuzzer binaries if survivors remain, removes the cured and old stale buckets, and re-runs `triage.rb` + `cluster.rb` on only the still-failing inputs—giving every remaining bug fresh `input.min`, `testcase.c`, current line numbers, coverage maps, and `clusters.json` while preserving original AFL worker provenance in `occurrences.jsonl`.
 4. Extend your fix until `make fuzz-verify BUCKET=...` / `make fuzz-retriage` leaves zero failing buckets, then run `make fuzz-build` and `make fuzz-test` (and optionally a fresh `make fuzz-run` campaign) before committing.
+
+#### Verifying & Bisecting Against Earlier Revisions
+
+Because the triage buckets and harnesses (`test/fuzz/`) live in your current branch, checking out an older Prism revision directly would lose or downgrade the verifier. Instead, pass an external worktree (`TARGET=...`) or git revision (`REV=...`):
+
+```bash
+# Verify a bucket or cluster against a specific revision using an auto-managed worktree:
+make fuzz-verify REV=main CLUSTER=cluster-01
+
+# Or verify against your own git worktree (`git worktree add ../prism-old <rev>`):
+make fuzz-verify TARGET=../prism-old BUCKET=ABRT/14a9275da317ddd6
+```
+
+To automate `git bisect` without disturbing your working tree, use `make fuzz-bisect` (which creates a temporary detached worktree, checks endpoints first, uses `--fail-fast --max-failures 1` per step, and cleans up automatically). By default, every retained input (`input.min` and `inputs.tar.gz`) is tested at each step; pass `VERIFY_INPUT_MIN_ONLY=1` (`--input-min-only`) when bisecting regressions against only each bucket's minimized `input.min` (or `VERIFY_SKIP_MIN=1` / `--skip-min` for archived inputs only). When bisecting a `CLUSTER` or multiple buckets, `bisect.rb` automatically runs a non-`--fail-fast` check (`--max-failures 0`) on the identified commit and its parent (plus the `BAD`/`BROKEN` endpoint when split buckets remain) and warns if only a subset of the cluster transitioned there:
+
+```bash
+# Find which commit introduced a failure (good -> bad):
+make fuzz-bisect GOOD=main~100 BAD=HEAD BUCKET=ABRT/14a9275da317ddd6
+
+# Bisect a cluster using only minimized input.min representatives (ignores archived inputs):
+make fuzz-bisect GOOD=main~100 BAD=HEAD CLUSTER=cluster-01 VERIFY_INPUT_MIN_ONLY=1
+
+# Find which commit fixed an existing failure (broken -> fixed):
+make fuzz-bisect BROKEN=main~50 FIXED=HEAD CLUSTER=cluster-01
+```
+
+Compatibility & skip behavior across revisions:
+- [`verify_bucket.sh`](../test/fuzz/triage/verify_bucket.sh) regenerates target templates automatically whenever `config.yml` or `templates/` changes, and probes 2024–2026 Prism C API differences across headers (pre-opaque struct vs. opaque pointer APIs for options/arena/parser/buffer/diagnostics/comments, `pm_newline_list_t` vs. `pm_line_offset_list_t`, pointer vs. offset `pm_location_t`, list/iterator/`_each`/`_first` traversal, optional options setters, and optional visitor/stream/`pm_errors_format`/`pm_dump_json` helpers) so [`parse.c`](../test/fuzz/harness/parse.c) compiles across historical commits. [`bisect.rb`](../test/fuzz/triage/bisect.rb) also restores clean tracked state in the temporary worktree after each step so regenerated non-C template files cannot abort `git bisect` checkouts.
+- Commits lacking the core Prism C parser APIs (`pm_parse` and `pm_parser_new`/`pm_parser_init`), or commits that fail template generation or compilation, exit **`125`**, causing `git bisect` to skip them automatically.
 
 For implementation details on cross-worker replay normalization, signature hashing, `inputs.tar.gz` compaction, `meta.json` / `metadata.json` schemas, and `verify_runner.c`, see [`test/fuzz/triage/triage.md`](../test/fuzz/triage/triage.md).
 
