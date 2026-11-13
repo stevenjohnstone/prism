@@ -43,7 +43,7 @@ SANITIZER_ENV = {
   "LSAN_OPTIONS" => "handle_abort=1:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}"
 }.freeze
 
-FileUtils.mkdir_p(TESTCASES_PROCESSED_DIR)
+FileUtils.mkdir_p(TESTCASES_PROCESSED_DIR) unless ENV["TRIAGE_LIB_ONLY"] == "1"
 
 VERSIONS = ["3.3", "3.4", "3.5", "4.1"].freeze
 ENCODINGS = ["UTF-8", "ASCII-8BIT", "US-ASCII", "Windows-31J", "EUC-JP", "UTF-8-MAC", "ISO-8859-1", "Shift_JIS"].freeze
@@ -2000,15 +2000,15 @@ def binary_build_id(bin_path)
   Digest::SHA256.file(bin_path).hexdigest
 end
 
-def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes = Set.new, archived_hashes = Set.new)
+def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes = Set.new, archived_hashes = Set.new, testcases_dir: TESTCASES_DIR, occurrence_overrides: nil)
   raw_crash = File.binread(crash)
   crash_hash = Digest::SHA2.hexdigest(raw_crash)
-  sentinel = File.join(TESTCASES_PROCESSED_DIR, crash_hash)
+  sentinel = File.join(testcases_dir, ".processed", crash_hash)
 
   recount_only = false
   cached_bucket_id = nil
   claimed = semaphore.synchronize do
-    state = read_sentinel_state(sentinel, TESTCASES_DIR)
+    state = read_sentinel_state(sentinel, testcases_dir)
     if state[:status] != :absent
       if TRIAGE_RECOUNT && state[:status] != :skip &&
          (!recorded_hashes.include?(crash_hash) || !archived_hashes.include?(crash_hash)) &&
@@ -2030,10 +2030,10 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
   begin
     normalized_bytes = executable.end_with?("ijon") ? normalize_ijon_crash_bytes(raw_crash) : nil
     effective_raw_bytes = normalized_bytes || raw_crash
-    occ_record = build_occurrence_record(crash_dir, crash, crash_hash)
+    occ_record = occurrence_overrides&.dig(crash_hash) || build_occurrence_record(crash_dir, crash, crash_hash)
 
     if recount_only && cached_bucket_id
-      target_directory = File.join(TESTCASES_DIR, cached_bucket_id)
+      target_directory = File.join(testcases_dir, cached_bucket_id)
       semaphore.synchronize do
         unless recorded_hashes.include?(crash_hash)
           append_occurrences(target_directory, [occ_record])
@@ -2079,7 +2079,7 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
     signature = unreproducible ? crash_hash[0, 16] : testcase_output_signature(testcase_output, sig_lines)
     bucket_dir_name = unreproducible ? "unreproducible" : reason
     bucket_id = "#{bucket_dir_name}/#{signature}"
-    target_directory = File.join(TESTCASES_DIR, bucket_dir_name, signature)
+    target_directory = File.join(testcases_dir, bucket_dir_name, signature)
 
     skip_duplicate = semaphore.synchronize do
       if File.directory?(target_directory) && !Dir.empty?(target_directory)
@@ -2227,27 +2227,48 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
   end
 end
 
-pool = Concurrent::FixedThreadPool.new(TRIAGE_THREADS)
-semaphore = Mutex.new
-in_progress = Set.new
-pending_sentinels = {}
-pending_occurrences = {}
-pending_inputs = {}
-recorded_hashes = load_all_recorded_occurrence_hashes(TESTCASES_DIR)
-archived_hashes = load_all_archived_input_hashes(TESTCASES_DIR)
-OUTPUT_DIRS.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each do |crash_dir|
-  cmdline_file = File.join(crash_dir, "../cmdline")
-  next unless File.exist?(cmdline_file)
+def run_triage_pipeline(output_dirs: OUTPUT_DIRS, testcases_dir: TESTCASES_DIR, occurrence_overrides: nil)
+  FileUtils.mkdir_p(File.join(testcases_dir, ".processed"))
+  pool = Concurrent::FixedThreadPool.new(TRIAGE_THREADS)
+  semaphore = Mutex.new
+  in_progress = Set.new
+  pending_sentinels = {}
+  pending_occurrences = {}
+  pending_inputs = {}
+  recorded_hashes = load_all_recorded_occurrence_hashes(testcases_dir)
+  archived_hashes = load_all_archived_input_hashes(testcases_dir)
+  output_dirs.flat_map { |d| Dir.glob(File.join(d, "**/{crashes*,hangs*}")) }.each do |crash_dir|
+    cmdline_file = File.join(crash_dir, "../cmdline")
+    next unless File.exist?(cmdline_file)
 
-  executable = File.read(cmdline_file).strip
-  Dir.glob(File.join(crash_dir, "/id*")) do |crash|
-    pool.post do
-      process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes, archived_hashes)
-    rescue StandardError => e
-      warn "Error processing #{crash}: #{e.class}: #{e.message}\n#{e.backtrace.join("\n")}"
+    executable = File.read(cmdline_file).strip
+    Dir.glob(File.join(crash_dir, "/id*")) do |crash|
+      pool.post do
+        process_crash(
+          crash_dir,
+          crash,
+          executable,
+          semaphore,
+          in_progress,
+          pending_sentinels,
+          pending_occurrences,
+          pending_inputs,
+          recorded_hashes,
+          archived_hashes,
+          testcases_dir: testcases_dir,
+          occurrence_overrides: occurrence_overrides
+        )
+      rescue StandardError => e
+        warn "Error processing #{crash}: #{e.class}: #{e.message}\n#{e.backtrace.join("\n")}"
+      end
     end
   end
+  pool.shutdown
+  pool.wait_for_termination
+  finalize_triage_metadata(testcases_dir)
 end
-pool.shutdown
-pool.wait_for_termination
-finalize_triage_metadata(TESTCASES_DIR)
+
+pool = unless ENV["TRIAGE_LIB_ONLY"] == "1"
+         run_triage_pipeline(output_dirs: OUTPUT_DIRS, testcases_dir: TESTCASES_DIR)
+         nil
+       end

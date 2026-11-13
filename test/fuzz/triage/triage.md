@@ -15,6 +15,7 @@ For user workflows and reproduction/verification commands, see [`docs/fuzzing.md
 | [`verify_runner.c`](verify_runner.c) | C99 batch verifier linking Prism and the fuzz harness directly to execute thousands of archived inputs quickly under `fork()` + shared `mmap` isolation. |
 | [`verify_bucket.sh`](verify_bucket.sh) | Builds/caches `verify_runner.<profile>` cleanly and verifies `input.min`, `.inputs.pending`, and `inputs.tar.gz` for a single bucket. |
 | [`verify.rb`](verify.rb) | Multi-bucket verification sweep (`make fuzz-verify`) reporting `PASS`, `PARTIAL`, `FAIL`, and `EMPTY`, with survivor extraction and JSON reporting. |
+| [`retriage.rb`](retriage.rb) | Post-fix triage refresh (`make fuzz-retriage`) that removes cured buckets, marks fixed inputs `#skip`, and re-triages surviving failures into fresh buckets and clusters. |
 | [`cluster.rb`](cluster.rb) | Metadata-only root-cause bucket clustering (UPGMA with Weighted Jaccard over Laplace-smoothed corpus-IDF coverage, leaf-anchored Prism call frames, and soft reason weight -> `clusters.json`). See [`clustering.md`](clustering.md). |
 | [`clustering.md`](clustering.md) | Mathematical specification, calibration calculations, and output schema for [`cluster.rb`](cluster.rb). |
 | [`test_triage.sh`](test_triage.sh) | Regression test suite covering signature normalization, minimization, C reproducer synthesis, concurrency/coalescing, coverage/recount, `verify_runner`/`verify.rb` isolation, and `cluster.rb` clustering. |
@@ -234,6 +235,8 @@ Forwarded by `make fuzz-verify` (in [`test/fuzz/Makefile`](../Makefile)) or acce
 | `VERIFY_VERBOSE` | `--verbose` | `0` | List every failing input in `verify.rb` and capture full stderr in `verify_runner`. |
 | `VERIFY_QUIET` | `--quiet` | `0` | Suppress `PASS` lines in `verify.rb` and truncated stderr snippets in `verify_runner`. |
 | — | `--json [PATH]` | unset | Emit full structured JSON report to stdout or `PATH` (pass via `VERIFY_ARGS="--json ..."`). |
+| `RETRIAGE_BUILD` | `--no-build` (`retriage.rb`, `RETRIAGE_BUILD=0`) | `1` | Skip `make fuzz-build` before re-triaging surviving inputs in `retriage.rb`. |
+| `RETRIAGE_DRY_RUN` | `--dry-run` (`retriage.rb`) | `0` | Verify and print what `retriage.rb` would remove/re-triage without modifying disk. |
 | — | `VERIFY_BUILD_DIR` | `build/verify` | Override compiled `verify_runner` cache directory (`verify_bucket.sh`). |
 
 ---
@@ -248,4 +251,4 @@ Forwarded by `make fuzz-verify` (in [`test/fuzz/Makefile`](../Makefile)) or acce
 4. **`[4/7]` Concurrent triage**: Tests parallel `triage.rb` deduplication, header minimization, coalescing of simultaneous duplicates, `.processed` sentinels, and `meta.json` / `occurrences.jsonl` / `metadata.json` / `clusters.json` output.
 5. **`[5/7]` `afl-showmap` coverage & recount** (Docker only; skips outside Docker): Verifies bucket `edges`, corpus `edge_df`, `AFL_LLVM_DOCUMENT_IDS` loading, `.corpus-coverage.json` caching, and `TRIAGE_RECOUNT=1` archive/occurrence backfill.
 6. **`[6/7]` Post-fix verification**: Compiles `verify_runner` natively, verifies crash/timeout/`atexit`-leak binary-split isolation, runs generated `verify.sh` end-to-end, and tests `verify.rb`'s `FAIL` -> `PARTIAL` -> `PASS` lifecycle with survivor extraction (`--extract-survivors`) and JSON output.
-7. **`[7/7]` Root-cause clustering and cluster verification (`cluster.rb`, `verify.rb`)**: Verifies cross-reason leaf-frame merging (`SEGV` + `use-of-uninitialized-value` + 1-frame shift), frame-presence mismatch rejection, single-bug short-campaign stability, recovery-helper downweighting, empty/singleton/no-coverage fallbacks, CLI output, and `verify.rb` cluster workflows (`--cluster`, `--by-cluster`, `--list-clusters`, stale `clusters.json` refresh, representative-first execution, and unknown-cluster failure).
+7. **`[7/7]` Root-cause clustering and cluster/retriage verification (`cluster.rb`, `verify.rb`, `retriage.rb`)**: Verifies cross-reason leaf-frame merging (`SEGV` + `use-of-uninitialized-value` + 1-frame shift), frame-presence mismatch rejection, single-bug short-campaign stability, recovery-helper downweighting, empty/singleton/no-coverage fallbacks, CLI output, `verify.rb` cluster workflows (`--cluster`, `--by-cluster`, `--list-clusters`, stale `clusters.json` refresh, representative-first execution, unknown-cluster failure), and `retriage.rb` (`--dry-run`, scoped cluster retriage splitting a `PARTIAL` bucket into fresh buckets while preserving `occurrences.jsonl` and `#skip` sentinels, and full `PASS` cleanup).

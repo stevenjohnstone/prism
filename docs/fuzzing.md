@@ -32,6 +32,7 @@ test/fuzz
     ├── clustering.md               mathematical specification and calibration for cluster.rb
     ├── halfempty.sh                minimizes crash inputs with Google Project Zero's halfempty
     ├── halfempty_compare.sh        identifies similar backtraces during minimization
+    ├── retriage.rb                 removes cured buckets and re-triages surviving failures into fresh buckets
     ├── signature.sh                hashes stack traces into a crash signature
     ├── test_triage.sh              verifies signature normalization, minimization, triage, and verification
     ├── triage.md                   implementation details for triage, metadata schemas, and verification
@@ -211,8 +212,19 @@ From there:
    ```bash
    ./test/fuzz/triage/halfempty.sh ./build/fuzz tmp/fuzz/survivors/ABRT/14a9275da317ddd6/<sha256> /tmp/survivor.min
    ```
-3. Extend your fix until `make fuzz-verify BUCKET=...` reports `PASS` across every input in the bucket. If a `PARTIAL` survivor clearly represents a second unrelated bug (for example, a different parser bug masked behind the same signature), you can remove the now-fixed bucket or track the extracted survivor separately once verified.
-4. Once `make fuzz-verify` is green, run `make fuzz-build` and `make fuzz-test` (and optionally a fresh `make fuzz-run` campaign) before committing.
+3. **Re-triage remaining failures into fresh buckets** (recommended whenever partial fixes shift backtraces/line numbers or unmask secondary bugs):
+   ```bash
+   # Preview what would be removed vs re-triaged:
+   make fuzz-retriage RETRIAGE_DRY_RUN=1
+
+   # Remove cured PASS buckets and replace failing/partial buckets with freshly triaged buckets:
+   make fuzz-retriage
+
+   # Or scope retriage to a single cluster/bucket:
+   make fuzz-retriage CLUSTER=cluster-01
+   ```
+   `make fuzz-retriage` verifies the selected buckets first, marks cured raw hashes `#skip` in `.processed/` (so an uncleaned `tmp/fuzz/afl/` won't dump fixed crashes into `unreproducible/`), rebuilds the classifying fuzzer binaries if survivors remain, removes the cured and old stale buckets, and re-runs `triage.rb` + `cluster.rb` on only the still-failing inputs—giving every remaining bug fresh `input.min`, `testcase.c`, current line numbers, coverage maps, and `clusters.json` while preserving original AFL worker provenance in `occurrences.jsonl`.
+4. Extend your fix until `make fuzz-verify BUCKET=...` / `make fuzz-retriage` leaves zero failing buckets, then run `make fuzz-build` and `make fuzz-test` (and optionally a fresh `make fuzz-run` campaign) before committing.
 
 For implementation details on cross-worker replay normalization, signature hashing, `inputs.tar.gz` compaction, `meta.json` / `metadata.json` schemas, and `verify_runner.c`, see [`test/fuzz/triage/triage.md`](../test/fuzz/triage/triage.md).
 
