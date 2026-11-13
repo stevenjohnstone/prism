@@ -8,8 +8,8 @@ MAX_INPUT_SIZE=${FUZZ_MAX_INPUT_SIZE:-1024}
 SESSION="fuzzer"
 
 DEFAULT_WORKERS=$(( $(nproc) / 2 ))
-if [ "$DEFAULT_WORKERS" -lt 4 ]; then
-    DEFAULT_WORKERS=4
+if [ "$DEFAULT_WORKERS" -lt 5 ]; then
+    DEFAULT_WORKERS=5
 fi
 FUZZ_WORKERS=${FUZZ_WORKERS:-$DEFAULT_WORKERS}
 if [ "$FUZZ_WORKERS" -lt 1 ]; then
@@ -154,9 +154,13 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             prepare_seed_shard "ijon" 1
             add_worker "ijon" "ulimit -v 4194304 && AFL_SYNC_TIME=1 AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ijon/seeds -o $IJON_OUT_DIR $IJON_SYNC_FLAGS -p explore -- ./build/fuzz.ijon"
             ;;
+        4)
+            prepare_seed_shard "slow" 2
+            add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- ./build/fuzz.slow"
+            ;;
         *)
-            idx=$(( i - 4 ))
-            name="main-$(( i - 2 ))"
+            idx=$(( i - 5 ))
+            name="main-$(( i - 3 ))"
             prepare_seed_shard "$name" $(( i - 2 ))
             sched=${SCHEDULES[$(( idx % ${#SCHEDULES[@]} ))]}
             fmt=${INPUT_FORMATS[$(( idx % ${#INPUT_FORMATS[@]} ))]}

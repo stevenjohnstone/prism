@@ -349,6 +349,29 @@ msan_build = build_script(
 )
 raise "MSAN build.sh missing MSAN/arena flags:\n#{msan_build}" unless msan_build.include?("-DPM_ARENA_INITIAL_SIZE=0") && msan_build.include?("-fsanitize=memory -fsanitize-memory-track-origins -fno-sanitize-recover=all")
 
+raise "expected asan_ubsan_slow profile for fuzz.slow" unless bucket_verify_profile(reason: "ABRT", executable: "./build/fuzz.slow") == "asan_ubsan_slow"
+slow_build = build_script(
+  stream_slow_in,
+  crash_output: "    #0 0x1234 in pm_prettyprint\n",
+  reason: "ABRT",
+  executable: "./build/fuzz.slow"
+)
+raise "slow build.sh missing -DSLOW or ASAN+UBSAN:\n#{slow_build}" unless slow_build.include?("-DSLOW") && slow_build.include?("-fsanitize=address,undefined -fno-sanitize-recover=all")
+
+slow_fallback_plan = post_parse_plan("aborted\n", "./build/fuzz.slow", false, "source")
+raise "expected fuzz.slow non-parse crash to include slow consumers: #{slow_fallback_plan.inspect}" unless slow_fallback_plan[:need_node] && slow_fallback_plan[:lines].any? { |l| l.include?("pm_errors_format") }
+slow_parse_plan = post_parse_plan("in pm_parse\n", "./build/fuzz.slow", false, "source")
+raise "expected fuzz.slow pm_parse crash to omit slow consumers: #{slow_parse_plan.inspect}" unless !slow_parse_plan[:need_node] && slow_parse_plan[:lines].empty?
+
+slow_tc = c_program(
+  stream_slow_in,
+  "test asan_ubsan_slow",
+  crash_output: "    #0 0x1234 in pm_prettyprint\n",
+  reason: "ABRT",
+  executable: "./build/fuzz.slow"
+)
+raise "expected pm_prettyprint in slow_tc:\n#{slow_tc}" unless slow_tc.include?("pm_prettyprint")
+
 ub_build = build_script(
   nonempty_in,
   crash_output: "src/line_offset_list.c:85: runtime error: signed integer overflow\n",
@@ -801,6 +824,65 @@ EOF
 chmod +x "$real_pass_dir/verify.sh"
 VERIFY_BUILD_DIR="$WORKDIR/real_verify_build" "$real_pass_dir/verify.sh" --quiet >/dev/null
 VERIFY_BUILD_DIR="$WORKDIR/real_verify_build" ruby ./test/fuzz/triage/verify.rb --triage-dir "$real_triage" --quiet
+
+# Verify asan_ubsan_slow auto-detection from build.sh (-DSLOW), explicit --profile, verify.rb inference,
+# retriage.rb executable resolution, and triage.rb fast->slow fallback classification.
+real_slow_dir="$WORKDIR/real_slow_triage/ABRT/slow_pass_sig"
+mkdir -p "$real_slow_dir"
+cp "$real_pass_dir/input.min" "$real_pass_dir/inputs.tar.gz" "$real_slow_dir/"
+printf '%s\n' "#!/usr/bin/env bash" "clang -DSLOW -fsanitize=address,undefined" > "$real_slow_dir/build.sh"
+chmod +x "$real_slow_dir/build.sh"
+VERIFY_BUILD_DIR="$WORKDIR/real_verify_build" "$PWD/test/fuzz/triage/verify_bucket.sh" \
+    --repo-root "$PWD" --bucket-dir "$real_slow_dir" --quiet >/dev/null
+[ -x "$WORKDIR/real_verify_build/verify_runner.asan_ubsan_slow" ] || fail "expected verify_runner.asan_ubsan_slow to be built via -DSLOW auto-detection"
+VERIFY_BUILD_DIR="$WORKDIR/real_verify_build" ruby ./test/fuzz/triage/verify.rb \
+    --triage-dir "$WORKDIR/real_slow_triage" --quiet
+
+ruby - "$real_slow_dir" << 'EOF'
+slow_dir = ARGV.fetch(0)
+
+# Load verify.rb helper definitions without executing CLI loop
+v_code = File.read("test/fuzz/triage/verify.rb").split(/^def matches_bucket_filter\?/).first
+v_mod = Module.new
+v_mod.module_eval(v_code, File.expand_path("test/fuzz/triage/verify.rb"))
+v_mod.extend(v_mod)
+raise "expected verify.rb to infer asan_ubsan_slow from reproduced_by" unless v_mod.infer_bucket_profile(slow_dir, { "reproduced_by" => "./build/fuzz.slow" }) == "asan_ubsan_slow"
+raise "expected verify.rb to infer asan_ubsan_slow from build.sh -DSLOW" unless v_mod.infer_bucket_profile(slow_dir, {}) == "asan_ubsan_slow"
+
+# Load retriage.rb helper definitions without executing CLI loop
+ENV["TRIAGE_LIB_ONLY"] = "1"
+r_code = File.read("test/fuzz/triage/retriage.rb").split(/^def collect_survivor_files/).first
+r_mod = Module.new
+r_mod.module_eval(r_code, File.expand_path("test/fuzz/triage/retriage.rb"))
+r_mod.extend(r_mod)
+raise "expected retriage.rb to map asan_ubsan_slow to ./build/fuzz.slow" unless r_mod.resolve_reclassify_executable({}, "asan_ubsan_slow") == "./build/fuzz.slow"
+
+# Test classify_crash_execution fallback vs deduplication for ./build/fuzz.slow
+t_mod = Module.new
+t_code = File.read("test/fuzz/triage/triage.rb").split(/^pool = /).first
+t_mod.module_eval(t_code, File.expand_path("test/fuzz/triage/triage.rb"))
+t_mod.extend(t_mod)
+
+t_mod.define_singleton_method(:run_testcase) do |exe, _input|
+  if exe == "./build/fuzz"
+    ["AddressSanitizer: heap-buffer-overflow in pm_parse\nSUMMARY: AddressSanitizer: heap-buffer-overflow src/prism.c:1\n", true, false]
+  else
+    ["slow fallback unexpected", false, false]
+  end
+end
+dedup_res = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.slow")
+raise "expected ./build/fuzz.slow fast crash to deduplicate to ./build/fuzz: #{dedup_res.inspect}" unless dedup_res[:executable] == "./build/fuzz" && dedup_res[:reason] == "heap-buffer-overflow"
+
+t_mod.define_singleton_method(:run_testcase) do |exe, _input|
+  if exe == "./build/fuzz"
+    ["", false, false]
+  else
+    ["SUMMARY: UndefinedBehaviorSanitizer: signed-integer-overflow src/prettyprint.c:10\n", true, false]
+  end
+end
+slow_res = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.slow")
+raise "expected ./build/fuzz.slow slow-only crash to keep ./build/fuzz.slow: #{slow_res.inspect}" unless slow_res[:executable] == "./build/fuzz.slow" && slow_res[:reason] == "signed-integer-overflow"
+EOF
 
 # 2) Deterministic verify.sh + verify.rb PARTIAL-fix & survivor extraction check.
 mock_triage="$WORKDIR/mock_verify_triage"

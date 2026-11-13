@@ -48,6 +48,7 @@ def infer_bucket_profile(bucket_dir, meta)
   return "msan_slow" if reproduced_by.end_with?("msan") || reason == "use-of-uninitialized-value"
   return "lsan_slow" if reproduced_by.end_with?("lsan") || reason == "memory-leak"
   return "xallocator" if reason == "allocation-size-too-big" || reproduced_by.end_with?("ijon", "native")
+  return "asan_ubsan_slow" if reproduced_by.end_with?("slow")
 
   verify_sh = File.join(bucket_dir, "verify.sh")
   if File.file?(verify_sh)
@@ -60,6 +61,7 @@ def infer_bucket_profile(bucket_dir, meta)
     text = File.read(build_sh)
     return "msan_slow" if text.include?("-fsanitize=memory")
     return "lsan_slow" if text.include?("-fsanitize=leak")
+    return "asan_ubsan_slow" if text.include?("-DSLOW")
   end
 
   "asan_ubsan"

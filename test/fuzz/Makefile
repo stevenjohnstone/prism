@@ -27,8 +27,8 @@ FUZZ_SANITIZER_FLAGS := -DPM_ARENA_INITIAL_SIZE=0
 # well within FUZZ_MAX_ALLOCATED.
 # Exclude serialization, JSON, and prettyprint from fast parse-only fuzzers so
 # their translation units and coverage edges are omitted; enable -DSLOW on
-# fuzz.msan and fuzz.lsan to exercise serialization, error formatting,
-# prettyprint, and JSON dumping.
+# fuzz.slow, fuzz.msan, and fuzz.lsan to exercise serialization, error
+# formatting, prettyprint, and JSON dumping.
 FUZZ_FAST_FLAGS := -DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT
 FUZZ_SLOW_FLAGS := -DSLOW
 FUZZ_FLAGS := -DPM_INTEGER_DIVIDE_THRESHOLD=8 -DPRISM_DEPTH_MAXIMUM=128 -DFUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -DFUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -DFUZZ_HARD_RSS_LIMIT=$(FUZZ_HARD_RSS_LIMIT) -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration $(FUZZ_FLAGS)
@@ -84,6 +84,8 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(HEADERS) $(wildcard ext
 	$(Q) rm -f $(CURDIR)/build/fuzz.ids && AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_DOCUMENT_IDS=$(CURDIR)/build/fuzz.ids AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
 	$(ECHO) "building SAND sanitizer binary (forkserver-only ASAN+UBSAN)"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_ONLY_FSRV=1 AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.sand $(FUZZ_SOURCES)
+	$(ECHO) "building ASAN+UBSAN (SLOW) binary"
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.slow $(FUZZ_SOURCES)
 	$(ECHO) "building cmplog binary"
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
