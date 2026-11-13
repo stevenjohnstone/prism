@@ -473,6 +473,67 @@ done
 "$WORKDIR/tc_stream_diff"
 PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
+
+cat << 'C' > "$WORKDIR/harness_driver.c"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+extern void harness(const uint8_t *input, size_t size);
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) return 2;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 2;
+    }
+    long len = ftell(f);
+    if (len < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 2;
+    }
+    uint8_t *buf = len > 0 ? malloc((size_t) len) : NULL;
+    if (len > 0 && (!buf || fread(buf, 1, (size_t) len, f) != (size_t) len)) {
+        free(buf);
+        fclose(f);
+        return 2;
+    }
+    fclose(f);
+    harness(buf, (size_t) len);
+    free(buf);
+    return 0;
+}
+C
+clang -O1 -std=c99 -DSLOW -DPRISM_DEPTH_MAXIMUM=128 -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch \
+    -fsanitize=address,undefined -Iinclude -c test/fuzz/harness/parse.c -o "$WORKDIR/harness_parse_slow.o"
+clang -O1 -std=c99 -fsanitize=address,undefined "$WORKDIR/harness_driver.c" "$WORKDIR/harness_parse_slow.o" "$WORKDIR/libprism_test.a" -o "$WORKDIR/harness_slow"
+
+ruby - "$WORKDIR" << 'EOF'
+workdir = ARGV.fetch(0)
+File.binwrite(File.join(workdir, "sd_nul.bin"), "\x40\x00\x03\x01\x00\n__END__\n ".b)
+File.binwrite(File.join(workdir, "sd_ctrld.bin"), "\x40\x00\x03\x01\x04\n__END__\n ".b)
+File.binwrite(File.join(workdir, "sd_ctrlz.bin"), "\x40\x00\x03\x01\x1a\n__END__\n ".b)
+File.binwrite(File.join(workdir, "sd_midline.bin"), "\x40\x00\x03\x01".b + ("a".b * 4095) + "__END__\n ".b)
+File.binwrite(File.join(workdir, "sd_nul_in_str_midline.bin"), "\x40\x00\x03\x01\"a\x00\"\n".b + ("x".b * 4095) + "__END__\nputs 1\n".b)
+EOF
+
+for ok in sd_nul.bin sd_ctrld.bin sd_ctrlz.bin; do
+    "$WORKDIR/harness_slow" "$WORKDIR/$ok" || fail "expected $ok not to trigger INVARIANT[stream_diff]"
+done
+
+set +e
+"$WORKDIR/harness_slow" "$WORKDIR/sd_midline.bin" >"$WORKDIR/sd_midline.out" 2>"$WORKDIR/sd_midline.err"
+sd_midline_rc=$?
+"$WORKDIR/harness_slow" "$WORKDIR/sd_nul_in_str_midline.bin" >"$WORKDIR/sd_str.out" 2>"$WORKDIR/sd_str.err"
+sd_str_rc=$?
+set -e
+[ "$sd_midline_rc" -ne 0 ] || fail "expected 4096B mid-line __END__ to abort"
+grep -q "INVARIANT\[stream_diff\]: kind=spurious_stop" "$WORKDIR/sd_midline.err" || fail "expected kind=spurious_stop on mid-line __END__, got: $(cat "$WORKDIR/sd_midline.err")"
+[ "$sd_str_rc" -ne 0 ] || fail "expected NUL inside string + mid-line __END__ to abort"
+grep -q "INVARIANT\[stream_diff\]: kind=ast_mismatch" "$WORKDIR/sd_str.err" || fail "expected kind=ast_mismatch on NUL-in-string + mid-line __END__, got: $(cat "$WORKDIR/sd_str.err")"
+
 FUZZ_MAX_INPUT_SIZE=8192 ruby test/fuzz/runtime/corpus.rb --no-minimize "$WORKDIR/corpus_8k" >/dev/null
 [ -f "$WORKDIR/corpus_8k/opt_stream_long_line.rb" ] || fail "expected opt_stream_long_line.rb when FUZZ_MAX_INPUT_SIZE=8192"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
