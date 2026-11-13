@@ -256,7 +256,7 @@ def lookup_prefix(prefix_arr, count)
 end
 
 def sort_fuzzer_names(names)
-  priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ijon" => 3 }
+  priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ijon" => 3, "slow" => 4 }
   names.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]

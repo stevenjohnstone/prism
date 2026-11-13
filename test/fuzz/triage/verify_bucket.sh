@@ -26,7 +26,7 @@ usage() {
 Usage: verify_bucket.sh --repo-root DIR [--fuzz-root DIR] [--bucket-dir DIR] [OPTIONS]
   --repo-root DIR           Target Prism source directory (alias: --target DIR)
   --fuzz-root DIR           Fuzzer root containing test/fuzz/harness (default: script repo)
-  --profile NAME            asan_ubsan | msan_slow | lsan_slow | xallocator
+  --profile NAME            asan_ubsan | asan_ubsan_slow | msan_slow | lsan_slow | xallocator
   --runner PATH             Use a precompiled verify_runner binary
   --build-only              Build (if stale) and print the runner binary path
   --rebuild                 Force rebuild of verify_runner
@@ -130,6 +130,8 @@ if [ -z "$PROFILE" ]; then
         PROFILE="msan_slow"
       elif grep -q -- "-fsanitize=leak" "$BUCKET_DIR/build.sh" 2>/dev/null; then
         PROFILE="lsan_slow"
+      elif grep -q -- "-DSLOW" "$BUCKET_DIR/build.sh" 2>/dev/null; then
+        PROFILE="asan_ubsan_slow"
       else
         PROFILE="asan_ubsan"
       fi
@@ -406,6 +408,8 @@ build_verify_runner() {
   case "$profile" in
     asan_ubsan)
       flags+=(-fsanitize=address,undefined -fno-sanitize-recover=all) ;;
+    asan_ubsan_slow)
+      flags+=(-DSLOW -fsanitize=address,undefined -fno-sanitize-recover=all) ;;
     msan_slow)
       if [ "$(uname -s)" = "Darwin" ]; then
         echo "verify_bucket.sh: MSan verification requires Linux (run 'make fuzz-verify BUCKET=...' in Docker)" >&2

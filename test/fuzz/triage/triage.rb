@@ -493,7 +493,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
       "pm_dump_json(buffer, parser, node);",
       "pm_buffer_free(buffer);"
     ]
-  elsif executable.end_with?("msan", "lsan") && !crash_output.match?(/\bpm_parse(_stream)?\b/)
+  elsif executable.end_with?("msan", "lsan", "slow") && !crash_output.match?(/\bpm_parse(_stream)?\b/)
     plan[:need_node] = true
     plan[:lines] = slow_consumer_lines(stream_mode, source_ptr)
   end
@@ -870,6 +870,8 @@ def bucket_verify_profile(reason:, executable: "")
     "lsan_slow"
   elsif reason == "allocation-size-too-big" || exe.end_with?("ijon", "native")
     "xallocator"
+  elsif exe.end_with?("slow")
+    "asan_ubsan_slow"
   else
     "asan_ubsan"
   end
@@ -905,6 +907,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
   defines << "-DPM_INTEGER_DIVIDE_THRESHOLD=8" if has_long_decimal || crash_output.match?(/\b(?:pm_integer|pm_bignum)_|(?:integer|bignum)\.c\b/)
   defines << "-DPRISM_DEPTH_MAXIMUM=128" if source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep") || crash_output.include?("INVARIANT[recursion_depth]")
   defines << "-DPRISM_BUILD_DEBUG" if crash_output.match?(/fuzz_(free|realloc)_sized/)
+  defines << "-DSLOW" if executable.end_with?("slow")
 
   sanitizers = if executable.end_with?("msan") || reason == "use-of-uninitialized-value"
                  ["-fsanitize=memory", "-fsanitize-memory-track-origins", "-fno-sanitize-recover=all"]
@@ -1451,12 +1454,12 @@ def classify_crash_execution(crash_dir, crash_input, executable)
         testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
       end
     end
-  elsif executable.end_with?("msan")
-    # Try the ASAN/UBSAN binary first: if it crashes (e.g. on an illegal write,
-    # UBSAN check, assertion failure, or SEGV), prefer it for deterministic
+  elsif executable.end_with?("msan", "slow")
+    # Try the fast ASAN/UBSAN binary first: if it crashes (e.g. on an illegal write,
+    # UBSAN check, assertion failure, SEGV, or fast invariant), prefer it for deterministic
     # classification, minimization, and deduplication against main/grammar;
-    # otherwise fall back to MSAN for read issues (uninitialized or out-of-bounds
-    # reads, since ./build/fuzz has ASAN read instrumentation disabled).
+    # otherwise fall back to msan/slow for read issues (MSAN) or -DSLOW consumer /
+    # differential checks.
     testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
     if crashed
       executable = "./build/fuzz"
@@ -1949,8 +1952,9 @@ def backfill_bucket_meta(bucket_dir)
     candidates = []
     candidates << "./build/fuzz.msan" if build_text.include?("-fsanitize=memory")
     candidates << "./build/fuzz.lsan" if build_text.include?("-fsanitize=leak")
+    candidates << "./build/fuzz.slow" if build_text.include?("-DSLOW")
     candidates << COVERAGE_BIN unless COVERAGE_BIN.empty?
-    candidates.concat(["./build/fuzz", "./build/fuzz.msan", "./build/fuzz.lsan", "./build/fuzz.native"])
+    candidates.concat(["./build/fuzz", "./build/fuzz.slow", "./build/fuzz.msan", "./build/fuzz.lsan", "./build/fuzz.native"])
     candidates.uniq!
 
     candidates.each do |cand|

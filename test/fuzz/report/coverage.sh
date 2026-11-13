@@ -291,8 +291,8 @@ ruby -rdigest -rjson -rfileutils -e '
     end
   end
 
-  # Sort origins in canonical display order: corpus, grammar, main, msan, ijon, main-2..N
-  priority = { "corpus" => 0, "grammar" => 1, "main" => 2, "msan" => 3, "ijon" => 4 }
+  # Sort origins in canonical display order: corpus, grammar, main, msan, ijon, slow, main-2..N
+  priority = { "corpus" => 0, "grammar" => 1, "main" => 2, "msan" => 3, "ijon" => 4, "slow" => 5 }
   sorted_origins = buckets.keys.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]

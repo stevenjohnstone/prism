@@ -84,6 +84,8 @@ def resolve_reclassify_executable(meta, profile)
   end
 
   case profile
+  when "asan_ubsan_slow"
+    "./build/fuzz.slow"
   when "msan_slow"
     "./build/fuzz.msan"
   when "lsan_slow"
