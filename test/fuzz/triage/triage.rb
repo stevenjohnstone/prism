@@ -315,6 +315,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     need_stream_helpers: stream_mode,
     need_assert: false,
     need_stdbool: stream_mode,
+    need_string: false,
     lines: []
   }
 
@@ -349,6 +350,32 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:lines] = [
       "node_relation_ctx_t rel_ctx = {.source = #{source_ptr}, .parsed_size = parsed_size};",
       "pm_visit_node(node, check_node_relation, &rel_ctx);"
+    ]
+  elsif crash_output.include?("INVARIANT[diagnostic_semantic]:")
+    plan[:need_parsed_size] = true
+    plan[:need_assert] = true
+    plan[:need_stdbool] = true
+    plan[:need_string] = true
+    plan[:lines] = [
+      "for (const pm_diagnostic_t *d = pm_parser_errors_first(parser); d != NULL; d = pm_diagnostic_next(d)) {",
+      "  const char *diag_type = pm_diagnostic_type(d);",
+      "  pm_location_t loc = pm_diagnostic_location(d);",
+      "  assert((size_t)loc.start <= parsed_size && (size_t)loc.length <= parsed_size - (size_t)loc.start);",
+      "  if (strcmp(diag_type, \"mixed_encoding\") == 0) {",
+      "    assert(loc.length > 0);",
+      "    bool has_non_ascii_or_escape = false;",
+      "    for (uint32_t i = 0; i < loc.length; i++) {",
+      "      uint8_t byte = #{source_ptr}[loc.start + i];",
+      "      if (byte >= 0x80 || byte == '\\\\') {",
+      "        has_non_ascii_or_escape = true;",
+      "        break;",
+      "      }",
+      "    }",
+      "    assert(has_non_ascii_or_escape);",
+      "  } else if (strcmp(diag_type, \"escape_invalid_unicode_literal\") == 0) {",
+      "    assert(loc.length > 0);",
+      "  }",
+      "}"
     ]
   elsif crash_output.include?("INVARIANT[diagnostic]: list=error")
     plan[:need_parsed_size] = stream_mode
@@ -543,7 +570,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   options_arg = use_options ? "options" : "NULL"
 
   need_assert = !source.empty? || plan[:need_assert]
-  need_string = !source.empty?
+  need_string = !source.empty? || plan[:need_string]
 
   includes = []
   includes << "#include <assert.h>" if need_assert
