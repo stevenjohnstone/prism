@@ -1,4 +1,4 @@
 [libfuzzer]
 dict = prism_parse_fuzzer.dict
-max_len = 4096
+max_len = 8192
 

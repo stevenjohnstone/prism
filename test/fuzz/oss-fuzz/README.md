@@ -7,12 +7,12 @@ This directory holds the [OSS-Fuzz](https://github.com/google/oss-fuzz) project 
 - [`project.yaml`](project.yaml) — OSS-Fuzz metadata (`c` language, `libfuzzer`/`afl`/`honggfuzz`/`centipede` engines, `address`/`undefined`/`memory` sanitizers). Update `primary_contact` to a Google-account email before opening a PR against `google/oss-fuzz`.
 - [`Dockerfile`](Dockerfile) — Based on `gcr.io/oss-fuzz-base/base-builder`; installs `ruby` (used only for stdlib `templates/template.rb` and `test/fuzz/runtime/corpus.rb --no-minimize`) and `zip`.
 - [`build.sh`](build.sh) — Regenerates C sources/headers via `ruby templates/template.rb`, compiles both fuzz targets with `$CC $CFLAGS` and `-std=c99` (linking `$LIB_FUZZING_ENGINE` with `$CXX $CXXFLAGS`), installs `<target>.dict` and `<target>.options`, and packs `<target>_seed_corpus.zip`.
-- [`prism_parse_fuzzer.options`](prism_parse_fuzzer.options) — Runtime options (`max_len = 4096`, dictionary) for the fast parse/AST-traversal target.
+- [`prism_parse_fuzzer.options`](prism_parse_fuzzer.options) — Runtime options (`max_len = 8192`, dictionary) for the fast parse/AST-traversal target.
 - [`prism_full_fuzzer.options`](prism_full_fuzzer.options) — Runtime options (`max_len = 1024`, dictionary) for the `-DSLOW` serialization/formatting/prettyprint/JSON target.
 
 ## Fuzz Targets
 
-1. **`prism_parse_fuzzer`** (`-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`): Exercises parsing (both `pm_parse` and `pm_parse_stream`), options decoding via the 4-byte input header, AST visitation, comments, diagnostics, and encoding handling up to `max_len = 4096`.
+1. **`prism_parse_fuzzer`** (`-DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT`): Exercises parsing (both `pm_parse` and `pm_parse_stream`), options decoding via the 4-byte input header, AST visitation, comments, diagnostics, and encoding handling up to `max_len = 8192`.
 2. **`prism_full_fuzzer`** (`-DSLOW`): Adds `pm_serialize_parse`, `pm_serialize_parse_stream`, `pm_errors_format`, `pm_prettyprint`, and `pm_dump_json` checks up to `max_len = 1024`.
 
 Both targets reuse [`test/fuzz/harness/parse.c`](../harness/parse.c), [`test/fuzz/harness/fuzz.c`](../harness/fuzz.c), [`test/fuzz/dict`](../dict), and [`test/fuzz/runtime/corpus.rb`](../runtime/corpus.rb). Building with `-DPRISM_OSS_FUZZ` omits `__asan_default_options()` and `__ubsan_default_options()` in `fuzz.c` so ClusterFuzz controls sanitizer flags cleanly via environment variables. Compile-time fuzzing tunings (`-DPM_ARENA_INITIAL_SIZE=0`, `-DPM_INTEGER_DIVIDE_THRESHOLD=8`, `-DPRISM_DEPTH_MAXIMUM=128`) match `test/fuzz/Makefile`.

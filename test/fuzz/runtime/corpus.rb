@@ -111,6 +111,14 @@ begin
       count += 1
     end
 
+    if MAX_PAYLOAD_SIZE >= 4200
+      long_stream = ("x" * 4095) + "\nfoo\n__END__\nbar\n"
+      target_filename = File.join(tmpdir, "opt_stream_long_line.rb")
+      File.binwrite(target_filename, "\x40\x00\x03\x01".b + long_stream.b.byteslice(0, MAX_PAYLOAD_SIZE))
+      puts "✅ Generated: #{target_filename}"
+      count += 1
+    end
+
     base_content = <<~RUBY
       # This acts as a standard variable assignment
       foo = "Standard: abc"

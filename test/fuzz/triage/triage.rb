@@ -313,6 +313,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     need_check_node_helper: false,
     need_check_node_relation_helper: false,
     need_check_recursion_depth_helper: false,
+    need_stream_diff_helper: false,
     need_stream_helpers: stream_mode,
     need_assert: false,
     need_stdbool: stream_mode,
@@ -324,6 +325,13 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_parsed_size] = true
     plan[:need_assert] = true
     plan[:lines] = ["assert(#{size_var} <= input_size);"]
+  elsif crash_output.include?("INVARIANT[stream_diff]:")
+    plan[:need_node] = true
+    plan[:need_parsed_size] = true
+    plan[:need_stream_diff_helper] = true
+    plan[:need_assert] = true
+    plan[:need_stdbool] = true
+    plan[:need_string] = true
   elsif crash_output.include?("INVARIANT[line_offsets]:")
     plan[:need_parsed_size] = stream_mode
     plan[:need_assert] = true
@@ -779,6 +787,64 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
     C
   end
 
+  if plan[:need_stream_diff_helper]
+    helpers << <<~C.chomp
+      static void check_stream_diff(pm_parser_t *parser, pm_node_t *node, const uint8_t *source_buf, size_t size, size_t parsed_size, const pm_options_t *options) {
+        pm_arena_t *ref_arena = pm_arena_new();
+        pm_parser_t *ref_parser = pm_parser_new(ref_arena, source_buf, size, options);
+        pm_node_t *ref_node = pm_parse(ref_parser);
+        assert((node == NULL) == (ref_node == NULL));
+
+        if (parsed_size == size) {
+          if (node != NULL) {
+            pm_buffer_t *stream_buf = pm_buffer_new();
+            pm_buffer_t *ref_buf = pm_buffer_new();
+            pm_serialize(parser, node, stream_buf);
+            pm_serialize(ref_parser, ref_node, ref_buf);
+            assert(pm_buffer_length(stream_buf) == pm_buffer_length(ref_buf));
+            assert(memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), pm_buffer_length(stream_buf)) == 0);
+            pm_buffer_free(ref_buf);
+            pm_buffer_free(stream_buf);
+          }
+        } else {
+          const pm_location_t *stream_data = pm_parser_data_loc(parser);
+          const pm_location_t *full_data = pm_parser_data_loc(ref_parser);
+          assert(stream_data->length != 0);
+          assert(full_data->length != 0 && stream_data->start == full_data->start);
+          assert(pm_parser_errors_size(parser) == pm_parser_errors_size(ref_parser));
+          assert(pm_parser_warnings_size(parser) == pm_parser_warnings_size(ref_parser));
+          if (node != NULL) {
+            pm_buffer_t *stream_pp = pm_buffer_new();
+            pm_buffer_t *ref_pp = pm_buffer_new();
+            pm_prettyprint(stream_pp, parser, node);
+            pm_prettyprint(ref_pp, ref_parser, ref_node);
+            assert(pm_buffer_length(stream_pp) == pm_buffer_length(ref_pp));
+            assert(memcmp(pm_buffer_value(stream_pp), pm_buffer_value(ref_pp), pm_buffer_length(stream_pp)) == 0);
+            pm_buffer_free(ref_pp);
+            pm_buffer_free(stream_pp);
+
+            pm_arena_t *prefix_arena = pm_arena_new();
+            pm_parser_t *prefix_parser = pm_parser_new(prefix_arena, source_buf, parsed_size, options);
+            pm_node_t *prefix_node = pm_parse(prefix_parser);
+            pm_buffer_t *stream_ser = pm_buffer_new();
+            pm_buffer_t *prefix_ser = pm_buffer_new();
+            pm_serialize(parser, node, stream_ser);
+            pm_serialize(prefix_parser, prefix_node, prefix_ser);
+            assert(pm_buffer_length(stream_ser) == pm_buffer_length(prefix_ser));
+            assert(memcmp(pm_buffer_value(stream_ser), pm_buffer_value(prefix_ser), pm_buffer_length(stream_ser)) == 0);
+            pm_buffer_free(prefix_ser);
+            pm_buffer_free(stream_ser);
+            pm_parser_free(prefix_parser);
+            pm_arena_free(prefix_arena);
+          }
+        }
+
+        pm_parser_free(ref_parser);
+        pm_arena_free(ref_arena);
+      }
+    C
+  end
+
   main_lines = []
   if source.empty?
     main_lines << "uint8_t *source = malloc(input_size);"
@@ -820,6 +886,10 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   unless plan[:lines].empty?
     main_lines << ""
     main_lines.concat(plan[:lines])
+  end
+  if plan[:need_stream_diff_helper]
+    main_lines << "" if plan[:lines].empty?
+    main_lines << "check_stream_diff(parser, node, #{source_ptr}, input_size, parsed_size, #{options_arg});"
   end
 
   main_lines << ""
@@ -907,7 +977,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
   defines << "-DPM_INTEGER_DIVIDE_THRESHOLD=8" if has_long_decimal || crash_output.match?(/\b(?:pm_integer|pm_bignum)_|(?:integer|bignum)\.c\b/)
   defines << "-DPRISM_DEPTH_MAXIMUM=128" if source.bytesize >= 48 || reason == "hang" || crash_output.include?("nesting_too_deep") || crash_output.include?("INVARIANT[recursion_depth]")
   defines << "-DPRISM_BUILD_DEBUG" if crash_output.match?(/fuzz_(free|realloc)_sized/)
-  defines << "-DSLOW" if executable.end_with?("slow")
+  defines << "-DSLOW" if executable.end_with?("slow") || crash_output.include?("INVARIANT[stream_diff]")
 
   sanitizers = if executable.end_with?("msan") || reason == "use-of-uninitialized-value"
                  ["-fsanitize=memory", "-fsanitize-memory-track-origins", "-fno-sanitize-recover=all"]

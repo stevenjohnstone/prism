@@ -117,7 +117,7 @@ build_target() {
 
 build_target \
   prism_parse_fuzzer \
-  4096 \
+  8192 \
   -DPRISM_EXCLUDE_SERIALIZATION \
   -DPRISM_EXCLUDE_JSON \
   -DPRISM_EXCLUDE_PRETTYPRINT

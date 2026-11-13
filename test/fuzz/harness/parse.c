@@ -987,6 +987,137 @@ static inline void fuzz_buffer_reset(pm_buffer_t *buffer) {
     pm_buffer_clear(buffer);
 #endif
 }
+
+#if !defined(PRISM_FUZZ_IJON) && !defined(PRISM_FUZZ_NO_STREAM) && !defined(PRISM_FUZZ_NO_STREAM_DIFF) && \
+    !defined(PRISM_FUZZ_LEGACY_NO_ARENA) && !defined(PRISM_FUZZ_LEGACY_ARENA_STRUCT) && !defined(PRISM_FUZZ_LEGACY_PARSER_INIT) && \
+    !defined(PRISM_FUZZ_LEGACY_PARSER_DATA_LOC) && !defined(PRISM_FUZZ_LEGACY_BUFFER_STRUCT) && !defined(PRISM_FUZZ_NO_PARSER_ERRORS_SIZE)
+static void fuzz_check_stream_diff(
+    pm_parser_t *parser,
+    pm_node_t *node,
+    const uint8_t *source_buf,
+    size_t size,
+    size_t parsed_size,
+    const pm_options_t *options,
+    pm_buffer_t *stream_buf
+) {
+    pm_arena_t *ref_arena = pm_arena_new();
+    pm_parser_t *ref_parser = pm_parser_new(ref_arena, source_buf, size, options);
+    pm_node_t *ref_node = pm_parse(ref_parser);
+    pm_buffer_t *ref_buf = pm_buffer_new();
+
+    if ((node == NULL) != (ref_node == NULL)) {
+        fuzz_invariant_fail(
+            "INVARIANT[stream_diff]: kind=null_node [detail: stream_null=%d full_null=%d parsed_size=%zu size=%zu]\n",
+            node == NULL ? 1 : 0,
+            ref_node == NULL ? 1 : 0,
+            parsed_size,
+            size
+        );
+    }
+
+    if (parsed_size == size) {
+        if (node != NULL) {
+            pm_serialize(ref_parser, ref_node, ref_buf);
+            size_t stream_len = pm_buffer_length(stream_buf);
+            size_t ref_len = pm_buffer_length(ref_buf);
+            if (stream_len != ref_len || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_len) != 0) {
+                fuzz_invariant_fail(
+                    "INVARIANT[stream_diff]: kind=serialize_mismatch [detail: parsed_size=%zu size=%zu stream_len=%zu ref_len=%zu]\n",
+                    parsed_size,
+                    size,
+                    stream_len,
+                    ref_len
+                );
+            }
+        }
+    } else {
+        const pm_location_t *stream_data = pm_parser_data_loc(parser);
+        const pm_location_t *full_data = pm_parser_data_loc(ref_parser);
+        if (stream_data->length == 0) {
+            fuzz_invariant_fail(
+                "INVARIANT[stream_diff]: kind=spurious_stop [detail: parsed_size=%zu size=%zu]\n",
+                parsed_size,
+                size
+            );
+        }
+        if (full_data->length == 0 || stream_data->start != full_data->start) {
+            fuzz_invariant_fail(
+                "INVARIANT[stream_diff]: kind=data_loc_mismatch [detail: stream_start=%u stream_len=%u full_start=%u full_len=%u parsed_size=%zu size=%zu]\n",
+                stream_data->start,
+                stream_data->length,
+                full_data->start,
+                full_data->length,
+                parsed_size,
+                size
+            );
+        }
+        size_t stream_errs = pm_parser_errors_size(parser);
+        size_t full_errs = pm_parser_errors_size(ref_parser);
+        if (stream_errs != full_errs) {
+            fuzz_invariant_fail(
+                "INVARIANT[stream_diff]: kind=error_count_mismatch [detail: stream=%zu full=%zu parsed_size=%zu size=%zu]\n",
+                stream_errs,
+                full_errs,
+                parsed_size,
+                size
+            );
+        }
+        size_t stream_warns = pm_parser_warnings_size(parser);
+        size_t full_warns = pm_parser_warnings_size(ref_parser);
+        if (stream_warns != full_warns) {
+            fuzz_invariant_fail(
+                "INVARIANT[stream_diff]: kind=warning_count_mismatch [detail: stream=%zu full=%zu parsed_size=%zu size=%zu]\n",
+                stream_warns,
+                full_warns,
+                parsed_size,
+                size
+            );
+        }
+
+        if (node != NULL) {
+            fuzz_buffer_reset(stream_buf);
+            pm_prettyprint(stream_buf, parser, node);
+            pm_prettyprint(ref_buf, ref_parser, ref_node);
+            size_t stream_pp = pm_buffer_length(stream_buf);
+            size_t ref_pp = pm_buffer_length(ref_buf);
+            if (stream_pp != ref_pp || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_pp) != 0) {
+                fuzz_invariant_fail(
+                    "INVARIANT[stream_diff]: kind=ast_mismatch [detail: parsed_size=%zu size=%zu stream_pp=%zu full_pp=%zu]\n",
+                    parsed_size,
+                    size,
+                    stream_pp,
+                    ref_pp
+                );
+            }
+
+            pm_arena_t *prefix_arena = pm_arena_new();
+            pm_parser_t *prefix_parser = pm_parser_new(prefix_arena, source_buf, parsed_size, options);
+            pm_node_t *prefix_node = pm_parse(prefix_parser);
+            fuzz_buffer_reset(stream_buf);
+            fuzz_buffer_reset(ref_buf);
+            pm_serialize(parser, node, stream_buf);
+            pm_serialize(prefix_parser, prefix_node, ref_buf);
+            size_t stream_len = pm_buffer_length(stream_buf);
+            size_t prefix_len = pm_buffer_length(ref_buf);
+            if (stream_len != prefix_len || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_len) != 0) {
+                fuzz_invariant_fail(
+                    "INVARIANT[stream_diff]: kind=prefix_serialize_mismatch [detail: parsed_size=%zu size=%zu stream_len=%zu prefix_len=%zu]\n",
+                    parsed_size,
+                    size,
+                    stream_len,
+                    prefix_len
+                );
+            }
+            pm_parser_free(prefix_parser);
+            pm_arena_free(prefix_arena);
+        }
+    }
+
+    pm_buffer_free(ref_buf);
+    pm_parser_free(ref_parser);
+    pm_arena_free(ref_arena);
+}
+#endif
 #endif
 
 __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, const fuzz_options_t *opts) {
@@ -1335,8 +1466,16 @@ __attribute__((noinline)) void harness_parse(const uint8_t *input, size_t size, 
 
     if (node != NULL) {
         pm_serialize(parser, node, buffer);
-        fuzz_buffer_reset(buffer);
     }
+
+#if !defined(PRISM_FUZZ_IJON) && !defined(PRISM_FUZZ_NO_STREAM) && !defined(PRISM_FUZZ_NO_STREAM_DIFF) && \
+    !defined(PRISM_FUZZ_LEGACY_NO_ARENA) && !defined(PRISM_FUZZ_LEGACY_ARENA_STRUCT) && !defined(PRISM_FUZZ_LEGACY_PARSER_INIT) && \
+    !defined(PRISM_FUZZ_LEGACY_PARSER_DATA_LOC) && !defined(PRISM_FUZZ_LEGACY_BUFFER_STRUCT) && !defined(PRISM_FUZZ_NO_PARSER_ERRORS_SIZE)
+    if (opts->stream_mode) {
+        fuzz_check_stream_diff(parser, node, source_buf, size, parsed_size, options, buffer);
+    }
+#endif
+    fuzz_buffer_reset(buffer);
 
 #ifndef PRISM_FUZZ_NO_STREAM
     if (opts->stream_mode) {
