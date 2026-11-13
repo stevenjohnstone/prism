@@ -16,6 +16,9 @@
 #    AFL_LLVM_DOCUMENT_IDS function resolution, corpus cache hits, and recount.
 # 6. Per-bucket raw input archiving, verify.sh / verify.rb PARTIAL-fix detection,
 #    survivor extraction, crash/timeout isolation, and LSan leak bisection.
+# 7. Root-cause bucket clustering (cluster.rb): cross-reason frame merges,
+#    frame-presence mismatch separation, single-bug short campaigns, boilerplate
+#    & recovery damping, unreproducible filtering, fallbacks, and determinism.
 
 set -euo pipefail
 
@@ -27,7 +30,7 @@ fail() {
     exit 1
 }
 
-echo "[1/6] Checking signature.sh normalization and SIGPIPE safety..."
+echo "[1/7] Checking signature.sh normalization and SIGPIPE safety..."
 s1=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int32_t'\n#0 0x1234 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s2=$(printf "src/prism.c:10:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
 s3=$(printf "src/prism.c:20:5: runtime error: signed integer overflow: 2147483600 + 99 cannot be represented in type 'int32_t'\n#0 0x9999 in foo\n" | SIGLINES=3 ./test/fuzz/triage/signature.sh)
@@ -68,7 +71,7 @@ ruby -e 'File.write(ARGV.fetch(0), "INVARIANT[stream]: kind=parsed_size_oob [det
 SIGLINES=15 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_inv_trace.txt" >/dev/null
 echo "  signature.sh normalization and 5,000-line trace check passed"
 
-echo "[2/6] Checking halfempty.sh minimization, header preservation, and drift protection..."
+echo "[2/7] Checking halfempty.sh minimization, header preservation, and drift protection..."
 cat << 'EOF' > "$WORKDIR/synth_target.c"
 #define _GNU_SOURCE
 #include <signal.h>
@@ -224,7 +227,7 @@ ruby -e '
 ' "$WORKDIR/inv.in" "$WORKDIR/inv.min"
 echo "  halfempty.sh header preservation, drift protection, INVARIANT symmetry breaking, SIGSEGV, and 4-byte checks passed"
 
-echo "[3/6] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
+echo "[3/7] Checking triage.rb minimal <prism.h> C reproducer synthesis and strict C99 build..."
 ruby - "$WORKDIR" << 'EOF'
 workdir = ARGV.fetch(0)
 code = File.read("test/fuzz/triage/triage.rb")
@@ -400,7 +403,7 @@ PRISM_ROOT="$repo_root" "$WORKDIR/standalone_repro/build.sh"
 "$WORKDIR/standalone_repro/testcase"
 echo "  minimal <prism.h> testcase.c + build.sh compiled with -Iinclude only under -std=c99 -Werror and passed ASAN+UBSAN"
 
-echo "[4/6] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
+echo "[4/7] Checking concurrent triage.rb deduplication, header minimization, coalescing, sentinels, and JSON metadata..."
 mkdir -p "$WORKDIR/afl/w1/crashes" "$WORKDIR/afl/w2/crashes" "$WORKDIR/afl/w1/hangs"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w1/cmdline"
 printf '%s\n' "$WORKDIR/synth_target" > "$WORKDIR/afl/w2/cmdline"
@@ -529,7 +532,7 @@ EOF
 echo "  concurrent deduplication, header minimization, coalescing, sentinel, and JSON metadata checks passed"
 
 if command -v afl-clang-lto >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1 && [ -d build/afl ]; then
-    echo "[5/6] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
+    echo "[5/7] Checking afl-showmap bucket coverage, corpus edge DF, DOCUMENT_IDS, caching, and recount..."
     cat << 'EOF' > "$WORKDIR/cov_target.c"
 #include <stdint.h>
 #include <stdio.h>
@@ -632,10 +635,10 @@ raise "expected recounted archive to contain all 3 inputs, got #{b["archive"].in
 EOF
     echo "  afl-showmap coverage, corpus DF, DOCUMENT_IDS, caching, and recount checks passed"
 else
-    echo "[5/6] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
+    echo "[5/7] SKIPPED: afl-clang-lto / afl-showmap / build/afl not available outside Docker"
 fi
 
-echo "[6/6] Checking verify_runner crash/timeout/leak isolation and verify.sh / verify.rb PARTIAL-fix workflow..."
+echo "[6/7] Checking verify_runner crash/timeout/leak isolation and verify.sh / verify.rb PARTIAL-fix workflow..."
 cat << 'EOF' > "$WORKDIR/mock_fuzz_target.c"
 #include <stdint.h>
 #include <stdio.h>
@@ -844,5 +847,207 @@ raise "extracted survivor contents mismatch" unless File.binread(surv_file) == "
 raise "empty survivor dir should not exist for PASS bucket" if Dir.exist?(File.join(surv_dir, "ABRT/pass_sig"))
 EOF
 echo "  verify_runner isolation, real verify.sh build, and verify.rb PARTIAL-fix checks passed"
+
+echo "[7/7] Checking cluster.rb root-cause clustering, cross-reason merges, single-bug stability, and CLI..."
+ruby - "$WORKDIR" << 'EOF'
+require "json"
+require_relative "test/fuzz/triage/cluster"
+
+workdir = ARGV.fetch(0)
+
+# Build a synthetic multi-regime metadata fixture exercising:
+# 1. Cross-reason same-bug (SEGV from ijon vs use-of-uninitialized-value from msan sharing leaf parser_lex)
+# 2. Cross-reason 1-frame wrapper shift sharing rare coverage
+# 3. Distinct leaf sharing only root parser callers (parse_case -> parse_expression -> pm_parse) stays separate
+# 4. Two stackless ABRT buckets (minimal + verbose) sharing rare heredoc edges + boilerplate/recovery noise
+# 5. Adversarial frame-presence mismatch: stackless ABRT parse_for + in-parse UB parse_for stays separate
+# 6. Single unreproducible bucket excluded by default, included via --include-unreproducible
+edge_functions = {
+  "1" => "pm_parse",
+  "2" => "fuzz_invariant_fail",
+  "3" => "check_node_location",
+  "4" => "pm_visit_node",
+  "5" => "pm_error_recovery_node_create",
+  "6" => "context_recoverable",
+  "10" => "pm_parser_err_heredoc_term",
+  "11" => "parse_heredoc",
+  "12" => "parse_string_part",
+  "13" => "parse_statements",
+  "20" => "parse_for",
+  "21" => "parse_for",
+  "22" => "parse_for",
+  "30" => "parser_lex",
+  "31" => "pm_string_ensure",
+  "40" => "parse_interpolated_symbol_array"
+}
+edge_df = {
+  "1" => 100,
+  "2" => 0,
+  "3" => 0,
+  "4" => 100,
+  "5" => 0,
+  "6" => 0,
+  "10" => 0,
+  "11" => 5,
+  "12" => 1,
+  "13" => 1,
+  "20" => 0,
+  "21" => 0,
+  "22" => 1,
+  "30" => 0,
+  "31" => 1,
+  "40" => 0
+}
+corpus = {
+  "available" => true,
+  "corpus_count" => 100,
+  "edge_df" => edge_df,
+  "edge_functions" => edge_functions
+}
+
+make_bucket = lambda do |id:, reason:, occ:, size: 10, frames: [], edges: {}, unrepro: false|
+  {
+    "bucket_id" => id,
+    "reason" => reason,
+    "signature" => id.split("/", 2).last,
+    "reproducible" => !unrepro,
+    "occurrences" => { "count" => occ },
+    "input" => { "min_size_bytes" => size },
+    "symptom" => { "headline" => "synthetic #{id}" },
+    "frames" => frames,
+    "coverage" => { "available" => true, "edges" => edges }
+  }
+end
+
+f_segv = [
+  { "scope" => "prism", "func" => "parser_lex", "file" => "src/prism.c", "line" => 300 },
+  { "scope" => "prism", "func" => "parse_expression", "file" => "src/prism.c", "line" => 2000 },
+  { "scope" => "prism", "func" => "pm_parse", "file" => "src/prism.c", "line" => 3000 }
+]
+f_msan = [
+  { "scope" => "prism", "func" => "parser_lex", "file" => "src/prism.c", "line" => 305 },
+  { "scope" => "prism", "func" => "parse_string_part", "file" => "src/prism.c", "line" => 900 },
+  { "scope" => "prism", "func" => "pm_parse", "file" => "src/prism.c", "line" => 3000 }
+]
+f_shift = [
+  { "scope" => "prism", "func" => "pm_helper_read", "file" => "src/prism.c", "line" => 50 },
+  { "scope" => "prism", "func" => "parser_lex", "file" => "src/prism.c", "line" => 300 },
+  { "scope" => "prism", "func" => "parse_expression", "file" => "src/prism.c", "line" => 2000 },
+  { "scope" => "prism", "func" => "pm_parse", "file" => "src/prism.c", "line" => 3000 }
+]
+f_other_leaf = [
+  { "scope" => "prism", "func" => "pm_line_offset_list_line_column", "file" => "src/line_offset_list.c", "line" => 96 },
+  { "scope" => "prism", "func" => "parse_case", "file" => "src/prism.c", "line" => 1800 },
+  { "scope" => "prism", "func" => "parse_expression", "file" => "src/prism.c", "line" => 2000 },
+  { "scope" => "prism", "func" => "pm_parse", "file" => "src/prism.c", "line" => 3000 }
+]
+f_ub_for = [
+  { "scope" => "prism", "func" => "parser_warn_indentation_mismatch", "file" => "src/prism.c", "line" => 15213 },
+  { "scope" => "prism", "func" => "parse_for", "file" => "src/prism.c", "line" => 19744 },
+  { "scope" => "prism", "func" => "pm_parse", "file" => "src/prism.c", "line" => 3000 }
+]
+
+buckets = [
+  # Cross-reason leaf + 1-frame shift cluster (should merge across SEGV, msan, asan)
+  make_bucket.call(id: "SEGV/lex_ijon", reason: "SEGV", occ: 40, frames: f_segv, edges: { "1" => 1, "30" => 1, "31" => 1 }),
+  make_bucket.call(id: "use-of-uninitialized-value/lex_msan", reason: "use-of-uninitialized-value", occ: 12, frames: f_msan, edges: { "1" => 1, "30" => 1, "31" => 1 }),
+  make_bucket.call(id: "heap-buffer-overflow/lex_shift", reason: "heap-buffer-overflow", occ: 5, frames: f_shift, edges: { "1" => 1, "30" => 1, "31" => 1 }),
+  # Separate stack bug sharing root frames
+  make_bucket.call(id: "use-of-uninitialized-value/line_col", reason: "use-of-uninitialized-value", occ: 9, frames: f_other_leaf, edges: { "1" => 1 }),
+  # Stackless heredoc cluster (minimal + verbose + parse_for caller noise) + visitor wrapper stripped
+  make_bucket.call(id: "ABRT/heredoc_min", reason: "ABRT", occ: 100, size: 9, frames: [{ "scope" => "prism", "func" => "pm_visit_node", "file" => "node.c", "line" => 1 }], edges: { "1" => 1, "2" => 1, "3" => 1, "4" => 1, "10" => 1, "11" => 1 }),
+  make_bucket.call(id: "ABRT/heredoc_full", reason: "ABRT", occ: 25, size: 22, edges: { "1" => 1, "2" => 1, "3" => 1, "5" => 1, "6" => 1, "10" => 1, "11" => 1, "12" => 1, "13" => 1, "20" => 1, "21" => 1, "22" => 1 }),
+  # Different stackless ABRT sharing recovery + boilerplate noise only (must NOT merge with heredoc_full)
+  make_bucket.call(id: "ABRT/sym_array", reason: "ABRT", occ: 30, edges: { "1" => 1, "2" => 1, "3" => 1, "5" => 1, "6" => 1, "40" => 1 }),
+  # Adversarial in-parse UB parse_for (must NOT merge with ABRT/heredoc_full despite shared parse_for edges)
+  make_bucket.call(id: "undefined-behavior/indent_for", reason: "undefined-behavior", occ: 18, frames: f_ub_for, edges: { "1" => 1, "5" => 1, "6" => 1, "20" => 1, "21" => 1, "22" => 1 }),
+  # Unreproducible bucket (skipped by default; common parse edge only)
+  make_bucket.call(id: "unreproducible/transient_01", reason: "unreproducible", occ: 2, unrepro: true, edges: { "1" => 1 })
+]
+
+metadata = { "schema_version" => 1, "corpus" => corpus, "buckets" => buckets }
+report = FuzzClustering.cluster_metadata(metadata)
+groups = report["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] }.sort }.sort
+expected = [
+  ["ABRT/heredoc_full", "ABRT/heredoc_min"],
+  ["ABRT/sym_array"],
+  ["SEGV/lex_ijon", "heap-buffer-overflow/lex_shift", "use-of-uninitialized-value/lex_msan"],
+  ["undefined-behavior/indent_for"],
+  ["use-of-uninitialized-value/line_col"]
+].sort
+raise "unexpected clusters:\n  got:      #{groups.inspect}\n  expected: #{expected.inspect}" unless groups == expected
+raise "expected excluded_unreproducible=1" unless report.dig("summary", "excluded_unreproducible") == 1
+
+# Shuffling bucket order must produce identical deterministic output
+shuffled = { "schema_version" => 1, "corpus" => corpus, "buckets" => buckets.reverse }
+report_rev = FuzzClustering.cluster_metadata(shuffled)
+raise "cluster_metadata must be permutation-invariant" unless report_rev["clusters"] == report["clusters"]
+
+# Include unreproducible option preserves unreproducible bucket as its own cluster
+report_unrepro = FuzzClustering.cluster_metadata(metadata, include_unreproducible: true)
+raise "expected 6 clusters with include_unreproducible=true, got #{report_unrepro.dig("summary", "cluster_count")}" unless report_unrepro.dig("summary", "cluster_count") == 6
+
+# Single-bug short-campaign mode (only the 2 heredoc buckets, 1 reason, zero external contrast)
+single_bug_meta = { "schema_version" => 1, "corpus" => corpus, "buckets" => buckets.select { |b| b["bucket_id"].start_with?("ABRT/heredoc") } }
+single_rep = FuzzClustering.cluster_metadata(single_bug_meta)
+raise "single-bug 2-bucket heredoc collapsed failed: #{single_rep["clusters"].inspect}" unless single_rep.dig("summary", "cluster_count") == 1
+
+# Recovery-only bug must still cluster (recovery weight = 0.10 > 0 rather than zeroed)
+rec_a = make_bucket.call(id: "ABRT/rec_a", reason: "ABRT", occ: 4, edges: { "1" => 1, "5" => 1, "6" => 1 })
+rec_b = make_bucket.call(id: "ABRT/rec_b", reason: "ABRT", occ: 2, edges: { "1" => 1, "5" => 1, "6" => 1 })
+rec_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [rec_a, rec_b] })
+raise "expected recovery-only bug buckets to merge via S_cov=1.0, got #{rec_rep["clusters"].inspect}" unless rec_rep.dig("summary", "cluster_count") == 1
+
+# Setup/encoding-lookup functions (weight 0.0) must not alias unrelated syntax bugs sharing rare fuzz options
+setup_ef = edge_functions.merge("50" => "pm_parser_init", "51" => "pm_encoding_find", "52" => "parse_heredoc", "53" => "parse_global_variable")
+setup_df = edge_df.merge("50" => 0, "51" => 0, "52" => 0, "53" => 0)
+setup_corpus = { "available" => true, "corpus_count" => 100, "edge_df" => setup_df, "edge_functions" => setup_ef }
+setup_a = make_bucket.call(id: "ABRT/setup_a", reason: "ABRT", occ: 3, edges: { "1" => 1, "50" => 1, "51" => 1, "52" => 1 })
+setup_b = make_bucket.call(id: "ABRT/setup_b", reason: "ABRT", occ: 3, edges: { "1" => 1, "50" => 1, "51" => 1, "53" => 1 })
+setup_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => setup_corpus, "buckets" => [setup_a, setup_b] })
+raise "expected SETUP_FUNCTIONS filtering to separate setup_a and setup_b, got #{setup_rep["clusters"].inspect}" unless setup_rep.dig("summary", "cluster_count") == 2
+
+# Subset containment: short syntax bug whose rare edges also appear inside a much larger compound bug must not merge
+sub_ef = edge_functions.dup
+sub_df = edge_df.dup
+%w[60 61].each { |k| sub_ef[k] = "parse_not"; sub_df[k] = 1 }
+%w[70 71 72 73 74 75 76 77 78 79 80 81 82 83].each { |k| sub_ef[k] = "parse_heredoc"; sub_df[k] = 0 }
+sub_corpus = { "available" => true, "corpus_count" => 100, "edge_df" => sub_df, "edge_functions" => sub_ef }
+sub_small = make_bucket.call(id: "ABRT/sub_small", reason: "ABRT", occ: 5, edges: { "60" => 1, "61" => 1 })
+sub_big_edges = { "60" => 1, "61" => 1 }.merge((70..83).each_with_object({}) { |k, h| h[k.to_s] = 1 })
+sub_big = make_bucket.call(id: "ABRT/sub_big", reason: "ABRT", occ: 5, edges: sub_big_edges)
+sub_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => sub_corpus, "buckets" => [sub_small, sub_big] })
+raise "expected Weighted Jaccard to separate subset containment, got #{sub_rep["clusters"].inspect}" unless sub_rep.dig("summary", "cluster_count") == 2
+
+# Empty, singleton, and coverage-unavailable fallbacks
+empty_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [] })
+raise "expected 0 clusters on empty metadata" unless empty_rep.dig("summary", "cluster_count") == 0
+
+one_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [buckets.first] })
+raise "expected 1 cluster on singleton metadata" unless one_rep.dig("summary", "cluster_count") == 1
+
+no_cov_corpus = { "available" => false, "corpus_count" => 0 }
+no_cov_buckets = [
+  make_bucket.call(id: "SEGV/s1", reason: "SEGV", occ: 5, frames: f_segv, edges: {}).merge("coverage" => { "available" => false }),
+  make_bucket.call(id: "use-of-uninitialized-value/s2", reason: "use-of-uninitialized-value", occ: 3, frames: f_msan, edges: {}).merge("coverage" => { "available" => false }),
+  make_bucket.call(id: "ABRT/u1", reason: "ABRT", occ: 2, edges: {}).merge("coverage" => { "available" => false }),
+  make_bucket.call(id: "ABRT/u2", reason: "ABRT", occ: 1, edges: {}).merge("coverage" => { "available" => false })
+]
+no_cov_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => no_cov_corpus, "buckets" => no_cov_buckets })
+no_cov_groups = no_cov_rep["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] }.sort }.sort
+unless no_cov_groups == [["ABRT/u1"], ["ABRT/u2"], ["SEGV/s1", "use-of-uninitialized-value/s2"]]
+  raise "unexpected no-coverage fallback clusters: #{no_cov_groups.inspect}"
+end
+
+# Exercise CLI file and stdout output paths
+meta_path = File.join(workdir, "cluster_meta.json")
+out_path = File.join(workdir, "clusters_out.json")
+File.write(meta_path, JSON.generate(metadata))
+cli_out = `ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output #{out_path}`
+raise "cluster.rb CLI failed" unless $?.success? && File.file?(out_path) && cli_out.include?("5 clusters")
+stdout_json = JSON.parse(`ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output - --quiet`)
+raise "cluster.rb stdout JSON mismatch" unless stdout_json["clusters"] == JSON.parse(File.read(out_path))["clusters"]
+EOF
+echo "  cluster.rb cross-reason, single-bug, recovery-damping, fallback, and CLI checks passed"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."
