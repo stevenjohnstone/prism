@@ -72,12 +72,13 @@ end
 def normalize_sync_source(src)
   return "grammar" if src =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
   return "ijon" if src =~ /\Aijon(?:_\d+|_peer)?\z/
+  return "diff" if src =~ /\Adiff(?:_\d+|_peer)?\z/
 
   src
 end
 
 def worker_root_dirs(afl_dir)
-  [afl_dir, "#{afl_dir}-ijon"].select { |d| Dir.exist?(d) }
+  [afl_dir, "#{afl_dir}-ijon", "#{afl_dir}-diff"].select { |d| Dir.exist?(d) }
 end
 
 def discover_fuzzer_dirs(afl_dir)
@@ -256,7 +257,7 @@ def lookup_prefix(prefix_arr, count)
 end
 
 def sort_fuzzer_names(names)
-  priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ijon" => 3, "slow" => 4 }
+  priority = { "main" => 0, "grammar" => 1, "msan" => 2, "ijon" => 3, "slow" => 4, "diff" => 5 }
   names.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]
@@ -673,7 +674,7 @@ fuzzers.each do |f|
   end
 
   is_isolated_root = File.expand_path(File.dirname(f[:dir])) != expanded_afl_dir
-  shadow_synced_path = peer_name == "ijon" ? File.join(main_fuzzer[:dir], ".synced", "ijon_peer") : nil
+  shadow_synced_path = %w[ijon diff].include?(peer_name) ? File.join(main_fuzzer[:dir], ".synced", "#{peer_name}_peer") : nil
   has_shadow_peer = !!(shadow_synced_path && File.file?(shadow_synced_path))
   is_foreign_queue = is_isolated_root && !has_shadow_peer
   peer_total = f[:corpus_count]
@@ -760,7 +761,7 @@ peer_sync_rows_html = fuzzers.reject { |f| f[:name] == main_name }.map do |f|
           "Rejected by #{consumer}: #{format_int(ps[:rejected_by_main])} | " \
           "Unsynced backlog: #{format_int(ps[:unsynced_backlog])}"
         when :shadow_peer
-          "#{f[:name]} → #{consumer} (#{consumer}/.synced/ijon_peer, queue: #{format_int(ps[:peer_total])}) — " \
+          "#{f[:name]} → #{consumer} (#{consumer}/.synced/#{f[:name]}_peer, queue: #{format_int(ps[:peer_total])}) — " \
           "Cursor: #{format_int(ps[:cursor])} (#{format('%.1f%%', ps[:sync_pct])}) | " \
           "Tested by #{consumer}: #{format_int(ps[:tested_by_main])} | " \
           "Imported by #{consumer}: #{format_int(ps[:imported_by_main])} (#{format('%.2f%%', ps[:yield_pct])} of tested) | " \

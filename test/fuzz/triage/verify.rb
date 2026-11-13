@@ -45,6 +45,7 @@ def infer_bucket_profile(bucket_dir, meta)
 
   reason = meta&.dig("reason") || File.basename(File.dirname(bucket_dir))
   reproduced_by = meta&.dig("reproduced_by").to_s
+  return "diff_parse_y" if reproduced_by.end_with?("diff")
   return "msan_slow" if reproduced_by.end_with?("msan") || reason == "use-of-uninitialized-value"
   return "lsan_slow" if reproduced_by.end_with?("lsan") || reason == "memory-leak"
   return "xallocator" if reason == "allocation-size-too-big" || reproduced_by.end_with?("ijon", "native")

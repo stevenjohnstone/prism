@@ -65,12 +65,13 @@ end
 def normalize_origin(origin)
   return "grammar" if origin =~ /\A(?:grammar|seeds)(?:_\d+)?\z/
   return "ijon" if origin =~ /\Aijon(?:_\d+|_peer)?\z/
+  return "diff" if origin =~ /\Adiff(?:_\d+|_peer)?\z/
 
   origin
 end
 
 def worker_root_dirs(afl_dir)
-  [afl_dir, "#{afl_dir}-ijon"].select { |d| Dir.exist?(d) }
+  [afl_dir, "#{afl_dir}-ijon", "#{afl_dir}-diff"].select { |d| Dir.exist?(d) }
 end
 
 def find_worker_dir(afl_dir, name)

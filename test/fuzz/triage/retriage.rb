@@ -75,12 +75,13 @@ end
 def resolve_reclassify_executable(meta, profile)
   reproduced_by = meta&.dig("reproduced_by").to_s
   unless reproduced_by.empty?
-    return "./build/fuzz" if %w[./build/fuzz.sand ./build/fuzz.cmplog].include?(reproduced_by)
+    return "./build/fuzz" if %w[./build/fuzz.sand ./build/fuzz.cmplog fuzz.sand fuzz.cmplog].include?(reproduced_by)
     # Raw archived bytes already have IJON stream-mode bit cleared; classify via fuzz.native
     # when built so we avoid redundant normalization while keeping the same replay chain.
     return "./build/fuzz.native" if reproduced_by.end_with?("ijon") && File.executable?("./build/fuzz.native")
+    return "./build/fuzz.diff" if reproduced_by.end_with?("diff")
 
-    return reproduced_by
+    return reproduced_by.include?("/") ? reproduced_by : "./build/#{reproduced_by}"
   end
 
   case profile
@@ -92,6 +93,8 @@ def resolve_reclassify_executable(meta, profile)
     "./build/fuzz.lsan"
   when "xallocator"
     File.executable?("./build/fuzz.native") ? "./build/fuzz.native" : "./build/fuzz"
+  when "diff_parse_y"
+    "./build/fuzz.diff"
   else
     "./build/fuzz"
   end
