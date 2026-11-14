@@ -42,6 +42,7 @@ typedef struct {
 } fuzz_options_t;
 
 #if (!defined(PRISM_FUZZ_IJON) || defined(SLOW)) && !defined(PRISM_FUZZ_NO_STREAM)
+/* TRIAGE_SLICE_BEGIN(stream_helpers) */
 typedef struct {
     const uint8_t *data;
     size_t size;
@@ -73,6 +74,7 @@ static char *fuzz_stream_fgets(char *buf, int n, void *vp) {
 static int fuzz_stream_feof(void *vp) {
     return ((const fuzz_stream_t *) vp)->eof ? 1 : 0;
 }
+/* TRIAGE_SLICE_END(stream_helpers) */
 #endif
 
 static inline void fuzz_string_view_init(pm_string_t *str, const uint8_t *buf, size_t len) {
@@ -84,12 +86,14 @@ static inline void fuzz_string_view_init(pm_string_t *str, const uint8_t *buf, s
 }
 
 #ifndef PRISM_FUZZ_NO_SHEBANG_CALLBACK
+/* TRIAGE_SLICE_BEGIN(shebang_cb) */
 static void fuzz_shebang_cb(pm_options_t *options, const uint8_t *source, size_t length, void *shebang_data) {
     (void) options;
     (void) source;
     (void) length;
     (void) shebang_data;
 }
+/* TRIAGE_SLICE_END(shebang_cb) */
 #endif
 
 static inline const char *fuzz_node_type_name(pm_node_type_t type) {
@@ -99,6 +103,10 @@ static inline const char *fuzz_node_type_name(pm_node_type_t type) {
     return pm_node_type(type);
 #endif
 }
+
+#ifdef PRISM_FUZZ_NODE_TYPE_TO_STR
+#define pm_node_type(type) pm_node_type_to_str(type)
+#endif
 
 typedef struct {
     uint32_t start;
@@ -251,6 +259,7 @@ typedef struct {
 } fuzz_line_offset_ctx_t;
 #endif
 
+/* TRIAGE_SLICE_BEGIN(invariant_fail) */
 __attribute__((noreturn, noinline, format(printf, 1, 2)))
 static void fuzz_invariant_fail(const char *fmt, ...) {
     va_list args;
@@ -260,11 +269,13 @@ static void fuzz_invariant_fail(const char *fmt, ...) {
     fflush(stderr);
     abort();
 }
+/* TRIAGE_SLICE_END(invariant_fail) */
 
 static bool fuzz_loc_in_bounds(fuzz_span_t loc, size_t parsed_size) {
     return (size_t) loc.start <= parsed_size && (size_t) loc.length <= parsed_size - (size_t) loc.start;
 }
 
+/* TRIAGE_SLICE_BEGIN(span_violation) */
 static const char *fuzz_span_violation_kind(uint32_t start, uint32_t length, size_t parsed_size) {
     if ((size_t) start <= parsed_size && (size_t) length <= parsed_size - (size_t) start) {
         return NULL;
@@ -281,6 +292,7 @@ static const char *fuzz_span_violation_kind(uint32_t start, uint32_t length, siz
     }
     return "end_oob";
 }
+/* TRIAGE_SLICE_END(span_violation) */
 
 #ifndef PRISM_FUZZ_NO_VISIT_NODE
 static bool fuzz_heredoc_span_contains(
@@ -603,28 +615,30 @@ static void fuzz_check_magic_comment(const pm_magic_comment_t *mc, void *data) {
     }
 }
 
+/* TRIAGE_SLICE_BEGIN(safe_node_name) */
 static inline const char *fuzz_safe_node_name(pm_node_type_t type) {
-    const char *name = fuzz_node_type_name(type);
+    const char *name = pm_node_type(type);
     return (name != NULL && name[0] != '\0') ? name : "UNKNOWN";
 }
+/* TRIAGE_SLICE_END(safe_node_name) */
 
 #if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+/* TRIAGE_SLICE_BEGIN(node_relations) */
 static void fuzz_check_node_list_relations(
     const pm_node_t *parent,
-    fuzz_span_t parent_loc,
     pm_location_t opening_loc,
     pm_location_t closing_loc,
     const pm_node_list_t *list,
-    const fuzz_node_check_t *ctx
+    const uint8_t *source,
+    size_t parsed_size
 ) {
-    fuzz_span_t opening = fuzz_loc_span(opening_loc, ctx->source);
-    fuzz_span_t closing = fuzz_loc_span(closing_loc, ctx->source);
-    bool opening_valid = opening.length > 0 && fuzz_span_violation_kind(opening.start, opening.length, ctx->parsed_size) == NULL;
-    bool closing_valid = closing.length > 0 && fuzz_span_violation_kind(closing.start, closing.length, ctx->parsed_size) == NULL;
-    bool is_heredoc = opening_valid && opening.length >= 2 && ctx->source[opening.start] == '<' && ctx->source[opening.start + 1] == '<';
+    pm_location_t parent_loc = parent->location;
+    bool opening_valid = opening_loc.length > 0 && fuzz_span_violation_kind(opening_loc.start, opening_loc.length, parsed_size) == NULL;
+    bool closing_valid = closing_loc.length > 0 && fuzz_span_violation_kind(closing_loc.start, closing_loc.length, parsed_size) == NULL;
+    bool is_heredoc = opening_valid && opening_loc.length >= 2 && source[opening_loc.start] == '<' && source[opening_loc.start + 1] == '<';
     const char *parent_name = fuzz_safe_node_name(parent->type);
     uint64_t pend = (uint64_t) parent_loc.start + (uint64_t) parent_loc.length;
-    uint64_t opening_end = (uint64_t) opening.start + (uint64_t) opening.length;
+    uint64_t opening_end = (uint64_t) opening_loc.start + (uint64_t) opening_loc.length;
 
     bool has_prev = false;
     uint32_t prev_start = 0;
@@ -635,8 +649,8 @@ static void fuzz_check_node_list_relations(
         const pm_node_t *child = list->nodes[i];
         if (child == NULL) continue;
 
-        fuzz_span_t cloc = fuzz_loc_span(child->location, ctx->source);
-        if (fuzz_span_violation_kind(cloc.start, cloc.length, ctx->parsed_size) != NULL) {
+        pm_location_t cloc = child->location;
+        if (fuzz_span_violation_kind(cloc.start, cloc.length, parsed_size) != NULL) {
             continue;
         }
 
@@ -691,13 +705,13 @@ static void fuzz_check_node_list_relations(
                     cloc.start
                 );
             }
-            if (closing_valid && cend > (uint64_t) closing.start) {
+            if (closing_valid && cend > (uint64_t) closing_loc.start) {
                 fuzz_invariant_fail(
                     "INVARIANT[node_relation]: parent=%s child=%s kind=child_after_closing [detail: idx=%zu closing_start=%u child_end=%llu]\n",
                     parent_name,
                     child_name,
                     i,
-                    closing.start,
+                    closing_loc.start,
                     (unsigned long long) cend
                 );
             }
@@ -710,37 +724,38 @@ static void fuzz_check_node_list_relations(
     }
 }
 
-static void fuzz_check_node_relations(const pm_node_t *node, fuzz_span_t loc, const fuzz_node_check_t *ctx) {
+static void fuzz_check_node_relations(const pm_node_t *node, const uint8_t *source, size_t parsed_size) {
     switch (node->type) {
         case PM_ARRAY_NODE: {
             const pm_array_node_t *arr = (const pm_array_node_t *) node;
-            fuzz_check_node_list_relations(node, loc, arr->opening_loc, arr->closing_loc, &arr->elements, ctx);
+            fuzz_check_node_list_relations(node, arr->opening_loc, arr->closing_loc, &arr->elements, source, parsed_size);
             break;
         }
         case PM_INTERPOLATED_SYMBOL_NODE: {
             const pm_interpolated_symbol_node_t *sym = (const pm_interpolated_symbol_node_t *) node;
-            fuzz_check_node_list_relations(node, loc, sym->opening_loc, sym->closing_loc, &sym->parts, ctx);
+            fuzz_check_node_list_relations(node, sym->opening_loc, sym->closing_loc, &sym->parts, source, parsed_size);
             break;
         }
         case PM_INTERPOLATED_STRING_NODE: {
             const pm_interpolated_string_node_t *str = (const pm_interpolated_string_node_t *) node;
-            fuzz_check_node_list_relations(node, loc, str->opening_loc, str->closing_loc, &str->parts, ctx);
+            fuzz_check_node_list_relations(node, str->opening_loc, str->closing_loc, &str->parts, source, parsed_size);
             break;
         }
         case PM_INTERPOLATED_X_STRING_NODE: {
             const pm_interpolated_x_string_node_t *xstr = (const pm_interpolated_x_string_node_t *) node;
-            fuzz_check_node_list_relations(node, loc, xstr->opening_loc, xstr->closing_loc, &xstr->parts, ctx);
+            fuzz_check_node_list_relations(node, xstr->opening_loc, xstr->closing_loc, &xstr->parts, source, parsed_size);
             break;
         }
         case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE: {
             const pm_interpolated_regular_expression_node_t *re = (const pm_interpolated_regular_expression_node_t *) node;
-            fuzz_check_node_list_relations(node, loc, re->opening_loc, re->closing_loc, &re->parts, ctx);
+            fuzz_check_node_list_relations(node, re->opening_loc, re->closing_loc, &re->parts, source, parsed_size);
             break;
         }
         default:
             break;
     }
 }
+/* TRIAGE_SLICE_END(node_relations) */
 #endif
 
 static void fuzz_for_each_error_diag(pm_parser_t *parser, void (*fn)(const pm_diagnostic_t *, void *), void *ctx) {
@@ -764,6 +779,7 @@ static void fuzz_for_each_error_diag(pm_parser_t *parser, void (*fn)(const pm_di
 }
 
 #if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_NO_DIAGNOSTIC_TYPE) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+/* TRIAGE_SLICE_BEGIN(iterative_chain_node) */
 static bool fuzz_is_iterative_chain_node(pm_node_type_t parent, pm_node_type_t child) {
     if (parent != child) return false;
     switch (child) {
@@ -778,6 +794,7 @@ static bool fuzz_is_iterative_chain_node(pm_node_type_t parent, pm_node_type_t c
             return false;
     }
 }
+/* TRIAGE_SLICE_END(iterative_chain_node) */
 
 static void fuzz_check_depth_or_stack_cb(const pm_diagnostic_t *d, void *data) {
     bool *found = (bool *) data;
@@ -818,7 +835,7 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
     (void) ctx;
 #else
 #if !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
-    fuzz_check_node_relations(node, loc, ctx);
+    fuzz_check_node_relations(node, ctx->source, ctx->parsed_size);
 #endif
 #if !defined(PRISM_FUZZ_NO_DIAGNOSTIC_TYPE) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
     size_t cur_depth = ctx->depth + (fuzz_is_iterative_chain_node(ctx->parent_type, node->type) ? 0u : 1u);
@@ -991,6 +1008,7 @@ static inline void fuzz_buffer_reset(pm_buffer_t *buffer) {
 #if !defined(PRISM_FUZZ_IJON) && !defined(PRISM_FUZZ_NO_STREAM) && !defined(PRISM_FUZZ_NO_STREAM_DIFF) && \
     !defined(PRISM_FUZZ_LEGACY_NO_ARENA) && !defined(PRISM_FUZZ_LEGACY_ARENA_STRUCT) && !defined(PRISM_FUZZ_LEGACY_PARSER_INIT) && \
     !defined(PRISM_FUZZ_LEGACY_PARSER_DATA_LOC) && !defined(PRISM_FUZZ_LEGACY_BUFFER_STRUCT) && !defined(PRISM_FUZZ_NO_PARSER_ERRORS_SIZE)
+/* TRIAGE_SLICE_BEGIN(stream_diff) */
 static bool fuzz_has_eof_control_byte(const uint8_t *buf, size_t len) {
     for (size_t i = 0; i < len; i++) {
         uint8_t byte = buf[i];
@@ -1101,12 +1119,13 @@ static void fuzz_check_stream_diff(
         }
 
         if (node != NULL) {
-            fuzz_buffer_reset(stream_buf);
-            pm_prettyprint(stream_buf, parser, node);
+            pm_buffer_t *stream_pp_buf = pm_buffer_new();
+            pm_prettyprint(stream_pp_buf, parser, node);
             pm_prettyprint(ref_buf, ref_parser, ref_node);
-            size_t stream_pp = pm_buffer_length(stream_buf);
+            size_t stream_pp = pm_buffer_length(stream_pp_buf);
             size_t ref_pp = pm_buffer_length(ref_buf);
-            if (stream_pp != ref_pp || memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), stream_pp) != 0) {
+            if (stream_pp != ref_pp || memcmp(pm_buffer_value(stream_pp_buf), pm_buffer_value(ref_buf), stream_pp) != 0) {
+                pm_buffer_free(stream_pp_buf);
                 fuzz_invariant_fail(
                     "INVARIANT[stream_diff]: kind=ast_mismatch [detail: parsed_size=%zu size=%zu stream_pp=%zu full_pp=%zu]\n",
                     parsed_size,
@@ -1115,15 +1134,18 @@ static void fuzz_check_stream_diff(
                     ref_pp
                 );
             }
+            pm_buffer_free(stream_pp_buf);
 
             pm_arena_t *prefix_arena = pm_arena_new();
             pm_parser_t *prefix_parser = pm_parser_new(prefix_arena, source_buf, parsed_size, options);
             pm_node_t *prefix_node = pm_parse(prefix_parser);
-            fuzz_buffer_reset(stream_buf);
-            fuzz_buffer_reset(ref_buf);
-            pm_serialize(parser, node, stream_buf);
-            pm_serialize(prefix_parser, prefix_node, ref_buf);
-            fuzz_assert_serialized_equal(stream_buf, ref_buf, "prefix_serialize_mismatch", "prefix_len", parsed_size, size);
+            pm_buffer_t *stream_ser = pm_buffer_new();
+            pm_buffer_t *prefix_ser = pm_buffer_new();
+            pm_serialize(parser, node, stream_ser);
+            pm_serialize(prefix_parser, prefix_node, prefix_ser);
+            fuzz_assert_serialized_equal(stream_ser, prefix_ser, "prefix_serialize_mismatch", "prefix_len", parsed_size, size);
+            pm_buffer_free(prefix_ser);
+            pm_buffer_free(stream_ser);
             pm_parser_free(prefix_parser);
             pm_arena_free(prefix_arena);
         }
@@ -1133,6 +1155,7 @@ static void fuzz_check_stream_diff(
     pm_parser_free(ref_parser);
     pm_arena_free(ref_arena);
 }
+/* TRIAGE_SLICE_END(stream_diff) */
 #endif
 #endif
 

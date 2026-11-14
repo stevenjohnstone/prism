@@ -17,6 +17,7 @@ require "zlib"
 cluster_lib = [(__dir__ && File.join(__dir__, "cluster.rb")), File.expand_path("test/fuzz/triage/cluster.rb")].compact.find { |p| File.file?(p) }
 require cluster_lib if cluster_lib
 
+TRIAGE_FILE_DIR = __dir__
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
 OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon", "tmp/fuzz/afl-diff"].freeze
@@ -84,6 +85,45 @@ FORWARDING_CHARS = [
   [0x04, "b"],
   [0x08, "a"]
 ].freeze
+
+HARNESS_SLICE_MUTEX = Mutex.new
+HARNESS_SLICES_CACHE = {}
+
+# Locate a fuzz harness source file relative to FUZZ_HARNESS_DIR, this file's
+# directory (when loaded normally rather than via eval), or the repo root cwd.
+def find_fuzz_harness_file(filename)
+  candidates = [
+    (ENV["FUZZ_HARNESS_DIR"] && !ENV["FUZZ_HARNESS_DIR"].empty? ? File.join(ENV["FUZZ_HARNESS_DIR"], filename) : nil),
+    (TRIAGE_FILE_DIR && File.expand_path("../harness/#{filename}", TRIAGE_FILE_DIR)),
+    File.expand_path("test/fuzz/harness/#{filename}"),
+    File.expand_path("../../harness/#{filename}")
+  ].compact.uniq
+  path = candidates.find { |p| File.file?(p) }
+  raise "Cannot locate fuzz harness file #{filename} (tried #{candidates.join(', ')})" unless path
+
+  path
+end
+
+# Extract and cache a named `/* TRIAGE_SLICE_BEGIN(name) */` block from a
+# harness C file so standalone testcase.c reproducers share harness code.
+def harness_slice(filename, slice_name)
+  key = [filename, slice_name].freeze
+  cached = HARNESS_SLICE_MUTEX.synchronize { HARNESS_SLICES_CACHE[key] }
+  return cached if cached
+
+  content = File.read(find_fuzz_harness_file(filename))
+  begin_marker = "/* TRIAGE_SLICE_BEGIN(#{slice_name}) */"
+  end_marker = "/* TRIAGE_SLICE_END(#{slice_name}) */"
+  start_idx = content.index(begin_marker)
+  raise "Missing #{begin_marker} in #{filename}" unless start_idx
+
+  body_start = start_idx + begin_marker.bytesize
+  end_idx = content.index(end_marker, body_start)
+  raise "Missing #{end_marker} in #{filename}" unless end_idx
+
+  sliced = content[body_start...end_idx].strip
+  HARNESS_SLICE_MUTEX.synchronize { HARNESS_SLICES_CACHE[key] ||= sliced }
+end
 
 def escape_c_comment(text)
   text.gsub("*/", "* /")
@@ -288,8 +328,8 @@ def slow_consumer_lines(stream_mode, source_ptr)
   if stream_mode
     lines.concat([
       "pm_buffer_t *stream_buf = pm_buffer_new();",
-      "mem_stream_t stream_state2 = {.data = #{source_ptr}, .size = input_size, .pos = 0, .eof = false};",
-      "pm_source_t *stream_src2 = pm_source_stream_new(&stream_state2, mem_stream_fgets, mem_stream_feof);",
+      "fuzz_stream_t stream_state2 = {.data = #{source_ptr}, .size = input_size, .pos = 0, .eof = false};",
+      "pm_source_t *stream_src2 = pm_source_stream_new(&stream_state2, fuzz_stream_fgets, fuzz_stream_feof);",
       "pm_serialize_parse_stream(stream_buf, stream_src2, NULL);",
       "pm_source_free(stream_src2);",
       "pm_buffer_free(stream_buf);"
@@ -338,7 +378,6 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_node] = true
     plan[:need_parsed_size] = true
     plan[:need_stream_diff_helper] = true
-    plan[:need_assert] = true
     plan[:need_stdbool] = true
     plan[:need_string] = true
   elsif crash_output.include?("INVARIANT[line_offsets]:")
@@ -363,7 +402,6 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_node] = true
     plan[:need_parsed_size] = true
     plan[:need_check_node_relation_helper] = true
-    plan[:need_assert] = true
     plan[:need_stdbool] = true
     plan[:lines] = [
       "node_relation_ctx_t rel_ctx = {.source = #{source_ptr}, .parsed_size = parsed_size};",
@@ -472,8 +510,8 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_stdbool] = true
     plan[:lines] = [
       "pm_buffer_t *buffer = pm_buffer_new();",
-      "mem_stream_t stream_state2 = {.data = #{source_ptr}, .size = input_size, .pos = 0, .eof = false};",
-      "pm_source_t *stream_src2 = pm_source_stream_new(&stream_state2, mem_stream_fgets, mem_stream_feof);",
+      "fuzz_stream_t stream_state2 = {.data = #{source_ptr}, .size = input_size, .pos = 0, .eof = false};",
+      "pm_source_t *stream_src2 = pm_source_stream_new(&stream_state2, fuzz_stream_fgets, fuzz_stream_feof);",
       "pm_serialize_parse_stream(buffer, stream_src2, NULL);",
       "pm_source_free(stream_src2);",
       "pm_buffer_free(buffer);"
@@ -537,927 +575,8 @@ def diff_c_program(source, crash_details, crash_output, loupe_url)
     "#include <ruby.h>"
   ]
 
-  helpers = []
-  helpers << <<~'C'.chomp
-    static void diff_invariant_fail(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
-    static void diff_invariant_fail(const char *fmt, ...) {
-      va_list args;
-      va_start(args, fmt);
-      vfprintf(stderr, fmt, args);
-      va_end(args);
-      fflush(stderr);
-      signal(SIGABRT, SIG_DFL);
-      abort();
-    }
-
-    static VALUE diff_warning_warn(int argc, VALUE *argv, VALUE self) {
-      return Qnil;
-    }
-
-    static VALUE diff_ast_parse_cb(VALUE src_str) {
-      VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
-      VALUE rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
-      return rb_funcall(rb_mAST, rb_intern("parse"), 1, src_str);
-    }
-
-    static bool diff_is_valid_utf8(const uint8_t *s, size_t len) {
-      size_t i = 0;
-      while (i < len) {
-        uint8_t b0 = s[i];
-        if (b0 <= 0x7F) {
-          i += 1;
-        } else if (b0 >= 0xC2 && b0 <= 0xDF) {
-          if (i + 2 > len || (s[i + 1] & 0xC0) != 0x80) return false;
-          i += 2;
-        } else if (b0 == 0xE0) {
-          if (i + 3 > len || s[i + 1] < 0xA0 || s[i + 1] > 0xBF || (s[i + 2] & 0xC0) != 0x80) return false;
-          i += 3;
-        } else if ((b0 >= 0xE1 && b0 <= 0xEC) || (b0 >= 0xEE && b0 <= 0xEF)) {
-          if (i + 3 > len || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80) return false;
-          i += 3;
-        } else if (b0 == 0xED) {
-          if (i + 3 > len || s[i + 1] < 0x80 || s[i + 1] > 0x9F || (s[i + 2] & 0xC0) != 0x80) return false;
-          i += 3;
-        } else if (b0 == 0xF0) {
-          if (i + 4 > len || s[i + 1] < 0x90 || s[i + 1] > 0xBF || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
-          i += 4;
-        } else if (b0 >= 0xF1 && b0 <= 0xF3) {
-          if (i + 4 > len || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
-          i += 4;
-        } else if (b0 == 0xF4) {
-          if (i + 4 > len || s[i + 1] < 0x80 || s[i + 1] > 0x8F || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
-          i += 4;
-        } else {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    static bool diff_has_nul(const uint8_t *s, size_t len) {
-      return len > 0 && memchr(s, '\0', len) != NULL;
-    }
-
-    static bool diff_starts_with(const char *s, const char *prefix) {
-      return strncmp(s, prefix, strlen(prefix)) == 0;
-    }
-
-    static void diff_sanitize_ident(const char *src, char *dst, size_t cap, const char *fallback) {
-      if (cap == 0) return;
-      size_t out = 0;
-      if (src != NULL) {
-        for (size_t i = 0; src[i] != '\0' && out + 1 < cap; i++) {
-          char c = src[i];
-          if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
-            dst[out++] = c;
-          }
-        }
-      }
-      if (out == 0) {
-        snprintf(dst, cap, "%s", fallback);
-      } else {
-        dst[out] = '\0';
-      }
-    }
-
-    static void diff_classify_cruby_msg(const char *cls, const char *line, char *tag_buf, size_t tag_cap) {
-      static const struct {
-        const char *prefix;
-        const char *tag;
-      } prefix_tags[] = {
-        { "unknown encoding name:",                        "unknown_encoding" },
-        { "invalid multibyte char (UTF-8)",                "invalid_multibyte_utf8" },
-        { "invalid multibyte char (US-ASCII)",             "invalid_multibyte_us_ascii" },
-        { "invalid multibyte char",                        "invalid_multibyte" },
-        { "string literal encodings differ",               "string_encodings_differ" },
-        { "invalid symbol",                                "invalid_symbol" },
-        { "premature end of char-class:",                  "regexp_char_class" },
-        { "invalid character property name",               "regexp_property" },
-        { "invalid backref number/name:",                  "regexp_backref" },
-        { "too short escape sequence:",                    "regexp_escape" },
-        { "invalid escape:",                               "regexp_escape" },
-        { "end pattern",                                   "regexp_pattern" },
-        { "empty char-class:",                             "regexp_char_class" },
-        { "target of repeat-operator",                     "regexp_repeat" },
-        { "invalid pattern in look-behind",                "regexp_lookbehind" },
-        { "unterminated string meets end of file",         "unterminated_string" },
-        { "unterminated regexp meets end of file",         "unterminated_regexp" },
-        { "can't find string \"",                          "unterminated_heredoc" },
-        { "embedded document meets end of file",           "unterminated_embdoc" },
-        { "dynamic constant assignment",                   "dynamic_constant_assign" },
-        { "formal argument cannot be",                     "invalid_formal_arg" },
-        { "duplicated argument name",                      "duplicate_arg_name" },
-        { "circular argument reference",                   "circular_arg_ref" },
-        { "Invalid break",                                 "invalid_break" },
-        { "Invalid next",                                  "invalid_next" },
-        { "Invalid redo",                                  "invalid_redo" },
-        { "Invalid retry",                                 "invalid_retry" },
-        { "Invalid yield",                                 "invalid_yield" },
-        { "numbered parameter",                            "numbered_param" },
-        { "ordinary parameter is defined",                 "ordinary_param_conflict" },
-        { "no .<digit> floating literal anymore",          "float_literal_method" },
-        { "syntax error, unexpected 'do' for block",       "unexpected_do_block" },
-        { "syntax error, unexpected '\\n'",                "unexpected_newline" }
-      };
-
-      for (size_t i = 0; i < sizeof(prefix_tags) / sizeof(prefix_tags[0]); i++) {
-        if (diff_starts_with(line, prefix_tags[i].prefix)) {
-          snprintf(tag_buf, tag_cap, "%s:%s", cls, prefix_tags[i].tag);
-          return;
-        }
-      }
-      if (diff_starts_with(line, "identifier ")) {
-        if (strstr(line, " is not valid to get") != NULL) {
-          snprintf(tag_buf, tag_cap, "%s:invalid_identifier_get", cls);
-          return;
-        }
-        if (strstr(line, " is not valid to set") != NULL) {
-          snprintf(tag_buf, tag_cap, "%s:invalid_identifier_set", cls);
-          return;
-        }
-      }
-      static const char unexpected_pfx[] = "syntax error, unexpected ";
-      if (diff_starts_with(line, unexpected_pfx)) {
-        const char *p = line + sizeof(unexpected_pfx) - 1;
-        char tok[48];
-        size_t len = 0;
-        bool has_alnum = false;
-        while (*p != '\0' && *p != ',' && len + 1 < sizeof(tok)) {
-          unsigned char ch = (unsigned char)*p++;
-          if (ch >= 'A' && ch <= 'Z') {
-            tok[len++] = (char)(ch + ('a' - 'A'));
-            has_alnum = true;
-          } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
-            tok[len++] = (char)ch;
-            has_alnum = true;
-          } else if ((ch == ' ' || ch == '-' || ch == '_') && len > 0 && tok[len - 1] != '_') {
-            tok[len++] = '_';
-          }
-        }
-        while (len > 0 && tok[len - 1] == '_') len--;
-        tok[len] = '\0';
-        snprintf(tag_buf, tag_cap, "%s:unexpected_%s", cls, has_alnum ? tok : "punct");
-        return;
-      }
-      if (strcmp(cls, "RegexpError") == 0 || strstr(line, ": /") != NULL) {
-        snprintf(tag_buf, tag_cap, "%s:regexp_other", cls);
-        return;
-      }
-      snprintf(tag_buf, tag_cap, "%s:other", cls);
-    }
-
-    static void diff_format_exception(VALUE err, char *exc_buf, size_t exc_cap, char *tag_buf, size_t tag_cap) {
-      if (NIL_P(err)) {
-        if (exc_cap > 0) snprintf(exc_buf, exc_cap, "nil");
-        if (tag_cap > 0) snprintf(tag_buf, tag_cap, "nil");
-        return;
-      }
-      char cls_buf[48];
-      diff_sanitize_ident(rb_obj_classname(err), cls_buf, sizeof(cls_buf), "Exception");
-      VALUE msg = rb_funcall(err, rb_intern("message"), 0);
-      const char *mptr = (RB_TYPE_P(msg, T_STRING) && RSTRING_LEN(msg) > 0) ? RSTRING_PTR(msg) : "";
-      long mlen = RB_TYPE_P(msg, T_STRING) ? RSTRING_LEN(msg) : 0;
-      char line[128];
-      long line_len = 0;
-      while (line_len < mlen && line_len < (long)(sizeof(line) - 1) && mptr[line_len] != '\n' && mptr[line_len] != '\r') {
-        line[line_len] = (mptr[line_len] != '\0') ? mptr[line_len] : ' ';
-        line_len++;
-      }
-      line[line_len] = '\0';
-      if (exc_cap > 0) {
-        int detail_len = (int)(line_len > 96 ? 96 : line_len);
-        snprintf(exc_buf, exc_cap, "%s: %.*s", cls_buf, detail_len, line);
-      }
-      if (tag_cap > 0) {
-        diff_classify_cruby_msg(cls_buf, line, tag_buf, tag_cap);
-      }
-      RB_GC_GUARD(msg);
-    }
-  C
-
-  if need_ast
-    helpers << <<~'C'.chomp
-      #define DIFF_MAX_AST_DEPTH 4096
-
-      typedef enum {
-        DIFF_SCOPE_PROGRAM = 0,
-        DIFF_SCOPE_DEF,
-        DIFF_SCOPE_CLASS,
-        DIFF_SCOPE_MODULE,
-        DIFF_SCOPE_SCLASS,
-        DIFF_SCOPE_BLOCK,
-        DIFF_SCOPE_LAMBDA
-      } diff_scope_kind_t;
-
-      typedef enum {
-        DIFF_CNT_CLASS = 0,
-        DIFF_CNT_MODULE,
-        DIFF_CNT_SCLASS,
-        DIFF_CNT_FOR,
-        DIFF_CNT_IF,
-        DIFF_CNT_UNLESS,
-        DIFF_CNT_WHILE,
-        DIFF_CNT_UNTIL,
-        DIFF_CNT_YIELD,
-        DIFF_CNT_RETURN,
-        DIFF_CNT_SUPER,
-        DIFF_CNT_DEFINED,
-        DIFF_CNT_ALIAS,
-        DIFF_CNT_UNDEF,
-        DIFF_CNT_CASE,
-        DIFF_CNT_LEN
-      } diff_count_kind_t;
-
-      typedef struct {
-        uint32_t offset;
-        uint32_t length;
-      } diff_span_t;
-
-      typedef struct {
-        char *data;
-        size_t used;
-        size_t cap;
-      } diff_strbuf_t;
-
-      typedef struct {
-        diff_span_t *items;
-        size_t count;
-        size_t cap;
-      } diff_span_vec_t;
-
-      typedef struct {
-        uint8_t kind;
-        uint32_t local_start;
-        uint32_t local_count;
-      } diff_scope_t;
-
-      typedef struct {
-        diff_scope_t *items;
-        size_t count;
-        size_t cap;
-      } diff_scope_vec_t;
-
-      typedef struct {
-        diff_strbuf_t strbuf;
-        diff_scope_vec_t scopes;
-        diff_span_vec_t locals;
-        diff_span_vec_t defs;
-        diff_span_vec_t block_owners;
-        size_t counts[DIFF_CNT_LEN];
-      } diff_summary_t;
-
-      typedef struct {
-        VALUE ast_node_cls;
-        ID id_type;
-        ID id_children;
-        ID scope, defn, defs, cls, mod, scls, iter, lambda, for_n, postexe;
-        ID if_n, unless_n, while_n, until_n, yield_n, return_n, break_n, next_n;
-        ID super_n, zsuper_n, defined_n, alias_n, valias_n, undef_n, case_n, case2_n;
-        ID fcall, vcall, call, qcall, opcall;
-      } diff_cruby_env_t;
-
-      static const char *diff_scope_kind_name(diff_scope_kind_t kind) {
-        static const char *const names[] = {"program", "def", "class", "module", "sclass", "block", "lambda"};
-        size_t idx = (size_t)kind;
-        return idx < (sizeof(names) / sizeof(names[0])) ? names[idx] : "unknown";
-      }
-
-      static const char *diff_count_kind_name(diff_count_kind_t kind) {
-        static const char *const names[] = {
-          "class", "module", "sclass", "for", "if", "unless", "while", "until",
-          "yield", "return", "super", "defined", "alias", "undef", "case"
-        };
-        size_t idx = (size_t)kind;
-        return idx < (sizeof(names) / sizeof(names[0])) ? names[idx] : "unknown";
-      }
-
-      static void diff_summary_init(diff_summary_t *s) {
-        memset(s, 0, sizeof(*s));
-      }
-
-      static void diff_summary_free(diff_summary_t *s) {
-        free(s->strbuf.data);
-        free(s->scopes.items);
-        free(s->locals.items);
-        free(s->defs.items);
-        free(s->block_owners.items);
-        memset(s, 0, sizeof(*s));
-      }
-
-      static void diff_grow_heap(void **buf, size_t *cap, size_t elem_size, size_t needed) {
-        if (needed <= *cap) return;
-        size_t new_cap = *cap > 0 ? *cap : 16;
-        while (new_cap < needed) {
-          assert(new_cap <= SIZE_MAX / 2);
-          new_cap *= 2;
-        }
-        assert(new_cap <= SIZE_MAX / elem_size);
-        void *next = realloc(*buf, new_cap * elem_size);
-        assert(next != NULL);
-        *buf = next;
-        *cap = new_cap;
-      }
-
-      static diff_span_t diff_strbuf_add(diff_strbuf_t *b, const char *ptr, size_t len) {
-        assert(len <= UINT32_MAX && b->used <= (size_t)UINT32_MAX - len);
-        void *p = b->data;
-        diff_grow_heap(&p, &b->cap, 1, b->used + len);
-        b->data = (char *)p;
-        diff_span_t span = {.offset = (uint32_t)b->used, .length = (uint32_t)len};
-        if (len > 0) {
-          memcpy(b->data + b->used, ptr, len);
-          b->used += len;
-        }
-        return span;
-      }
-
-      static void diff_span_vec_push(diff_span_vec_t *v, diff_span_t span) {
-        void *p = v->items;
-        diff_grow_heap(&p, &v->cap, sizeof(diff_span_t), v->count + 1);
-        v->items = (diff_span_t *)p;
-        v->items[v->count++] = span;
-      }
-
-      static void diff_scope_vec_push(diff_scope_vec_t *v, diff_scope_t sc) {
-        void *p = v->items;
-        diff_grow_heap(&p, &v->cap, sizeof(diff_scope_t), v->count + 1);
-        v->items = (diff_scope_t *)p;
-        v->items[v->count++] = sc;
-      }
-
-      static int diff_span_cmp(diff_span_t a, diff_span_t b, const char *buf) {
-        size_t min_len = a.length < b.length ? a.length : b.length;
-        int cmp = min_len > 0 ? memcmp(buf + a.offset, buf + b.offset, min_len) : 0;
-        if (cmp != 0) return cmp;
-        return (a.length > b.length) - (a.length < b.length);
-      }
-
-      static void diff_sift_down(diff_span_t *arr, size_t start, size_t end, const char *buf) {
-        size_t root = start;
-        while (root * 2 + 1 <= end) {
-          size_t child = root * 2 + 1;
-          size_t swap_idx = root;
-          if (diff_span_cmp(arr[swap_idx], arr[child], buf) < 0) swap_idx = child;
-          if (child + 1 <= end && diff_span_cmp(arr[swap_idx], arr[child + 1], buf) < 0) swap_idx = child + 1;
-          if (swap_idx == root) return;
-          diff_span_t tmp = arr[root];
-          arr[root] = arr[swap_idx];
-          arr[swap_idx] = tmp;
-          root = swap_idx;
-        }
-      }
-
-      static void diff_sort_spans(diff_span_t *arr, size_t n, const char *buf) {
-        if (n < 2) return;
-        for (size_t start = n / 2; start > 0; start--) diff_sift_down(arr, start - 1, n - 1, buf);
-        for (size_t end = n - 1; end > 0; end--) {
-          diff_span_t tmp = arr[0];
-          arr[0] = arr[end];
-          arr[end] = tmp;
-          diff_sift_down(arr, 0, end - 1, buf);
-        }
-      }
-
-      static void diff_finalize_summary(diff_summary_t *s) {
-        for (size_t i = 0; i < s->scopes.count; i++) {
-          diff_scope_t *sc = &s->scopes.items[i];
-          size_t n = sc->local_count;
-          if (n < 2) continue;
-          diff_span_t *slice = &s->locals.items[sc->local_start];
-          diff_sort_spans(slice, n, s->strbuf.data);
-          size_t unique = 1;
-          for (size_t j = 1; j < n; j++) {
-            if (diff_span_cmp(slice[j], slice[unique - 1], s->strbuf.data) != 0) slice[unique++] = slice[j];
-          }
-          sc->local_count = (uint32_t)unique;
-        }
-        diff_sort_spans(s->block_owners.items, s->block_owners.count, s->strbuf.data);
-      }
-
-      static bool diff_is_synthetic_local(const char *s, size_t len) {
-        switch (len) {
-          case 1: return s[0] == '*' || s[0] == '&';
-          case 2: return memcmp(s, "**", 2) == 0;
-          case 3: return memcmp(s, "...", 3) == 0;
-          case 4: return memcmp(s, "<it>", 4) == 0;
-          default: return false;
-        }
-      }
-
-      typedef struct {
-        const pm_parser_t *parser;
-        diff_summary_t *out;
-        size_t depth;
-      } diff_prism_ctx_t;
-
-      static void diff_prism_push_scope(const pm_parser_t *parser, diff_summary_t *out, diff_scope_kind_t kind, const pm_constant_id_list_t *list) {
-        assert(out->locals.count <= UINT32_MAX);
-        diff_scope_t sc = {.kind = (uint8_t)kind, .local_start = (uint32_t)out->locals.count, .local_count = 0};
-        for (size_t i = 0; i < list->size; i++) {
-          const pm_constant_t *c = pm_parser_constant(parser, list->ids[i]);
-          const char *ptr = (const char *)pm_constant_start(c);
-          size_t len = pm_constant_length(c);
-          if (diff_is_synthetic_local(ptr, len)) continue;
-          diff_span_vec_push(&out->locals, diff_strbuf_add(&out->strbuf, ptr, len));
-          sc.local_count++;
-        }
-        diff_scope_vec_push(&out->scopes, sc);
-      }
-
-      static void diff_prism_add_const(const pm_parser_t *parser, diff_summary_t *out, pm_constant_id_t id, diff_span_vec_t *vec) {
-        const pm_constant_t *c = pm_parser_constant(parser, id);
-        diff_span_vec_push(vec, diff_strbuf_add(&out->strbuf, (const char *)pm_constant_start(c), pm_constant_length(c)));
-      }
-
-      static pm_visit_result_t diff_prism_visit_cb(const pm_node_t *node, void *data);
-
-      static void diff_prism_visit_child(const pm_node_t *child, diff_prism_ctx_t *ctx) {
-        if (child != NULL && ctx->depth < DIFF_MAX_AST_DEPTH) pm_visit_node(child, diff_prism_visit_cb, ctx);
-      }
-
-      static pm_visit_result_t diff_prism_visit_cb(const pm_node_t *node, void *data) {
-        diff_prism_ctx_t *ctx = (diff_prism_ctx_t *)data;
-        if (ctx->depth >= DIFF_MAX_AST_DEPTH) return PM_VISIT_SKIP;
-        ctx->depth++;
-        switch (PM_NODE_TYPE(node)) {
-          case PM_PROGRAM_NODE: {
-            const pm_program_node_t *prog = (const pm_program_node_t *)node;
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_PROGRAM, &prog->locals);
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          }
-          case PM_DEF_NODE: {
-            const pm_def_node_t *def_n = (const pm_def_node_t *)node;
-            diff_prism_visit_child(def_n->receiver, ctx);
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_DEF, &def_n->locals);
-            diff_prism_add_const(ctx->parser, ctx->out, def_n->name, &ctx->out->defs);
-            if (def_n->parameters != NULL) diff_prism_visit_child(&def_n->parameters->base, ctx);
-            diff_prism_visit_child(def_n->body, ctx);
-            break;
-          }
-          case PM_CLASS_NODE: {
-            const pm_class_node_t *cls = (const pm_class_node_t *)node;
-            ctx->out->counts[DIFF_CNT_CLASS]++;
-            diff_prism_visit_child(cls->constant_path, ctx);
-            diff_prism_visit_child(cls->superclass, ctx);
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_CLASS, &cls->locals);
-            diff_prism_visit_child(cls->body, ctx);
-            break;
-          }
-          case PM_MODULE_NODE: {
-            const pm_module_node_t *mod = (const pm_module_node_t *)node;
-            ctx->out->counts[DIFF_CNT_MODULE]++;
-            diff_prism_visit_child(mod->constant_path, ctx);
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_MODULE, &mod->locals);
-            diff_prism_visit_child(mod->body, ctx);
-            break;
-          }
-          case PM_SINGLETON_CLASS_NODE: {
-            const pm_singleton_class_node_t *scls = (const pm_singleton_class_node_t *)node;
-            ctx->out->counts[DIFF_CNT_SCLASS]++;
-            diff_prism_visit_child(scls->expression, ctx);
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_SCLASS, &scls->locals);
-            diff_prism_visit_child(scls->body, ctx);
-            break;
-          }
-          case PM_FOR_NODE: {
-            const pm_for_node_t *for_n = (const pm_for_node_t *)node;
-            ctx->out->counts[DIFF_CNT_FOR]++;
-            diff_prism_visit_child(for_n->collection, ctx);
-            diff_prism_visit_child(for_n->index, ctx);
-            if (for_n->statements != NULL) diff_prism_visit_child(&for_n->statements->base, ctx);
-            break;
-          }
-          case PM_BLOCK_NODE: {
-            const pm_block_node_t *blk = (const pm_block_node_t *)node;
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_BLOCK, &blk->locals);
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          }
-          case PM_LAMBDA_NODE: {
-            const pm_lambda_node_t *lam = (const pm_lambda_node_t *)node;
-            diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_LAMBDA, &lam->locals);
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          }
-          case PM_CALL_NODE: {
-            const pm_call_node_t *call = (const pm_call_node_t *)node;
-            if (call->block != NULL && PM_NODE_TYPE_P(call->block, PM_BLOCK_NODE)) {
-              diff_prism_add_const(ctx->parser, ctx->out, call->name, &ctx->out->block_owners);
-            }
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          }
-          case PM_SUPER_NODE: {
-            const pm_super_node_t *sup = (const pm_super_node_t *)node;
-            ctx->out->counts[DIFF_CNT_SUPER]++;
-            if (sup->block != NULL && PM_NODE_TYPE_P(sup->block, PM_BLOCK_NODE)) {
-              diff_span_vec_push(&ctx->out->block_owners, diff_strbuf_add(&ctx->out->strbuf, "super", 5));
-            }
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          }
-          case PM_FORWARDING_SUPER_NODE: {
-            const pm_forwarding_super_node_t *fsup = (const pm_forwarding_super_node_t *)node;
-            ctx->out->counts[DIFF_CNT_SUPER]++;
-            if (fsup->block != NULL && PM_NODE_TYPE_P(&fsup->block->base, PM_BLOCK_NODE)) {
-              diff_span_vec_push(&ctx->out->block_owners, diff_strbuf_add(&ctx->out->strbuf, "super", 5));
-            }
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          }
-          case PM_IF_NODE:      ctx->out->counts[DIFF_CNT_IF]++;      pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_UNLESS_NODE:  ctx->out->counts[DIFF_CNT_UNLESS]++;  pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_WHILE_NODE:   ctx->out->counts[DIFF_CNT_WHILE]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_UNTIL_NODE:   ctx->out->counts[DIFF_CNT_UNTIL]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_YIELD_NODE:   ctx->out->counts[DIFF_CNT_YIELD]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_RETURN_NODE:  ctx->out->counts[DIFF_CNT_RETURN]++;  pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_DEFINED_NODE: ctx->out->counts[DIFF_CNT_DEFINED]++; pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_ALIAS_METHOD_NODE:
-          case PM_ALIAS_GLOBAL_VARIABLE_NODE:
-            ctx->out->counts[DIFF_CNT_ALIAS]++;
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-          case PM_UNDEF_NODE:   ctx->out->counts[DIFF_CNT_UNDEF]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          case PM_CASE_NODE:    ctx->out->counts[DIFF_CNT_CASE]++;    pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
-          default:
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
-            break;
-        }
-        ctx->depth--;
-        return PM_VISIT_SKIP;
-      }
-
-      static void diff_collect_prism_summary(const pm_parser_t *parser, const pm_node_t *root, diff_summary_t *out) {
-        if (root == NULL) return;
-        diff_prism_ctx_t ctx = {.parser = parser, .out = out, .depth = 0};
-        pm_visit_node(root, diff_prism_visit_cb, &ctx);
-        diff_finalize_summary(out);
-      }
-
-      static void diff_init_cruby_env(diff_cruby_env_t *env) {
-        VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
-        VALUE rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
-        env->ast_node_cls = rb_const_get(rb_mAST, rb_intern("Node"));
-        env->id_type = rb_intern("type");
-        env->id_children = rb_intern("children");
-        static const struct {
-          size_t off;
-          const char *name;
-        } map[] = {
-          {offsetof(diff_cruby_env_t, scope), "SCOPE"},     {offsetof(diff_cruby_env_t, defn), "DEFN"},
-          {offsetof(diff_cruby_env_t, defs), "DEFS"},       {offsetof(diff_cruby_env_t, cls), "CLASS"},
-          {offsetof(diff_cruby_env_t, mod), "MODULE"},      {offsetof(diff_cruby_env_t, scls), "SCLASS"},
-          {offsetof(diff_cruby_env_t, iter), "ITER"},       {offsetof(diff_cruby_env_t, lambda), "LAMBDA"},
-          {offsetof(diff_cruby_env_t, for_n), "FOR"},       {offsetof(diff_cruby_env_t, postexe), "POSTEXE"},
-          {offsetof(diff_cruby_env_t, if_n), "IF"},         {offsetof(diff_cruby_env_t, unless_n), "UNLESS"},
-          {offsetof(diff_cruby_env_t, while_n), "WHILE"},   {offsetof(diff_cruby_env_t, until_n), "UNTIL"},
-          {offsetof(diff_cruby_env_t, yield_n), "YIELD"},   {offsetof(diff_cruby_env_t, return_n), "RETURN"},
-          {offsetof(diff_cruby_env_t, break_n), "BREAK"},   {offsetof(diff_cruby_env_t, next_n), "NEXT"},
-          {offsetof(diff_cruby_env_t, super_n), "SUPER"},   {offsetof(diff_cruby_env_t, zsuper_n), "ZSUPER"},
-          {offsetof(diff_cruby_env_t, defined_n), "DEFINED"}, {offsetof(diff_cruby_env_t, alias_n), "ALIAS"},
-          {offsetof(diff_cruby_env_t, valias_n), "VALIAS"}, {offsetof(diff_cruby_env_t, undef_n), "UNDEF"},
-          {offsetof(diff_cruby_env_t, case_n), "CASE"},     {offsetof(diff_cruby_env_t, case2_n), "CASE2"},
-          {offsetof(diff_cruby_env_t, fcall), "FCALL"},     {offsetof(diff_cruby_env_t, vcall), "VCALL"},
-          {offsetof(diff_cruby_env_t, call), "CALL"},       {offsetof(diff_cruby_env_t, qcall), "QCALL"},
-          {offsetof(diff_cruby_env_t, opcall), "OPCALL"}
-        };
-        char *base = (char *)env;
-        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
-          ID id_val = rb_intern(map[i].name);
-          memcpy(base + map[i].off, &id_val, sizeof(id_val));
-        }
-      }
-
-      static bool diff_cruby_is_ast_node(const diff_cruby_env_t *env, VALUE v) {
-        return RB_TYPE_P(v, T_DATA) && rb_obj_is_kind_of(v, env->ast_node_cls);
-      }
-
-      static void diff_cruby_add_sym(VALUE sym, diff_summary_t *out, diff_span_vec_t *vec) {
-        if (!SYMBOL_P(sym)) {
-          diff_span_vec_push(vec, diff_strbuf_add(&out->strbuf, "<nil>", 5));
-          return;
-        }
-        volatile VALUE sym_str = rb_sym2str(sym);
-        if (RB_TYPE_P(sym_str, T_STRING)) {
-          diff_span_vec_push(vec, diff_strbuf_add(&out->strbuf, RSTRING_PTR(sym_str), (size_t)RSTRING_LEN(sym_str)));
-        } else {
-          diff_span_vec_push(vec, diff_strbuf_add(&out->strbuf, "<sym>", 5));
-        }
-        RB_GC_GUARD(sym_str);
-      }
-
-      static void diff_cruby_record_block_owner(const diff_cruby_env_t *env, VALUE target, diff_summary_t *out) {
-        volatile VALUE cur = target;
-        for (int hop = 0; hop < 32 && diff_cruby_is_ast_node(env, cur); hop++) {
-          volatile VALUE type_sym = rb_funcall(cur, env->id_type, 0);
-          ID tid = SYMBOL_P(type_sym) ? SYM2ID(type_sym) : 0;
-          volatile VALUE ch = rb_funcall(cur, env->id_children, 0);
-          if (!RB_TYPE_P(ch, T_ARRAY)) {
-            RB_GC_GUARD(ch);
-            RB_GC_GUARD(type_sym);
-            break;
-          }
-          long len = RARRAY_LEN(ch);
-          if ((tid == env->return_n || tid == env->break_n || tid == env->next_n) && len >= 1) {
-            cur = RARRAY_AREF(ch, 0);
-            RB_GC_GUARD(ch);
-            RB_GC_GUARD(type_sym);
-            continue;
-          }
-          if ((tid == env->fcall || tid == env->vcall) && len >= 1) {
-            diff_cruby_add_sym(RARRAY_AREF(ch, 0), out, &out->block_owners);
-          } else if ((tid == env->call || tid == env->qcall || tid == env->opcall) && len >= 2) {
-            diff_cruby_add_sym(RARRAY_AREF(ch, 1), out, &out->block_owners);
-          } else if (tid == env->super_n || tid == env->zsuper_n) {
-            diff_span_vec_push(&out->block_owners, diff_strbuf_add(&out->strbuf, "super", 5));
-          } else {
-            const char *tname = SYMBOL_P(type_sym) ? rb_id2name(tid) : "unknown";
-            diff_span_vec_push(&out->block_owners, diff_strbuf_add(&out->strbuf, tname ? tname : "unknown", tname ? strlen(tname) : 7));
-          }
-          RB_GC_GUARD(ch);
-          RB_GC_GUARD(type_sym);
-          RB_GC_GUARD(cur);
-          return;
-        }
-        diff_span_vec_push(&out->block_owners, diff_strbuf_add(&out->strbuf, "<unknown>", 9));
-        RB_GC_GUARD(cur);
-      }
-
-      static void diff_cruby_extract_scope_locals(VALUE tbl, diff_scope_kind_t kind, diff_summary_t *out) {
-        if (!RB_TYPE_P(tbl, T_ARRAY)) {
-          int t = (int)TYPE(tbl);
-          diff_summary_free(out);
-          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_tbl_type [detail: type=%d]\n", t);
-        }
-        assert(out->locals.count <= UINT32_MAX);
-        diff_scope_t sc = {.kind = (uint8_t)kind, .local_start = (uint32_t)out->locals.count, .local_count = 0};
-        long tbl_len = RARRAY_LEN(tbl);
-        for (long i = 0; i < tbl_len; i++) {
-          VALUE sym = RARRAY_AREF(tbl, i);
-          if (!SYMBOL_P(sym)) continue;
-          volatile VALUE sym_str = rb_sym2str(sym);
-          if (!RB_TYPE_P(sym_str, T_STRING)) {
-            RB_GC_GUARD(sym_str);
-            continue;
-          }
-          const char *ptr = RSTRING_PTR(sym_str);
-          size_t len = (size_t)RSTRING_LEN(sym_str);
-          if (!diff_is_synthetic_local(ptr, len)) {
-            diff_span_vec_push(&out->locals, diff_strbuf_add(&out->strbuf, ptr, len));
-            sc.local_count++;
-          }
-          RB_GC_GUARD(sym_str);
-        }
-        diff_scope_vec_push(&out->scopes, sc);
-      }
-
-      static void diff_cruby_visit_val(const diff_cruby_env_t *env, VALUE val, diff_summary_t *out, int depth);
-
-      static void diff_cruby_visit_scope_child(const diff_cruby_env_t *env, VALUE sc, int scope_kind, diff_summary_t *out, int depth) {
-        if (depth >= DIFF_MAX_AST_DEPTH) return;
-        if (!diff_cruby_is_ast_node(env, sc)) {
-          diff_cruby_visit_val(env, sc, out, depth);
-          return;
-        }
-        volatile VALUE type_sym = rb_funcall(sc, env->id_type, 0);
-        ID tid = SYMBOL_P(type_sym) ? SYM2ID(type_sym) : 0;
-        if (tid != env->scope) {
-          RB_GC_GUARD(type_sym);
-          diff_cruby_visit_val(env, sc, out, depth);
-          return;
-        }
-        volatile VALUE ch = rb_funcall(sc, env->id_children, 0);
-        if (!RB_TYPE_P(ch, T_ARRAY) || RARRAY_LEN(ch) < 1) {
-          long clen = RB_TYPE_P(ch, T_ARRAY) ? RARRAY_LEN(ch) : -1L;
-          RB_GC_GUARD(ch);
-          RB_GC_GUARD(type_sym);
-          diff_summary_free(out);
-          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_shape [detail: node=SCOPE children_len=%ld]\n", clen);
-        }
-        if (scope_kind >= 0) diff_cruby_extract_scope_locals(RARRAY_AREF(ch, 0), (diff_scope_kind_t)scope_kind, out);
-        long clen = RARRAY_LEN(ch);
-        for (long i = 1; i < clen; i++) diff_cruby_visit_val(env, RARRAY_AREF(ch, i), out, depth + 1);
-        RB_GC_GUARD(ch);
-        RB_GC_GUARD(type_sym);
-      }
-
-      static void diff_cruby_count_if_matched(const diff_cruby_env_t *env, ID tid, diff_summary_t *out) {
-        if      (tid == env->if_n)      out->counts[DIFF_CNT_IF]++;
-        else if (tid == env->unless_n)  out->counts[DIFF_CNT_UNLESS]++;
-        else if (tid == env->while_n)   out->counts[DIFF_CNT_WHILE]++;
-        else if (tid == env->until_n)   out->counts[DIFF_CNT_UNTIL]++;
-        else if (tid == env->yield_n)   out->counts[DIFF_CNT_YIELD]++;
-        else if (tid == env->return_n)  out->counts[DIFF_CNT_RETURN]++;
-        else if (tid == env->super_n || tid == env->zsuper_n) out->counts[DIFF_CNT_SUPER]++;
-        else if (tid == env->defined_n) out->counts[DIFF_CNT_DEFINED]++;
-        else if (tid == env->alias_n || tid == env->valias_n) out->counts[DIFF_CNT_ALIAS]++;
-        else if (tid == env->undef_n)   out->counts[DIFF_CNT_UNDEF]++;
-        else if (tid == env->case_n || tid == env->case2_n)   out->counts[DIFF_CNT_CASE]++;
-      }
-
-      static void diff_cruby_visit_node(const diff_cruby_env_t *env, VALUE node, diff_summary_t *out, int depth) {
-        if (depth >= DIFF_MAX_AST_DEPTH) return;
-        volatile VALUE type_sym = rb_funcall(node, env->id_type, 0);
-        ID tid = SYMBOL_P(type_sym) ? SYM2ID(type_sym) : 0;
-        volatile VALUE ch = rb_funcall(node, env->id_children, 0);
-        if (!RB_TYPE_P(ch, T_ARRAY)) {
-          const char *tname = SYMBOL_P(type_sym) ? rb_id2name(tid) : "unknown";
-          RB_GC_GUARD(ch);
-          RB_GC_GUARD(type_sym);
-          diff_summary_free(out);
-          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_shape [detail: node=%s children_len=-1]\n", tname ? tname : "unknown");
-        }
-        long len = RARRAY_LEN(ch);
-        if (tid == env->scope) {
-          diff_cruby_visit_scope_child(env, node, depth == 0 ? (int)DIFF_SCOPE_PROGRAM : -1, out, depth);
-        } else if (tid == env->defn && len >= 2) {
-          diff_cruby_add_sym(RARRAY_AREF(ch, 0), out, &out->defs);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 1), DIFF_SCOPE_DEF, out, depth + 1);
-        } else if (tid == env->defs && len >= 3) {
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 0), out, depth + 1);
-          diff_cruby_add_sym(RARRAY_AREF(ch, 1), out, &out->defs);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 2), DIFF_SCOPE_DEF, out, depth + 1);
-        } else if (tid == env->cls && len >= 3) {
-          out->counts[DIFF_CNT_CLASS]++;
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 0), out, depth + 1);
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 1), out, depth + 1);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 2), DIFF_SCOPE_CLASS, out, depth + 1);
-        } else if (tid == env->mod && len >= 2) {
-          out->counts[DIFF_CNT_MODULE]++;
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 0), out, depth + 1);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 1), DIFF_SCOPE_MODULE, out, depth + 1);
-        } else if (tid == env->scls && len >= 2) {
-          out->counts[DIFF_CNT_SCLASS]++;
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 0), out, depth + 1);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 1), DIFF_SCOPE_SCLASS, out, depth + 1);
-        } else if (tid == env->iter && len >= 2) {
-          diff_cruby_record_block_owner(env, RARRAY_AREF(ch, 0), out);
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 0), out, depth + 1);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 1), DIFF_SCOPE_BLOCK, out, depth + 1);
-        } else if (tid == env->lambda && len >= 1) {
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 0), DIFF_SCOPE_LAMBDA, out, depth + 1);
-        } else if (tid == env->for_n && len >= 2) {
-          out->counts[DIFF_CNT_FOR]++;
-          diff_cruby_visit_val(env, RARRAY_AREF(ch, 0), out, depth + 1);
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 1), -1, out, depth + 1);
-        } else if (tid == env->postexe && len >= 1) {
-          diff_cruby_visit_scope_child(env, RARRAY_AREF(ch, 0), -1, out, depth + 1);
-        } else {
-          diff_cruby_count_if_matched(env, tid, out);
-          for (long i = 0; i < len; i++) diff_cruby_visit_val(env, RARRAY_AREF(ch, i), out, depth + 1);
-        }
-        RB_GC_GUARD(ch);
-        RB_GC_GUARD(type_sym);
-      }
-
-      static void diff_cruby_visit_val(const diff_cruby_env_t *env, VALUE val, diff_summary_t *out, int depth) {
-        if (depth >= DIFF_MAX_AST_DEPTH) return;
-        if (diff_cruby_is_ast_node(env, val)) {
-          diff_cruby_visit_node(env, val, out, depth);
-        } else if (RB_TYPE_P(val, T_ARRAY)) {
-          long len = RARRAY_LEN(val);
-          for (long i = 0; i < len; i++) diff_cruby_visit_val(env, RARRAY_AREF(val, i), out, depth + 1);
-        }
-      }
-
-      static void diff_collect_cruby_summary(VALUE ast_node, diff_summary_t *out) {
-        if (NIL_P(ast_node)) return;
-        diff_cruby_env_t env;
-        diff_init_cruby_env(&env);
-        RB_GC_GUARD(env.ast_node_cls);
-        diff_cruby_visit_val(&env, ast_node, out, 0);
-        diff_finalize_summary(out);
-      }
-
-      static const char *diff_block_mismatch_sub(const char *p_ptr, size_t p_len, const char *c_ptr, size_t c_len) {
-        if ((p_len == 5 && memcmp(p_ptr, "super", 5) == 0) || (c_len == 5 && memcmp(c_ptr, "super", 5) == 0)) return "super";
-        if (p_len > 0) {
-          char p0 = p_ptr[0];
-          if (!((p0 >= 'a' && p0 <= 'z') || (p0 >= 'A' && p0 <= 'Z') || p0 == '_')) return "operator";
-        }
-        if (c_len > 0) {
-          char c0 = c_ptr[0];
-          if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_')) return "operator";
-        }
-        return "method";
-      }
-
-      static bool diff_span_equal(const char *pbuf, diff_span_t pspan, const char *cbuf, diff_span_t cspan) {
-        return pspan.length == cspan.length &&
-               (pspan.length == 0 || memcmp(pbuf + pspan.offset, cbuf + cspan.offset, pspan.length) == 0);
-      }
-
-      static size_t diff_copy_span(const char *buf, diff_span_t span, char dst[97]) {
-        size_t len = span.length > 96 ? 96 : (size_t)span.length;
-        if (len > 0) memcpy(dst, buf + span.offset, len);
-        dst[len] = '\0';
-        return len;
-      }
-
-      static void diff_compare_locals(diff_summary_t *prism, diff_summary_t *cruby) {
-        for (size_t s = 0; s < prism->scopes.count; s++) {
-          const diff_scope_t *ps = &prism->scopes.items[s];
-          const diff_scope_t *cs = &cruby->scopes.items[s];
-          const char *sname = diff_scope_kind_name((diff_scope_kind_t)ps->kind);
-          if (ps->local_count != cs->local_count) {
-            size_t pc = ps->local_count;
-            size_t cc = cs->local_count;
-            diff_summary_free(prism);
-            diff_summary_free(cruby);
-            diff_invariant_fail("INVARIANT[diff_parse_y]: kind=locals_count_mismatch scope=%s [detail: scope_idx=%zu prism=%zu cruby=%zu]\n", sname, s, pc, cc);
-          }
-          for (uint32_t j = 0; j < ps->local_count; j++) {
-            diff_span_t pspan = prism->locals.items[ps->local_start + j];
-            diff_span_t cspan = cruby->locals.items[cs->local_start + j];
-            if (!diff_span_equal(prism->strbuf.data, pspan, cruby->strbuf.data, cspan)) {
-              char pcopy[97];
-              char ccopy[97];
-              diff_copy_span(prism->strbuf.data, pspan, pcopy);
-              diff_copy_span(cruby->strbuf.data, cspan, ccopy);
-              diff_summary_free(prism);
-              diff_summary_free(cruby);
-              diff_invariant_fail("INVARIANT[diff_parse_y]: kind=locals_name_mismatch scope=%s [detail: scope_idx=%zu idx=%zu prism=%s cruby=%s]\n", sname, s, (size_t)j, pcopy, ccopy);
-            }
-          }
-        }
-      }
-
-      static void diff_compare_asts(diff_summary_t *prism, diff_summary_t *cruby) {
-        size_t common_scopes = prism->scopes.count < cruby->scopes.count ? prism->scopes.count : cruby->scopes.count;
-        for (size_t i = 0; i < common_scopes; i++) {
-          if (prism->scopes.items[i].kind != cruby->scopes.items[i].kind) {
-            const char *pk = diff_scope_kind_name((diff_scope_kind_t)prism->scopes.items[i].kind);
-            const char *ck = diff_scope_kind_name((diff_scope_kind_t)cruby->scopes.items[i].kind);
-            size_t pc = prism->scopes.count;
-            size_t cc = cruby->scopes.count;
-            diff_summary_free(prism);
-            diff_summary_free(cruby);
-            diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_scope_kind_mismatch prism=%s cruby=%s [detail: scope_idx=%zu prism_scopes=%zu cruby_scopes=%zu]\n", pk, ck, i, pc, cc);
-          }
-        }
-        if (prism->scopes.count != cruby->scopes.count) {
-          size_t pc = prism->scopes.count;
-          size_t cc = cruby->scopes.count;
-          diff_summary_free(prism);
-          diff_summary_free(cruby);
-          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_scope_count_mismatch [detail: prism=%zu cruby=%zu]\n", pc, cc);
-        }
-        diff_compare_locals(prism, cruby);
-        for (size_t k = 0; k < DIFF_CNT_LEN; k++) {
-          if (prism->counts[k] != cruby->counts[k]) {
-            size_t pc = prism->counts[k];
-            size_t cc = cruby->counts[k];
-            diff_summary_free(prism);
-            diff_summary_free(cruby);
-            diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_node_count_mismatch node=%s [detail: prism=%zu cruby=%zu]\n", diff_count_kind_name((diff_count_kind_t)k), pc, cc);
-          }
-        }
-        size_t common_defs = prism->defs.count < cruby->defs.count ? prism->defs.count : cruby->defs.count;
-        for (size_t i = 0; i < common_defs; i++) {
-          diff_span_t ps = prism->defs.items[i];
-          diff_span_t cs = cruby->defs.items[i];
-          if (!diff_span_equal(prism->strbuf.data, ps, cruby->strbuf.data, cs)) {
-            char pcopy[97];
-            char ccopy[97];
-            diff_copy_span(prism->strbuf.data, ps, pcopy);
-            diff_copy_span(cruby->strbuf.data, cs, ccopy);
-            diff_summary_free(prism);
-            diff_summary_free(cruby);
-            diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_def_name_mismatch [detail: idx=%zu prism=%s cruby=%s]\n", i, pcopy, ccopy);
-          }
-        }
-        if (prism->defs.count != cruby->defs.count) {
-          size_t pc = prism->defs.count;
-          size_t cc = cruby->defs.count;
-          diff_summary_free(prism);
-          diff_summary_free(cruby);
-          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_node_count_mismatch node=def [detail: prism=%zu cruby=%zu]\n", pc, cc);
-        }
-        if (prism->block_owners.count != cruby->block_owners.count) {
-          size_t pc = prism->block_owners.count;
-          size_t cc = cruby->block_owners.count;
-          diff_summary_free(prism);
-          diff_summary_free(cruby);
-          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=count [detail: prism=%zu cruby=%zu]\n", pc, cc);
-        }
-        for (size_t i = 0; i < prism->block_owners.count; i++) {
-          diff_span_t ps = prism->block_owners.items[i];
-          diff_span_t cs = cruby->block_owners.items[i];
-          if (!diff_span_equal(prism->strbuf.data, ps, cruby->strbuf.data, cs)) {
-            char pcopy[97];
-            char ccopy[97];
-            size_t plen = diff_copy_span(prism->strbuf.data, ps, pcopy);
-            size_t clen = diff_copy_span(cruby->strbuf.data, cs, ccopy);
-            const char *sub = diff_block_mismatch_sub(pcopy, plen, ccopy, clen);
-            diff_summary_free(prism);
-            diff_summary_free(cruby);
-            diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=%s [detail: idx=%zu prism=%s cruby=%s]\n", sub, i, pcopy, ccopy);
-          }
-        }
-      }
-    C
-  end
+  helpers = [harness_slice("diff.c", "diff_core")]
+  helpers << harness_slice("diff.c", "diff_ast") if need_ast
 
   main_lines = []
   if source.empty?
@@ -1497,9 +616,6 @@ def diff_c_program(source, crash_details, crash_output, loupe_url)
   main_lines << "pm_arena_free(arena);"
   main_lines << "pm_options_free(options);"
   main_lines << ""
-  main_lines << "int has_nul = diff_has_nul((const uint8_t *)#{source_ptr}, input_size) ? 1 : 0;"
-  main_lines << "int valid_utf8 = diff_is_valid_utf8((const uint8_t *)#{source_ptr}, input_size) ? 1 : 0;"
-  main_lines << ""
   main_lines << "RUBY_INIT_STACK;"
   main_lines << "if (ruby_setup() != 0) {"
   main_lines << '  fprintf(stderr, "ruby_setup() failed\n");'
@@ -1510,27 +626,17 @@ def diff_c_program(source, crash_details, crash_output, loupe_url)
   main_lines << "}"
   main_lines << 'char *opts[] = {(char *)"ruby", (char *)"--disable=gems", (char *)"--parser=parse.y", (char *)"-e", (char *)""};'
   main_lines << "(void)ruby_options(5, opts);"
+  main_lines << "signal(SIGABRT, SIG_DFL);"
   main_lines << 'rb_define_singleton_method(rb_const_get(rb_cObject, rb_intern("Warning")), "warn", diff_warning_warn, -1);'
   main_lines << ""
-  main_lines << "assert(input_size <= (size_t)LONG_MAX);"
-  main_lines << "volatile VALUE src_str = rb_utf8_str_new((const char *)#{source_ptr}, (long)input_size);"
-  main_lines << "free(source);"
-  main_lines << "int state = 0;"
-  main_lines << "volatile VALUE ast_node = rb_protect(diff_ast_parse_cb, src_str, &state);"
-  main_lines << "bool cruby_ok = (state == 0);"
+  main_lines << "bool cruby_ok = false;"
   main_lines << 'char exc_buf[160] = "";'
   main_lines << 'char cruby_tag[128] = "ok";'
-  main_lines << "if (!cruby_ok) {"
-  main_lines << "  VALUE err = rb_errinfo();"
-  main_lines << "  rb_set_errinfo(Qnil);"
-  main_lines << "  diff_format_exception(err, exc_buf, sizeof(exc_buf), cruby_tag, sizeof(cruby_tag));"
-  main_lines << "}"
-  main_lines << "RB_GC_GUARD(src_str);"
+  main_lines << "volatile VALUE ast_node = diff_run_cruby((const char *)#{source_ptr}, input_size, &cruby_ok, exc_buf, sizeof(exc_buf), cruby_tag, sizeof(cruby_tag));"
   main_lines << ""
   main_lines << "if (prism_ok != cruby_ok) {"
-  main_lines << '  const char *sub = prism_ok ? "prism_ok_cruby_err" : "prism_err_cruby_ok";'
   main_lines << "  diff_summary_free(&prism_ast);" if need_ast
-  main_lines << '  diff_invariant_fail("INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=%s nul=%d utf8=%d prism=%s cruby=%s [detail: prism_errs=%zu cruby=%s]\n", sub, has_nul, valid_utf8, prism_diag, cruby_ok ? "ok" : cruby_tag, prism_errs, cruby_ok ? "ok" : exc_buf);'
+  main_lines << "  diff_fail_syntax_mismatch((const uint8_t *)#{source_ptr}, input_size, prism_ok, prism_errs, prism_diag, cruby_ok, cruby_tag, exc_buf);"
   main_lines << "}"
   if need_ast
     main_lines << "if (prism_ok && cruby_ok) {"
@@ -1543,6 +649,7 @@ def diff_c_program(source, crash_details, crash_output, loupe_url)
     main_lines << "diff_summary_free(&prism_ast);"
   end
   main_lines << "RB_GC_GUARD(ast_node);"
+  main_lines << "free(source);"
   main_lines << "return 0;"
 
   sections = [
@@ -1616,7 +723,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
       option_lines << 'pm_options_filepath_set(options, "fuzz.rb");'
       if h[:shebang_callback]
         need_shebang_cb = true
-        option_lines << "pm_options_shebang_callback_set(options, shebang_cb, NULL);"
+        option_lines << "pm_options_shebang_callback_set(options, fuzz_shebang_cb, NULL);"
       end
     end
 
@@ -1654,6 +761,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   use_options = is_diff || !option_lines.empty? || h[:has_shebang_prefix]
   options_arg = use_options ? "options" : "NULL"
 
+  need_invariant_fail = plan[:need_check_node_relation_helper] || plan[:need_stream_diff_helper]
   need_assert = !source.empty? || plan[:need_assert]
   need_string = !source.empty? || plan[:need_string]
 
@@ -1661,8 +769,10 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   includes << "#include <assert.h>" if need_assert
   includes << "#include <limits.h>" if need_limits
   includes << "#include <prism.h>"
+  includes << "#include <stdarg.h>" if need_invariant_fail
   includes << "#include <stdbool.h>" if need_stdbool
   includes << "#include <stdint.h>"
+  includes << "#include <stdio.h>" if need_invariant_fail
   includes << "#include <stdlib.h>"
   includes << "#include <string.h>" if need_string
 
@@ -1675,52 +785,9 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
     C
   end
 
-  if plan[:need_stream_helpers]
-    helpers << <<~C.chomp
-      typedef struct {
-        const uint8_t *data;
-        size_t size;
-        size_t pos;
-        bool eof;
-      } mem_stream_t;
-
-      static char *mem_stream_fgets(char *buf, int n, void *vp) {
-        mem_stream_t *s = (mem_stream_t *)vp;
-        if (n <= 0) return NULL;
-        if (s->pos >= s->size) {
-          s->eof = true;
-          return NULL;
-        }
-        size_t count = 0;
-        size_t limit = (size_t)(n - 1);
-        while (count < limit && s->pos < s->size) {
-          uint8_t ch = s->data[s->pos++];
-          buf[count++] = (char)ch;
-          if (ch == '\\n') break;
-        }
-        if (count < limit && (count == 0 || buf[count - 1] != '\\n') && s->pos >= s->size) {
-          s->eof = true;
-        }
-        buf[count] = '\\0';
-        return buf;
-      }
-
-      static int mem_stream_feof(void *vp) {
-        return ((const mem_stream_t *)vp)->eof ? 1 : 0;
-      }
-    C
-  end
-
-  if need_shebang_cb
-    helpers << <<~C.chomp
-      static void shebang_cb(pm_options_t *options, const uint8_t *source, size_t length, void *data) {
-        (void)options;
-        (void)source;
-        (void)length;
-        (void)data;
-      }
-    C
-  end
+  helpers << harness_slice("parse.c", "stream_helpers") if plan[:need_stream_helpers]
+  helpers << harness_slice("parse.c", "shebang_cb") if need_shebang_cb
+  helpers << harness_slice("parse.c", "invariant_fail") if need_invariant_fail
 
   if plan[:need_check_node_helper]
     helpers << <<~C.chomp
@@ -1734,107 +801,34 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   end
 
   if plan[:need_check_node_relation_helper]
+    helpers << harness_slice("parse.c", "span_violation")
+    helpers << harness_slice("parse.c", "safe_node_name")
+    helpers << harness_slice("parse.c", "node_relations")
     helpers << <<~C.chomp
       typedef struct {
         const uint8_t *source;
         size_t parsed_size;
       } node_relation_ctx_t;
 
-      static void check_node_list_relations(
-          const pm_node_t *parent,
-          pm_location_t opening_loc,
-          pm_location_t closing_loc,
-          const pm_node_list_t *list,
-          const node_relation_ctx_t *ctx) {
-        bool opening_valid = opening_loc.length > 0 &&
-            (size_t)opening_loc.start <= ctx->parsed_size &&
-            (size_t)opening_loc.length <= ctx->parsed_size - (size_t)opening_loc.start;
-        bool closing_valid = closing_loc.length > 0 &&
-            (size_t)closing_loc.start <= ctx->parsed_size &&
-            (size_t)closing_loc.length <= ctx->parsed_size - (size_t)closing_loc.start;
-        bool is_heredoc = opening_valid && opening_loc.length >= 2 &&
-            ctx->source[opening_loc.start] == '<' && ctx->source[opening_loc.start + 1] == '<';
-        uint64_t pend = (uint64_t)parent->location.start + (uint64_t)parent->location.length;
-        uint64_t opening_end = (uint64_t)opening_loc.start + (uint64_t)opening_loc.length;
-        uint64_t prev_end = 0;
-
-        for (size_t i = 0; i < list->size; i++) {
-          const pm_node_t *child = list->nodes[i];
-          uint64_t cstart = (uint64_t)child->location.start;
-          uint64_t cend = cstart + (uint64_t)child->location.length;
-          assert(i == 0 || cstart >= prev_end);
-          if (!is_heredoc) {
-            assert(child->location.start >= parent->location.start);
-            assert(cend <= pend);
-            assert(!opening_valid || cstart >= opening_end);
-            assert(!closing_valid || cend <= (uint64_t)closing_loc.start);
-          }
-          prev_end = cend;
-        }
-      }
-
       static pm_visit_result_t check_node_relation(const pm_node_t *node, void *data) {
         const node_relation_ctx_t *ctx = (const node_relation_ctx_t *)data;
-        switch (node->type) {
-          case PM_ARRAY_NODE: {
-            const pm_array_node_t *arr = (const pm_array_node_t *)node;
-            check_node_list_relations(node, arr->opening_loc, arr->closing_loc, &arr->elements, ctx);
-            break;
-          }
-          case PM_INTERPOLATED_SYMBOL_NODE: {
-            const pm_interpolated_symbol_node_t *sym = (const pm_interpolated_symbol_node_t *)node;
-            check_node_list_relations(node, sym->opening_loc, sym->closing_loc, &sym->parts, ctx);
-            break;
-          }
-          case PM_INTERPOLATED_STRING_NODE: {
-            const pm_interpolated_string_node_t *str = (const pm_interpolated_string_node_t *)node;
-            check_node_list_relations(node, str->opening_loc, str->closing_loc, &str->parts, ctx);
-            break;
-          }
-          case PM_INTERPOLATED_X_STRING_NODE: {
-            const pm_interpolated_x_string_node_t *xstr = (const pm_interpolated_x_string_node_t *)node;
-            check_node_list_relations(node, xstr->opening_loc, xstr->closing_loc, &xstr->parts, ctx);
-            break;
-          }
-          case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE: {
-            const pm_interpolated_regular_expression_node_t *re =
-                (const pm_interpolated_regular_expression_node_t *)node;
-            check_node_list_relations(node, re->opening_loc, re->closing_loc, &re->parts, ctx);
-            break;
-          }
-          default:
-            break;
-        }
+        fuzz_check_node_relations(node, ctx->source, ctx->parsed_size);
         return PM_VISIT_DESCEND;
       }
     C
   end
 
   if plan[:need_check_recursion_depth_helper]
+    helpers << harness_slice("parse.c", "iterative_chain_node")
     helpers << <<~C.chomp
       typedef struct {
         pm_node_type_t parent_type;
         size_t depth;
       } rec_depth_ctx_t;
 
-      static bool is_iterative_chain_node(pm_node_type_t parent, pm_node_type_t child) {
-        if (parent != child) return false;
-        switch (child) {
-          case PM_CALL_NODE:
-          case PM_AND_NODE:
-          case PM_OR_NODE:
-          case PM_CONSTANT_PATH_NODE:
-          case PM_IF_NODE:
-          case PM_RESCUE_NODE:
-            return true;
-          default:
-            return false;
-        }
-      }
-
       static pm_visit_result_t check_recursion_depth(const pm_node_t *node, void *data) {
         const rec_depth_ctx_t *ctx = (const rec_depth_ctx_t *)data;
-        size_t cur_depth = ctx->depth + (is_iterative_chain_node(ctx->parent_type, node->type) ? 0u : 1u);
+        size_t cur_depth = ctx->depth + (fuzz_is_iterative_chain_node(ctx->parent_type, node->type) ? 0u : 1u);
         assert(cur_depth <= (size_t)128 * 2u + 64u);
         rec_depth_ctx_t child_ctx = {.parent_type = node->type, .depth = cur_depth};
         pm_visit_child_nodes(node, check_recursion_depth, &child_ctx);
@@ -1843,63 +837,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
     C
   end
 
-  if plan[:need_stream_diff_helper]
-    helpers << <<~C.chomp
-      static void check_stream_diff(pm_parser_t *parser, pm_node_t *node, const uint8_t *source_buf, size_t size, size_t parsed_size, const pm_options_t *options) {
-        pm_arena_t *ref_arena = pm_arena_new();
-        pm_parser_t *ref_parser = pm_parser_new(ref_arena, source_buf, size, options);
-        pm_node_t *ref_node = pm_parse(ref_parser);
-        assert((node == NULL) == (ref_node == NULL));
-
-        if (parsed_size == size) {
-          if (node != NULL) {
-            pm_buffer_t *stream_buf = pm_buffer_new();
-            pm_buffer_t *ref_buf = pm_buffer_new();
-            pm_serialize(parser, node, stream_buf);
-            pm_serialize(ref_parser, ref_node, ref_buf);
-            assert(pm_buffer_length(stream_buf) == pm_buffer_length(ref_buf));
-            assert(memcmp(pm_buffer_value(stream_buf), pm_buffer_value(ref_buf), pm_buffer_length(stream_buf)) == 0);
-            pm_buffer_free(ref_buf);
-            pm_buffer_free(stream_buf);
-          }
-        } else {
-          const pm_location_t *stream_data = pm_parser_data_loc(parser);
-          const pm_location_t *full_data = pm_parser_data_loc(ref_parser);
-          assert(stream_data->length != 0);
-          assert(full_data->length != 0 && stream_data->start == full_data->start);
-          assert(pm_parser_errors_size(parser) == pm_parser_errors_size(ref_parser));
-          assert(pm_parser_warnings_size(parser) == pm_parser_warnings_size(ref_parser));
-          if (node != NULL) {
-            pm_buffer_t *stream_pp = pm_buffer_new();
-            pm_buffer_t *ref_pp = pm_buffer_new();
-            pm_prettyprint(stream_pp, parser, node);
-            pm_prettyprint(ref_pp, ref_parser, ref_node);
-            assert(pm_buffer_length(stream_pp) == pm_buffer_length(ref_pp));
-            assert(memcmp(pm_buffer_value(stream_pp), pm_buffer_value(ref_pp), pm_buffer_length(stream_pp)) == 0);
-            pm_buffer_free(ref_pp);
-            pm_buffer_free(stream_pp);
-
-            pm_arena_t *prefix_arena = pm_arena_new();
-            pm_parser_t *prefix_parser = pm_parser_new(prefix_arena, source_buf, parsed_size, options);
-            pm_node_t *prefix_node = pm_parse(prefix_parser);
-            pm_buffer_t *stream_ser = pm_buffer_new();
-            pm_buffer_t *prefix_ser = pm_buffer_new();
-            pm_serialize(parser, node, stream_ser);
-            pm_serialize(prefix_parser, prefix_node, prefix_ser);
-            assert(pm_buffer_length(stream_ser) == pm_buffer_length(prefix_ser));
-            assert(memcmp(pm_buffer_value(stream_ser), pm_buffer_value(prefix_ser), pm_buffer_length(stream_ser)) == 0);
-            pm_buffer_free(prefix_ser);
-            pm_buffer_free(stream_ser);
-            pm_parser_free(prefix_parser);
-            pm_arena_free(prefix_arena);
-          }
-        }
-
-        pm_parser_free(ref_parser);
-        pm_arena_free(ref_arena);
-      }
-    C
-  end
+  helpers << harness_slice("parse.c", "stream_diff") if plan[:need_stream_diff_helper]
 
   main_lines = []
   if source.empty?
@@ -1920,8 +858,8 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
 
   main_lines << "pm_arena_t *arena = pm_arena_new();"
   if stream_mode
-    main_lines << "mem_stream_t stream_state = {.data = #{source_ptr}, .size = input_size, .pos = 0, .eof = false};"
-    main_lines << "pm_source_t *stream_src = pm_source_stream_new(&stream_state, mem_stream_fgets, mem_stream_feof);"
+    main_lines << "fuzz_stream_t stream_state = {.data = #{source_ptr}, .size = input_size, .pos = 0, .eof = false};"
+    main_lines << "pm_source_t *stream_src = pm_source_stream_new(&stream_state, fuzz_stream_fgets, fuzz_stream_feof);"
     main_lines << "pm_parser_t *parser = NULL;"
     if plan[:need_node]
       main_lines << "pm_node_t *node = pm_parse_stream(&parser, arena, stream_src, #{options_arg});"
@@ -1945,7 +883,12 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   end
   if plan[:need_stream_diff_helper]
     main_lines << "" if plan[:lines].empty?
-    main_lines << "check_stream_diff(parser, node, #{source_ptr}, input_size, parsed_size, #{options_arg});"
+    main_lines << "pm_buffer_t *stream_diff_buf = pm_buffer_new();"
+    main_lines << "if (node != NULL) {"
+    main_lines << "  pm_serialize(parser, node, stream_diff_buf);"
+    main_lines << "}"
+    main_lines << "fuzz_check_stream_diff(parser, node, #{source_ptr}, input_size, parsed_size, #{options_arg}, stream_diff_buf);"
+    main_lines << "pm_buffer_free(stream_diff_buf);"
   end
 
   main_lines << ""

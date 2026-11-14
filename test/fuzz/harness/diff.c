@@ -21,14 +21,307 @@
 #define FUZZ_MAX_INPUT_SIZE 1024
 #endif
 
+/* CRuby internal helpers in thread.c / vm_dump.c (not exposed in public ruby.h). */
+extern void rb_thread_stop_timer_thread(void);
+extern void rb_print_backtrace(FILE *errout);
+
+/* TRIAGE_SLICE_BEGIN(diff_core) */
+static void diff_invariant_fail(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+static void diff_invariant_fail(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fflush(stderr);
+    abort();
+}
+
+static VALUE diff_warning_warn(int argc, VALUE *argv, VALUE self) {
+    (void) argc;
+    (void) argv;
+    (void) self;
+    return Qnil;
+}
+
+static bool diff_is_valid_utf8(const uint8_t *s, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t b0 = s[i];
+        if (b0 <= 0x7F) {
+            i += 1;
+        } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+            if (i + 2 > len || (s[i + 1] & 0xC0) != 0x80) return false;
+            i += 2;
+        } else if (b0 == 0xE0) {
+            if (i + 3 > len || s[i + 1] < 0xA0 || s[i + 1] > 0xBF || (s[i + 2] & 0xC0) != 0x80) return false;
+            i += 3;
+        } else if ((b0 >= 0xE1 && b0 <= 0xEC) || (b0 >= 0xEE && b0 <= 0xEF)) {
+            if (i + 3 > len || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80) return false;
+            i += 3;
+        } else if (b0 == 0xED) {
+            if (i + 3 > len || s[i + 1] < 0x80 || s[i + 1] > 0x9F || (s[i + 2] & 0xC0) != 0x80) return false;
+            i += 3;
+        } else if (b0 == 0xF0) {
+            if (i + 4 > len || s[i + 1] < 0x90 || s[i + 1] > 0xBF || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
+            i += 4;
+        } else if (b0 >= 0xF1 && b0 <= 0xF3) {
+            if (i + 4 > len || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
+            i += 4;
+        } else if (b0 == 0xF4) {
+            if (i + 4 > len || s[i + 1] < 0x80 || s[i + 1] > 0x8F || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
+            i += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool diff_has_nul(const uint8_t *s, size_t len) {
+    return len > 0 && memchr(s, '\0', len) != NULL;
+}
+
+static bool diff_starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static void diff_sanitize_ident(const char *src, char *dst, size_t cap, const char *fallback) {
+    if (cap == 0) return;
+    size_t out = 0;
+    if (src != NULL) {
+        for (size_t i = 0; src[i] != '\0' && out + 1 < cap; i++) {
+            char c = src[i];
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+                dst[out++] = c;
+            }
+        }
+    }
+    if (out == 0) {
+        snprintf(dst, cap, "%s", fallback);
+    } else {
+        dst[out] = '\0';
+    }
+}
+
+static void diff_classify_cruby_msg(const char *cls, const char *line, char *tag_buf, size_t tag_cap) {
+    static const struct {
+        const char *prefix;
+        const char *tag;
+    } prefix_tags[] = {
+        { "unknown encoding name:",                        "unknown_encoding" },
+        { "invalid multibyte char (UTF-8)",                "invalid_multibyte_utf8" },
+        { "invalid multibyte char (US-ASCII)",             "invalid_multibyte_us_ascii" },
+        { "invalid multibyte char",                        "invalid_multibyte" },
+        { "string literal encodings differ",               "string_encodings_differ" },
+        { "invalid symbol",                                "invalid_symbol" },
+        { "premature end of char-class:",                  "regexp_char_class" },
+        { "invalid character property name",               "regexp_property" },
+        { "invalid backref number/name:",                  "regexp_backref" },
+        { "too short escape sequence:",                    "regexp_escape" },
+        { "invalid escape:",                               "regexp_escape" },
+        { "end pattern",                                   "regexp_pattern" },
+        { "empty char-class:",                             "regexp_char_class" },
+        { "target of repeat-operator",                     "regexp_repeat" },
+        { "invalid pattern in look-behind",                "regexp_lookbehind" },
+        { "unterminated string meets end of file",         "unterminated_string" },
+        { "unterminated regexp meets end of file",         "unterminated_regexp" },
+        { "can't find string \"",                          "unterminated_heredoc" },
+        { "embedded document meets end of file",           "unterminated_embdoc" },
+        { "dynamic constant assignment",                   "dynamic_constant_assign" },
+        { "formal argument cannot be",                     "invalid_formal_arg" },
+        { "duplicated argument name",                      "duplicate_arg_name" },
+        { "circular argument reference",                   "circular_arg_ref" },
+        { "Invalid break",                                 "invalid_break" },
+        { "Invalid next",                                  "invalid_next" },
+        { "Invalid redo",                                  "invalid_redo" },
+        { "Invalid retry",                                 "invalid_retry" },
+        { "Invalid yield",                                 "invalid_yield" },
+        { "numbered parameter",                            "numbered_param" },
+        { "ordinary parameter is defined",                 "ordinary_param_conflict" },
+        { "no .<digit> floating literal anymore",          "float_literal_method" },
+        { "syntax error, unexpected 'do' for block",       "unexpected_do_block" },
+        { "syntax error, unexpected '\\n'",                "unexpected_newline" }
+    };
+
+    for (size_t i = 0; i < sizeof(prefix_tags) / sizeof(prefix_tags[0]); i++) {
+        if (diff_starts_with(line, prefix_tags[i].prefix)) {
+            snprintf(tag_buf, tag_cap, "%s:%s", cls, prefix_tags[i].tag);
+            return;
+        }
+    }
+
+    if (diff_starts_with(line, "identifier ")) {
+        if (strstr(line, " is not valid to get") != NULL) {
+            snprintf(tag_buf, tag_cap, "%s:invalid_identifier_get", cls);
+            return;
+        }
+        if (strstr(line, " is not valid to set") != NULL) {
+            snprintf(tag_buf, tag_cap, "%s:invalid_identifier_set", cls);
+            return;
+        }
+    }
+
+    static const char unexpected_pfx[] = "syntax error, unexpected ";
+    if (diff_starts_with(line, unexpected_pfx)) {
+        const char *p = line + sizeof(unexpected_pfx) - 1;
+        char tok[48];
+        size_t len = 0;
+        bool has_alnum = false;
+        while (*p != '\0' && *p != ',' && len + 1 < sizeof(tok)) {
+            unsigned char ch = (unsigned char) *p++;
+            if (ch >= 'A' && ch <= 'Z') {
+                tok[len++] = (char) (ch + ('a' - 'A'));
+                has_alnum = true;
+            } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+                tok[len++] = (char) ch;
+                has_alnum = true;
+            } else if ((ch == ' ' || ch == '-' || ch == '_') && len > 0 && tok[len - 1] != '_') {
+                tok[len++] = '_';
+            }
+        }
+        while (len > 0 && tok[len - 1] == '_') {
+            len--;
+        }
+        tok[len] = '\0';
+        snprintf(tag_buf, tag_cap, "%s:unexpected_%s", cls, has_alnum ? tok : "punct");
+        return;
+    }
+
+    if (strcmp(cls, "RegexpError") == 0 || strstr(line, ": /") != NULL) {
+        snprintf(tag_buf, tag_cap, "%s:regexp_other", cls);
+        return;
+    }
+
+    snprintf(tag_buf, tag_cap, "%s:other", cls);
+}
+
+static VALUE diff_ast_parse_cb(VALUE src_str) {
+    static VALUE rb_mAST = Qnil;
+    static ID id_parse = 0;
+    if (NIL_P(rb_mAST)) {
+        VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
+        rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
+        rb_gc_register_mark_object(rb_mAST);
+        id_parse = rb_intern("parse");
+    }
+    return rb_funcall(rb_mAST, id_parse, 1, src_str);
+}
+
+static void diff_format_exception(
+    VALUE err,
+    char *exc_buf,
+    size_t exc_cap,
+    char *tag_buf,
+    size_t tag_cap
+) {
+    if (NIL_P(err)) {
+        if (exc_cap > 0) snprintf(exc_buf, exc_cap, "nil");
+        if (tag_cap > 0) snprintf(tag_buf, tag_cap, "nil");
+        return;
+    }
+
+    char cls_buf[48];
+    diff_sanitize_ident(rb_obj_classname(err), cls_buf, sizeof(cls_buf), "Exception");
+
+    static ID id_message = 0;
+    if (id_message == 0) {
+        id_message = rb_intern("message");
+    }
+    volatile VALUE msg = rb_funcall(err, id_message, 0);
+    const char *mptr = (RB_TYPE_P(msg, T_STRING) && RSTRING_LEN(msg) > 0) ? RSTRING_PTR(msg) : "";
+    long mlen = RB_TYPE_P(msg, T_STRING) ? RSTRING_LEN(msg) : 0;
+
+    char line[128];
+    long line_len = 0;
+    while (line_len < mlen && line_len < (long) (sizeof(line) - 1) &&
+           mptr[line_len] != '\n' && mptr[line_len] != '\r') {
+        line[line_len] = (mptr[line_len] != '\0') ? mptr[line_len] : ' ';
+        line_len++;
+    }
+    line[line_len] = '\0';
+
+    if (exc_cap > 0) {
+        int detail_len = (int) (line_len > 96 ? 96 : line_len);
+        snprintf(exc_buf, exc_cap, "%s: %.*s", cls_buf, detail_len, line);
+    }
+    if (tag_cap > 0) {
+        diff_classify_cruby_msg(cls_buf, line, tag_buf, tag_cap);
+    }
+    RB_GC_GUARD(msg);
+}
+
+static VALUE diff_run_cruby(
+    const char *source,
+    size_t size,
+    bool *out_ok,
+    char *exc_buf,
+    size_t exc_cap,
+    char *tag_buf,
+    size_t tag_cap
+) {
+    if (size > (size_t) LONG_MAX) {
+        abort();
+    }
+    volatile VALUE src_str = rb_utf8_str_new(source != NULL ? source : "", (long) size);
+    int state = 0;
+    volatile VALUE ast_node = rb_protect(diff_ast_parse_cb, src_str, &state);
+    if (state != 0) {
+        VALUE err = rb_errinfo();
+        rb_set_errinfo(Qnil);
+        *out_ok = false;
+        diff_format_exception(err, exc_buf, exc_cap, tag_buf, tag_cap);
+        RB_GC_GUARD(src_str);
+        return Qnil;
+    }
+
+    *out_ok = true;
+    if (exc_cap > 0) exc_buf[0] = '\0';
+    if (tag_cap > 0) snprintf(tag_buf, tag_cap, "ok");
+    RB_GC_GUARD(src_str);
+    return ast_node;
+}
+
+static void diff_fail_syntax_mismatch(
+    const uint8_t *source,
+    size_t source_size,
+    bool prism_ok,
+    size_t prism_errs,
+    const char *prism_diag,
+    bool cruby_ok,
+    const char *cruby_tag,
+    const char *exc_buf
+) __attribute__((noreturn));
+static void diff_fail_syntax_mismatch(
+    const uint8_t *source,
+    size_t source_size,
+    bool prism_ok,
+    size_t prism_errs,
+    const char *prism_diag,
+    bool cruby_ok,
+    const char *cruby_tag,
+    const char *exc_buf
+) {
+    const char *sub = prism_ok ? "prism_ok_cruby_err" : "prism_err_cruby_ok";
+    int has_nul = diff_has_nul(source, source_size) ? 1 : 0;
+    int valid_utf8 = diff_is_valid_utf8(source, source_size) ? 1 : 0;
+    diff_invariant_fail(
+        "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=%s nul=%d utf8=%d prism=%s cruby=%s [detail: prism_errs=%zu cruby=%s]\n",
+        sub,
+        has_nul,
+        valid_utf8,
+        prism_diag,
+        cruby_ok ? "ok" : cruby_tag,
+        prism_errs,
+        cruby_ok ? "ok" : exc_buf
+    );
+}
+/* TRIAGE_SLICE_END(diff_core) */
+
+/* TRIAGE_SLICE_BEGIN(diff_ast) */
 #define DIFF_STACK_STR_BYTES 1024
 #define DIFF_STACK_SPANS     32
 #define DIFF_STACK_SCOPES    16
 #define DIFF_MAX_AST_DEPTH   4096
-
-/* CRuby internal helpers in thread.c / vm_dump.c (not exposed in public ruby.h). */
-extern void rb_thread_stop_timer_thread(void);
-extern void rb_print_backtrace(FILE *errout);
 
 typedef enum {
     DIFF_SCOPE_PROGRAM = 0,
@@ -110,129 +403,24 @@ typedef struct {
     ID fcall, vcall, call, qcall, opcall;
 } diff_cruby_ids_t;
 
-static int diff_oracle_initialized = 0;
-static VALUE rb_mAST = Qnil;
 static VALUE rb_cASTNode = Qnil;
-static ID id_parse = 0;
 static ID id_children = 0;
 static ID id_type = 0;
-static ID id_message = 0;
 static diff_cruby_ids_t diff_ids;
 
-static void diff_invariant_fail(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
-static void diff_invariant_fail(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
-    fflush(stderr);
-    abort();
-}
-
-static VALUE diff_warning_warn(int argc, VALUE *argv, VALUE self) {
-    (void) argc;
-    (void) argv;
-    (void) self;
-    return Qnil;
-}
-
-static const int diff_crash_signals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGPIPE };
-static const int diff_fatal_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
-
-static void diff_write_stderr_str(const char *s, size_t len) {
-    while (len > 0) {
-        ssize_t written = write(STDERR_FILENO, s, len);
-        if (written <= 0) {
-            if (written < 0 && errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        s += written;
-        len -= (size_t) written;
-    }
-}
-
-static void diff_fatal_signal_handler(int sig) {
-    const char *msg = "CRASH[diff_parse_y]: signal=SIGNAL\n";
-    switch (sig) {
-        case SIGSEGV: msg = "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n"; break;
-        case SIGBUS:  msg = "CRASH[diff_parse_y]: signal=SIGBUS (7)\n"; break;
-        case SIGILL:  msg = "CRASH[diff_parse_y]: signal=SIGILL (4)\n"; break;
-        case SIGFPE:  msg = "CRASH[diff_parse_y]: signal=SIGFPE (8)\n"; break;
-        default:      break;
-    }
-    diff_write_stderr_str(msg, strlen(msg));
-    rb_print_backtrace(stderr);
-    fflush(stderr);
-    raise(sig);
-    _exit(128 + sig);
-}
-
-static void diff_snapshot_signals(struct sigaction saved[5]) {
-    for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
-        sigaction(diff_crash_signals[i], NULL, &saved[i]);
-    }
-}
-
-static void diff_restore_signals(const struct sigaction saved[5]) {
-    for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
-        sigaction(diff_crash_signals[i], &saved[i], NULL);
-    }
-}
-
-static void diff_install_fatal_signal_handlers(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = diff_fatal_signal_handler;
-    sigemptyset(&sa.sa_mask);
-    /* Reset to SIG_DFL on delivery so raise(sig) kills with WTERMSIG == sig and nested faults cannot loop. */
-    sa.sa_flags = SA_RESETHAND;
-    for (size_t i = 0; i < sizeof(diff_fatal_signals) / sizeof(diff_fatal_signals[0]); i++) {
-        sigaction(diff_fatal_signals[i], &sa, NULL);
-    }
-}
-
-static void diff_oracle_init(void) {
-    if (diff_oracle_initialized) {
+static void diff_ast_ids_init(void) {
+    static int initialized = 0;
+    if (initialized) {
         return;
     }
 
-    struct sigaction saved[5];
-    diff_snapshot_signals(saved);
-
-    RUBY_INIT_STACK;
-    if (ruby_setup() != 0) {
-        fprintf(stderr, "fuzz.diff: ruby_setup() failed\n");
-        abort();
-    }
-
-    // Boot Ruby prelude once (without running user code) so RubyVM::AbstractSyntaxTree.parse is loaded.
-    char *opts[] = {
-        (char *) "ruby",
-        (char *) "--disable=gems",
-        (char *) "--parser=parse.y",
-        (char *) "-e",
-        (char *) ""
-    };
-    (void) ruby_options(5, opts);
-
-    diff_restore_signals(saved);
-    diff_install_fatal_signal_handlers();
-
-    VALUE warning_mod = rb_const_get(rb_cObject, rb_intern("Warning"));
-    rb_define_singleton_method(warning_mod, "warn", diff_warning_warn, -1);
-
     VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
-    rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
-    rb_gc_register_mark_object(rb_mAST);
+    VALUE rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
     rb_cASTNode = rb_const_get(rb_mAST, rb_intern("Node"));
     rb_gc_register_mark_object(rb_cASTNode);
 
-    id_parse = rb_intern("parse");
     id_children = rb_intern("children");
     id_type = rb_intern("type");
-    id_message = rb_intern("message");
 
     static const struct {
         ID *slot;
@@ -274,8 +462,7 @@ static void diff_oracle_init(void) {
         *id_map[i].slot = rb_intern(id_map[i].name);
     }
 
-    rb_thread_stop_timer_thread();
-    diff_oracle_initialized = 1;
+    initialized = 1;
 }
 
 static const char *diff_scope_kind_name(diff_scope_kind_t kind) {
@@ -504,158 +691,6 @@ static bool diff_is_synthetic_local(const char *s, size_t len) {
     }
 }
 
-static bool diff_is_valid_utf8(const uint8_t *s, size_t len) {
-    size_t i = 0;
-    while (i < len) {
-        uint8_t b0 = s[i];
-        if (b0 <= 0x7F) {
-            i += 1;
-        } else if (b0 >= 0xC2 && b0 <= 0xDF) {
-            if (i + 2 > len || (s[i + 1] & 0xC0) != 0x80) return false;
-            i += 2;
-        } else if (b0 == 0xE0) {
-            if (i + 3 > len || s[i + 1] < 0xA0 || s[i + 1] > 0xBF || (s[i + 2] & 0xC0) != 0x80) return false;
-            i += 3;
-        } else if ((b0 >= 0xE1 && b0 <= 0xEC) || (b0 >= 0xEE && b0 <= 0xEF)) {
-            if (i + 3 > len || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80) return false;
-            i += 3;
-        } else if (b0 == 0xED) {
-            if (i + 3 > len || s[i + 1] < 0x80 || s[i + 1] > 0x9F || (s[i + 2] & 0xC0) != 0x80) return false;
-            i += 3;
-        } else if (b0 == 0xF0) {
-            if (i + 4 > len || s[i + 1] < 0x90 || s[i + 1] > 0xBF || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
-            i += 4;
-        } else if (b0 >= 0xF1 && b0 <= 0xF3) {
-            if (i + 4 > len || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
-            i += 4;
-        } else if (b0 == 0xF4) {
-            if (i + 4 > len || s[i + 1] < 0x80 || s[i + 1] > 0x8F || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return false;
-            i += 4;
-        } else {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool diff_has_nul(const uint8_t *s, size_t len) {
-    return len > 0 && memchr(s, '\0', len) != NULL;
-}
-
-static bool diff_starts_with(const char *s, const char *prefix) {
-    return strncmp(s, prefix, strlen(prefix)) == 0;
-}
-
-static void diff_sanitize_ident(const char *src, char *dst, size_t cap, const char *fallback) {
-    if (cap == 0) return;
-    size_t out = 0;
-    if (src != NULL) {
-        for (size_t i = 0; src[i] != '\0' && out + 1 < cap; i++) {
-            char c = src[i];
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
-                dst[out++] = c;
-            }
-        }
-    }
-    if (out == 0) {
-        snprintf(dst, cap, "%s", fallback);
-    } else {
-        dst[out] = '\0';
-    }
-}
-
-static void diff_classify_cruby_msg(const char *cls, const char *line, char *tag_buf, size_t tag_cap) {
-    static const struct {
-        const char *prefix;
-        const char *tag;
-    } prefix_tags[] = {
-        { "unknown encoding name:",                        "unknown_encoding" },
-        { "invalid multibyte char (UTF-8)",                "invalid_multibyte_utf8" },
-        { "invalid multibyte char (US-ASCII)",             "invalid_multibyte_us_ascii" },
-        { "invalid multibyte char",                        "invalid_multibyte" },
-        { "string literal encodings differ",               "string_encodings_differ" },
-        { "invalid symbol",                                "invalid_symbol" },
-        { "premature end of char-class:",                  "regexp_char_class" },
-        { "invalid character property name",               "regexp_property" },
-        { "invalid backref number/name:",                  "regexp_backref" },
-        { "too short escape sequence:",                    "regexp_escape" },
-        { "invalid escape:",                               "regexp_escape" },
-        { "end pattern",                                   "regexp_pattern" },
-        { "empty char-class:",                             "regexp_char_class" },
-        { "target of repeat-operator",                     "regexp_repeat" },
-        { "invalid pattern in look-behind",                "regexp_lookbehind" },
-        { "unterminated string meets end of file",         "unterminated_string" },
-        { "unterminated regexp meets end of file",         "unterminated_regexp" },
-        { "can't find string \"",                          "unterminated_heredoc" },
-        { "embedded document meets end of file",           "unterminated_embdoc" },
-        { "dynamic constant assignment",                   "dynamic_constant_assign" },
-        { "formal argument cannot be",                     "invalid_formal_arg" },
-        { "duplicated argument name",                      "duplicate_arg_name" },
-        { "circular argument reference",                   "circular_arg_ref" },
-        { "Invalid break",                                 "invalid_break" },
-        { "Invalid next",                                  "invalid_next" },
-        { "Invalid redo",                                  "invalid_redo" },
-        { "Invalid retry",                                 "invalid_retry" },
-        { "Invalid yield",                                 "invalid_yield" },
-        { "numbered parameter",                            "numbered_param" },
-        { "ordinary parameter is defined",                 "ordinary_param_conflict" },
-        { "no .<digit> floating literal anymore",          "float_literal_method" },
-        { "syntax error, unexpected 'do' for block",       "unexpected_do_block" },
-        { "syntax error, unexpected '\\n'",                "unexpected_newline" }
-    };
-
-    for (size_t i = 0; i < sizeof(prefix_tags) / sizeof(prefix_tags[0]); i++) {
-        if (diff_starts_with(line, prefix_tags[i].prefix)) {
-            snprintf(tag_buf, tag_cap, "%s:%s", cls, prefix_tags[i].tag);
-            return;
-        }
-    }
-
-    if (diff_starts_with(line, "identifier ")) {
-        if (strstr(line, " is not valid to get") != NULL) {
-            snprintf(tag_buf, tag_cap, "%s:invalid_identifier_get", cls);
-            return;
-        }
-        if (strstr(line, " is not valid to set") != NULL) {
-            snprintf(tag_buf, tag_cap, "%s:invalid_identifier_set", cls);
-            return;
-        }
-    }
-
-    static const char unexpected_pfx[] = "syntax error, unexpected ";
-    if (diff_starts_with(line, unexpected_pfx)) {
-        const char *p = line + sizeof(unexpected_pfx) - 1;
-        char tok[48];
-        size_t len = 0;
-        bool has_alnum = false;
-        while (*p != '\0' && *p != ',' && len + 1 < sizeof(tok)) {
-            unsigned char ch = (unsigned char) *p++;
-            if (ch >= 'A' && ch <= 'Z') {
-                tok[len++] = (char) (ch + ('a' - 'A'));
-                has_alnum = true;
-            } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
-                tok[len++] = (char) ch;
-                has_alnum = true;
-            } else if ((ch == ' ' || ch == '-' || ch == '_') && len > 0 && tok[len - 1] != '_') {
-                tok[len++] = '_';
-            }
-        }
-        while (len > 0 && tok[len - 1] == '_') {
-            len--;
-        }
-        tok[len] = '\0';
-        snprintf(tag_buf, tag_cap, "%s:unexpected_%s", cls, has_alnum ? tok : "punct");
-        return;
-    }
-
-    if (strcmp(cls, "RegexpError") == 0 || strstr(line, ": /") != NULL) {
-        snprintf(tag_buf, tag_cap, "%s:regexp_other", cls);
-        return;
-    }
-
-    snprintf(tag_buf, tag_cap, "%s:other", cls);
-}
-
 typedef struct {
     const pm_parser_t *parser;
     diff_summary_t *out;
@@ -836,129 +871,6 @@ static void diff_collect_prism_summary(
     diff_prism_ctx_t ctx = { .parser = parser, .out = out, .depth = 0 };
     pm_visit_node(root, diff_prism_visit_cb, &ctx);
     diff_finalize_summary(out);
-}
-
-static void diff_run_prism(
-    const uint8_t *source,
-    size_t size,
-    bool *out_ok,
-    size_t *out_err_count,
-    const char **out_first_diag,
-    diff_summary_t *out_summary
-) {
-    *out_ok = false;
-    *out_err_count = 0;
-    *out_first_diag = "ok";
-
-    uint8_t *copy = size > 0 ? (uint8_t *) malloc(size) : NULL;
-    if (size > 0 && copy == NULL) {
-        abort();
-    }
-    if (size > 0) {
-        memcpy(copy, source, size);
-    }
-    const uint8_t *source_buf = (size == 0) ? (const uint8_t *) "" : copy;
-
-    pm_options_t *options = pm_options_new();
-    if (!pm_options_version_set(options, "4.0", 3)) {
-        abort();
-    }
-
-    pm_arena_t *arena = pm_arena_new();
-    pm_parser_t *parser = pm_parser_new(arena, source_buf, size, options);
-    pm_node_t *root = pm_parse(parser);
-
-    size_t err_count = pm_parser_errors_size(parser);
-    *out_err_count = err_count;
-    *out_ok = (err_count == 0);
-
-    if (*out_ok) {
-        if (root != NULL && PM_NODE_TYPE_P(root, PM_PROGRAM_NODE)) {
-            diff_collect_prism_summary(parser, root, out_summary);
-        }
-    } else {
-        const pm_diagnostic_t *first = pm_parser_errors_first(parser);
-        *out_first_diag = (first != NULL) ? pm_diagnostic_type(first) : "error";
-    }
-
-    pm_parser_free(parser);
-    pm_arena_free(arena);
-    pm_options_free(options);
-    free(copy);
-}
-
-static VALUE diff_ast_parse_cb(VALUE src_str) {
-    return rb_funcall(rb_mAST, id_parse, 1, src_str);
-}
-
-static void diff_format_exception(
-    VALUE err,
-    char *exc_buf,
-    size_t exc_cap,
-    char *tag_buf,
-    size_t tag_cap
-) {
-    if (NIL_P(err)) {
-        if (exc_cap > 0) snprintf(exc_buf, exc_cap, "nil");
-        if (tag_cap > 0) snprintf(tag_buf, tag_cap, "nil");
-        return;
-    }
-
-    char cls_buf[48];
-    diff_sanitize_ident(rb_obj_classname(err), cls_buf, sizeof(cls_buf), "Exception");
-
-    volatile VALUE msg = rb_funcall(err, id_message, 0);
-    const char *mptr = (RB_TYPE_P(msg, T_STRING) && RSTRING_LEN(msg) > 0) ? RSTRING_PTR(msg) : "";
-    long mlen = RB_TYPE_P(msg, T_STRING) ? RSTRING_LEN(msg) : 0;
-
-    char line[128];
-    long line_len = 0;
-    while (line_len < mlen && line_len < (long) (sizeof(line) - 1) &&
-           mptr[line_len] != '\n' && mptr[line_len] != '\r') {
-        line[line_len] = (mptr[line_len] != '\0') ? mptr[line_len] : ' ';
-        line_len++;
-    }
-    line[line_len] = '\0';
-
-    if (exc_cap > 0) {
-        int detail_len = (int) (line_len > 96 ? 96 : line_len);
-        snprintf(exc_buf, exc_cap, "%s: %.*s", cls_buf, detail_len, line);
-    }
-    if (tag_cap > 0) {
-        diff_classify_cruby_msg(cls_buf, line, tag_buf, tag_cap);
-    }
-    RB_GC_GUARD(msg);
-}
-
-static VALUE diff_run_cruby(
-    const char *source,
-    size_t size,
-    bool *out_ok,
-    char *exc_buf,
-    size_t exc_cap,
-    char *tag_buf,
-    size_t tag_cap
-) {
-    if (size > (size_t) LONG_MAX) {
-        abort();
-    }
-    volatile VALUE src_str = rb_utf8_str_new(source != NULL ? source : "", (long) size);
-    int state = 0;
-    volatile VALUE ast_node = rb_protect(diff_ast_parse_cb, src_str, &state);
-    if (state != 0) {
-        VALUE err = rb_errinfo();
-        rb_set_errinfo(Qnil);
-        *out_ok = false;
-        diff_format_exception(err, exc_buf, exc_cap, tag_buf, tag_cap);
-        RB_GC_GUARD(src_str);
-        return Qnil;
-    }
-
-    *out_ok = true;
-    if (exc_cap > 0) exc_buf[0] = '\0';
-    if (tag_cap > 0) snprintf(tag_buf, tag_cap, "ok");
-    RB_GC_GUARD(src_str);
-    return ast_node;
 }
 
 static bool diff_cruby_is_ast_node(VALUE v) {
@@ -1182,6 +1094,7 @@ static void diff_collect_cruby_summary(VALUE ast_node, diff_summary_t *out) {
     if (NIL_P(ast_node)) {
         return;
     }
+    diff_ast_ids_init();
     diff_cruby_visit_val(ast_node, out, 0);
     diff_finalize_summary(out);
 }
@@ -1379,6 +1292,151 @@ static void diff_compare_asts(diff_summary_t *prism, diff_summary_t *cruby) {
         }
     }
 }
+/* TRIAGE_SLICE_END(diff_ast) */
+
+static int diff_oracle_initialized = 0;
+
+static const int diff_crash_signals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGPIPE };
+static const int diff_fatal_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+
+static void diff_write_stderr_str(const char *s, size_t len) {
+    while (len > 0) {
+        ssize_t written = write(STDERR_FILENO, s, len);
+        if (written <= 0) {
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        s += written;
+        len -= (size_t) written;
+    }
+}
+
+static void diff_fatal_signal_handler(int sig) {
+    const char *msg = "CRASH[diff_parse_y]: signal=SIGNAL\n";
+    switch (sig) {
+        case SIGSEGV: msg = "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n"; break;
+        case SIGBUS:  msg = "CRASH[diff_parse_y]: signal=SIGBUS (7)\n"; break;
+        case SIGILL:  msg = "CRASH[diff_parse_y]: signal=SIGILL (4)\n"; break;
+        case SIGFPE:  msg = "CRASH[diff_parse_y]: signal=SIGFPE (8)\n"; break;
+        default:      break;
+    }
+    diff_write_stderr_str(msg, strlen(msg));
+    rb_print_backtrace(stderr);
+    fflush(stderr);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+static void diff_snapshot_signals(struct sigaction saved[5]) {
+    for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
+        sigaction(diff_crash_signals[i], NULL, &saved[i]);
+    }
+}
+
+static void diff_restore_signals(const struct sigaction saved[5]) {
+    for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
+        sigaction(diff_crash_signals[i], &saved[i], NULL);
+    }
+}
+
+static void diff_install_fatal_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = diff_fatal_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    /* Reset to SIG_DFL on delivery so raise(sig) kills with WTERMSIG == sig and nested faults cannot loop. */
+    sa.sa_flags = SA_RESETHAND;
+    for (size_t i = 0; i < sizeof(diff_fatal_signals) / sizeof(diff_fatal_signals[0]); i++) {
+        sigaction(diff_fatal_signals[i], &sa, NULL);
+    }
+}
+
+static void diff_oracle_init(void) {
+    if (diff_oracle_initialized) {
+        return;
+    }
+
+    struct sigaction saved[5];
+    diff_snapshot_signals(saved);
+
+    RUBY_INIT_STACK;
+    if (ruby_setup() != 0) {
+        fprintf(stderr, "fuzz.diff: ruby_setup() failed\n");
+        abort();
+    }
+
+    // Boot Ruby prelude once (without running user code) so RubyVM::AbstractSyntaxTree.parse is loaded.
+    char *opts[] = {
+        (char *) "ruby",
+        (char *) "--disable=gems",
+        (char *) "--parser=parse.y",
+        (char *) "-e",
+        (char *) ""
+    };
+    (void) ruby_options(5, opts);
+
+    diff_restore_signals(saved);
+    diff_install_fatal_signal_handlers();
+
+    VALUE warning_mod = rb_const_get(rb_cObject, rb_intern("Warning"));
+    rb_define_singleton_method(warning_mod, "warn", diff_warning_warn, -1);
+
+    diff_ast_ids_init();
+
+    rb_thread_stop_timer_thread();
+    diff_oracle_initialized = 1;
+}
+
+static void diff_run_prism(
+    const uint8_t *source,
+    size_t size,
+    bool *out_ok,
+    size_t *out_err_count,
+    const char **out_first_diag,
+    diff_summary_t *out_summary
+) {
+    *out_ok = false;
+    *out_err_count = 0;
+    *out_first_diag = "ok";
+
+    uint8_t *copy = size > 0 ? (uint8_t *) malloc(size) : NULL;
+    if (size > 0 && copy == NULL) {
+        abort();
+    }
+    if (size > 0) {
+        memcpy(copy, source, size);
+    }
+    const uint8_t *source_buf = (size == 0) ? (const uint8_t *) "" : copy;
+
+    pm_options_t *options = pm_options_new();
+    if (!pm_options_version_set(options, "4.0", 3)) {
+        abort();
+    }
+
+    pm_arena_t *arena = pm_arena_new();
+    pm_parser_t *parser = pm_parser_new(arena, source_buf, size, options);
+    pm_node_t *root = pm_parse(parser);
+
+    size_t err_count = pm_parser_errors_size(parser);
+    *out_err_count = err_count;
+    *out_ok = (err_count == 0);
+
+    if (*out_ok) {
+        if (root != NULL && PM_NODE_TYPE_P(root, PM_PROGRAM_NODE)) {
+            diff_collect_prism_summary(parser, root, out_summary);
+        }
+    } else {
+        const pm_diagnostic_t *first = pm_parser_errors_first(parser);
+        *out_first_diag = (first != NULL) ? pm_diagnostic_type(first) : "error";
+    }
+
+    pm_parser_free(parser);
+    pm_arena_free(arena);
+    pm_options_free(options);
+    free(copy);
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!diff_oracle_initialized) {
@@ -1415,20 +1473,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     );
 
     if (prism_ok != cruby_ok) {
-        const char *sub = prism_ok ? "prism_ok_cruby_err" : "prism_err_cruby_ok";
-        int has_nul = diff_has_nul(source, source_size) ? 1 : 0;
-        int valid_utf8 = diff_is_valid_utf8(source, source_size) ? 1 : 0;
         diff_summary_free(&prism_ast);
-        diff_invariant_fail(
-            "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=%s nul=%d utf8=%d prism=%s cruby=%s [detail: prism_errs=%zu cruby=%s]\n",
-            sub,
-            has_nul,
-            valid_utf8,
-            prism_diag,
-            cruby_ok ? "ok" : cruby_tag,
-            prism_errs,
-            cruby_ok ? "ok" : exc_buf
-        );
+        diff_fail_syntax_mismatch(source, source_size, prism_ok, prism_errs, prism_diag, cruby_ok, cruby_tag, exc_buf);
     }
 
     if (prism_ok && cruby_ok) {
