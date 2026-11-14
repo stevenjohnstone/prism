@@ -104,6 +104,19 @@ static void diff_sanitize_ident(const char *src, char *dst, size_t cap, const ch
 }
 
 static void diff_classify_cruby_msg(const char *cls, const char *line, char *tag_buf, size_t tag_cap) {
+    /* RubyVM::InstructionSequence.compile prefixes diagnostics with "<compiled>:<line>: ". */
+    if (diff_starts_with(line, "<compiled>:")) {
+        const char *p = line + 11;
+        if (*p >= '0' && *p <= '9') {
+            while (*p >= '0' && *p <= '9') {
+                p++;
+            }
+            if (p[0] == ':' && p[1] == ' ') {
+                line = p + 2;
+            }
+        }
+    }
+
     static const struct {
         const char *prefix;
         const char *tag;
@@ -114,15 +127,54 @@ static void diff_classify_cruby_msg(const char *cls, const char *line, char *tag
         { "invalid multibyte char",                        "invalid_multibyte" },
         { "string literal encodings differ",               "string_encodings_differ" },
         { "invalid symbol",                                "invalid_symbol" },
-        { "premature end of char-class:",                  "regexp_char_class" },
+        { "premature end of char-class",                   "regexp_char_class" },
         { "invalid character property name",               "regexp_property" },
-        { "invalid backref number/name:",                  "regexp_backref" },
+        { "invalid POSIX bracket type",                    "regexp_char_class" },
+        { "char-class value at ",                          "regexp_char_class" },
+        { "unmatched range specifier in char-class",       "regexp_char_class" },
+        { "empty range in char class",                     "regexp_char_class" },
+        { "mismatch multibyte code length in char-class range", "regexp_char_class" },
+        { "too many multibyte code ranges",                "regexp_char_class" },
+        { "empty char-class",                              "regexp_char_class" },
+        { "invalid backref number",                        "regexp_backref" },
+        { "too big backref number",                        "regexp_backref" },
+        { "numbered backref/call is not allowed",          "regexp_backref" },
         { "too short escape sequence:",                    "regexp_escape" },
         { "invalid escape:",                               "regexp_escape" },
+        { "invalid meta-code syntax",                      "regexp_escape" },
+        { "invalid control-code syntax",                   "regexp_escape" },
+        { "invalid code point value",                      "regexp_escape" },
+        { "too long wide-char value",                      "regexp_escape" },
+        { "too big wide-char value",                       "regexp_escape" },
+        { "too short digits",                              "regexp_escape" },
+        { "too short multibyte code string",               "regexp_escape" },
         { "end pattern",                                   "regexp_pattern" },
-        { "empty char-class:",                             "regexp_char_class" },
+        { "unmatched close parenthesis",                   "regexp_pattern" },
+        { "invalid conditional pattern",                   "regexp_pattern" },
+        { "never ending recursion",                        "regexp_pattern" },
+        { "parse depth limit over",                        "regexp_pattern" },
+        { "too big compiled program",                      "regexp_pattern" },
+        { "too many null check",                           "regexp_pattern" },
         { "target of repeat-operator",                     "regexp_repeat" },
+        { "target of repeat operator",                     "regexp_repeat" },
+        { "nested repeat operator",                        "regexp_repeat" },
+        { "invalid repeat range",                          "regexp_repeat" },
+        { "too big number",                                "regexp_repeat" },
+        { "upper is smaller than lower in repeat range",   "regexp_repeat" },
+        { "too many range repeat",                         "regexp_repeat" },
         { "invalid pattern in look-behind",                "regexp_lookbehind" },
+        { "invalid group name",                            "regexp_group" },
+        { "invalid char in group ",                        "regexp_group" },
+        { "undefined name <",                              "regexp_group" },
+        { "undefined group <",                             "regexp_group" },
+        { "multiplex defined name <",                      "regexp_group" },
+        { "multiplex definition name <",                   "regexp_group" },
+        { "group name is empty",                           "regexp_group" },
+        { "group number is too big",                       "regexp_group" },
+        { "too many capture groups",                       "regexp_group" },
+        { "undefined group option",                        "regexp_options" },
+        { "invalid combination of options",                "regexp_options" },
+        { "not supported encoding combination",            "regexp_options" },
         { "unterminated string meets end of file",         "unterminated_string" },
         { "unterminated regexp meets end of file",         "unterminated_regexp" },
         { "can't find string \"",                          "unterminated_heredoc" },
@@ -207,6 +259,18 @@ static VALUE diff_ast_parse_cb(VALUE src_str) {
     return rb_funcall(rb_mAST, id_parse, 1, src_str);
 }
 
+static VALUE diff_iseq_compile_cb(VALUE src_str) {
+    static VALUE rb_cISeq = Qnil;
+    static ID id_compile = 0;
+    if (NIL_P(rb_cISeq)) {
+        VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
+        rb_cISeq = rb_const_get(rb_cRubyVM, rb_intern("InstructionSequence"));
+        rb_gc_register_mark_object(rb_cISeq);
+        id_compile = rb_intern("compile");
+    }
+    return rb_funcall(rb_cISeq, id_compile, 1, src_str);
+}
+
 static void diff_format_exception(
     VALUE err,
     char *exc_buf,
@@ -250,7 +314,8 @@ static void diff_format_exception(
     RB_GC_GUARD(msg);
 }
 
-static VALUE diff_run_cruby(
+static VALUE diff_run_cruby_callback(
+    VALUE (*cb)(VALUE),
     const char *source,
     size_t size,
     bool *out_ok,
@@ -264,7 +329,7 @@ static VALUE diff_run_cruby(
     }
     volatile VALUE src_str = rb_utf8_str_new(source != NULL ? source : "", (long) size);
     int state = 0;
-    volatile VALUE ast_node = rb_protect(diff_ast_parse_cb, src_str, &state);
+    volatile VALUE res = rb_protect(cb, src_str, &state);
     if (state != 0) {
         VALUE err = rb_errinfo();
         rb_set_errinfo(Qnil);
@@ -278,7 +343,32 @@ static VALUE diff_run_cruby(
     if (exc_cap > 0) exc_buf[0] = '\0';
     if (tag_cap > 0) snprintf(tag_buf, tag_cap, "ok");
     RB_GC_GUARD(src_str);
-    return ast_node;
+    return res;
+}
+
+static VALUE diff_run_cruby(
+    const char *source,
+    size_t size,
+    bool *out_ok,
+    char *exc_buf,
+    size_t exc_cap,
+    char *tag_buf,
+    size_t tag_cap
+) {
+    return diff_run_cruby_callback(diff_ast_parse_cb, source, size, out_ok, exc_buf, exc_cap, tag_buf, tag_cap);
+}
+
+static void diff_run_cruby_compile(
+    const char *source,
+    size_t size,
+    bool *out_ok,
+    char *exc_buf,
+    size_t exc_cap,
+    char *tag_buf,
+    size_t tag_cap
+) {
+    volatile VALUE iseq = diff_run_cruby_callback(diff_iseq_compile_cb, source, size, out_ok, exc_buf, exc_cap, tag_buf, tag_cap);
+    RB_GC_GUARD(iseq);
 }
 
 static void diff_fail_syntax_mismatch(
@@ -851,6 +941,16 @@ static pm_visit_result_t diff_prism_visit_cb(const pm_node_t *node, void *data) 
             break;
         case PM_UNDEF_NODE:  ctx->out->counts[DIFF_CNT_UNDEF]++;  pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
         case PM_CASE_NODE:   ctx->out->counts[DIFF_CNT_CASE]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_ERROR_RECOVERY_NODE: {
+            uint32_t start = node->location.start;
+            uint32_t length = node->location.length;
+            diff_summary_free(ctx->out);
+            diff_invariant_fail(
+                "INVARIANT[diff_parse_y]: kind=ast_zero_error_recovery [detail: start=%u length=%u]\n",
+                start,
+                length
+            );
+        }
         default:
             pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
             break;
@@ -1511,6 +1611,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         cruby_tag,
         sizeof(cruby_tag)
     );
+
+    if (!prism_ok && cruby_ok) {
+        diff_run_cruby_compile(
+            (const char *) source,
+            source_size,
+            &cruby_ok,
+            exc_buf,
+            sizeof(exc_buf),
+            cruby_tag,
+            sizeof(cruby_tag)
+        );
+    }
 
     if (prism_ok != cruby_ok) {
         diff_summary_free(&prism_ast);

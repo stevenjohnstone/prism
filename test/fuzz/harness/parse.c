@@ -480,6 +480,57 @@ typedef struct {
     bool first;
 } fuzz_comment_check_state_t;
 
+#ifndef PRISM_FUZZ_NO_DIAGNOSTIC_TYPE
+/* TRIAGE_SLICE_BEGIN(mixed_encoding_unicode_escape) */
+static bool fuzz_is_hex_digit_byte(uint8_t byte) {
+    return (byte >= '0' && byte <= '9') ||
+           (byte >= 'a' && byte <= 'f') ||
+           (byte >= 'A' && byte <= 'F');
+}
+
+/* escape_write_unicode attaches mixed_encoding to the inner hex digits of
+ * \u{...} or the uXXXX body after '\\' in \uXXXX rather than including '\\'. */
+static bool fuzz_is_unicode_escape_mixed_encoding_span(
+    const uint8_t *source,
+    uint32_t start,
+    uint32_t length
+) {
+    if (length == 0) {
+        return false;
+    }
+
+    if (length == 5 && start >= 1 && source[start - 1] == '\\' && source[start] == 'u') {
+        for (uint32_t i = 1; i < 5; i++) {
+            if (!fuzz_is_hex_digit_byte(source[start + i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    for (uint32_t i = 0; i < length; i++) {
+        if (!fuzz_is_hex_digit_byte(source[start + i])) {
+            return false;
+        }
+    }
+
+    uint32_t pos = start;
+    while (pos > 0) {
+        uint8_t prev = source[pos - 1];
+        if (fuzz_is_hex_digit_byte(prev) || prev == ' ' || prev == '\t') {
+            pos--;
+        } else if (pos >= 2 && source[pos - 2] == '\\' && prev == 'n') {
+            pos -= 2;
+        } else {
+            break;
+        }
+    }
+
+    return pos >= 3 && source[pos - 3] == '\\' && source[pos - 2] == 'u' && source[pos - 1] == '{';
+}
+/* TRIAGE_SLICE_END(mixed_encoding_unicode_escape) */
+#endif
+
 static void fuzz_check_error_diag(const pm_diagnostic_t *d, void *data) {
     const fuzz_diag_check_ctx_t *ctx = (const fuzz_diag_check_ctx_t *) data;
     fuzz_span_t loc = fuzz_loc_span(fuzz_diag_location(d), ctx->source);
@@ -518,7 +569,7 @@ static void fuzz_check_error_diag(const pm_diagnostic_t *d, void *data) {
                     break;
                 }
             }
-            if (!has_non_ascii_or_escape) {
+            if (!has_non_ascii_or_escape && !fuzz_is_unicode_escape_mixed_encoding_span(ctx->source, loc.start, loc.length)) {
                 fuzz_invariant_fail(
                     "INVARIANT[diagnostic_semantic]: type=mixed_encoding kind=wrong_byte [detail: level=%u byte=0x%02x start=%u length=%u parsed_size=%zu]\n",
                     fuzz_diag_error_level(d),
@@ -624,6 +675,59 @@ static inline const char *fuzz_safe_node_name(pm_node_type_t type) {
 
 #if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
 /* TRIAGE_SLICE_BEGIN(node_relations) */
+typedef struct {
+    uint64_t target;
+    bool match_end;
+    bool found;
+    size_t budget;
+    size_t depth;
+} fuzz_er_edge_search_t;
+
+static pm_visit_result_t fuzz_find_er_edge_cb(const pm_node_t *node, void *data) {
+    fuzz_er_edge_search_t *s = (fuzz_er_edge_search_t *) data;
+    if (s->found || s->budget == 0 || s->depth >= 256) {
+        return PM_VISIT_STOP;
+    }
+    s->budget--;
+
+    if (PM_NODE_TYPE_P(node, PM_ERROR_RECOVERY_NODE)) {
+        uint64_t edge = s->match_end
+            ? (uint64_t) node->location.start + (uint64_t) node->location.length
+            : (uint64_t) node->location.start;
+        if (edge == s->target) {
+            s->found = true;
+            return PM_VISIT_STOP;
+        }
+        return PM_VISIT_SKIP;
+    }
+
+    s->depth++;
+    pm_visit_child_nodes(node, fuzz_find_er_edge_cb, s);
+    s->depth--;
+    return PM_VISIT_SKIP;
+}
+
+/* ErrorRecoveryNode borrows unconsumed lookahead token spans (which may match
+ * a container's closing_loc or a subsequent sibling's start), so suppress
+ * list-relation failures when the offending boundary belongs to recovery. */
+static bool fuzz_node_edge_has_error_recovery(const pm_node_t *node, uint64_t target, bool match_end) {
+    if (node == NULL) {
+        return false;
+    }
+    if (PM_NODE_TYPE_P(node, PM_ERROR_RECOVERY_NODE)) {
+        return true;
+    }
+    fuzz_er_edge_search_t s = {
+        .target = target,
+        .match_end = match_end,
+        .found = false,
+        .budget = 4096,
+        .depth = 0,
+    };
+    pm_visit_child_nodes(node, fuzz_find_er_edge_cb, &s);
+    return s.found;
+}
+
 static void fuzz_check_node_list_relations(
     const pm_node_t *parent,
     pm_location_t opening_loc,
@@ -640,7 +744,7 @@ static void fuzz_check_node_list_relations(
     uint64_t pend = (uint64_t) parent_loc.start + (uint64_t) parent_loc.length;
     uint64_t opening_end = (uint64_t) opening_loc.start + (uint64_t) opening_loc.length;
 
-    bool has_prev = false;
+    const pm_node_t *prev_node = NULL;
     uint32_t prev_start = 0;
     uint32_t prev_len = 0;
     uint64_t prev_end = 0;
@@ -657,7 +761,9 @@ static void fuzz_check_node_list_relations(
         const char *child_name = fuzz_safe_node_name(child->type);
         uint64_t cend = (uint64_t) cloc.start + (uint64_t) cloc.length;
 
-        if (has_prev && (uint64_t) cloc.start < prev_end) {
+        if (prev_node != NULL && (uint64_t) cloc.start < prev_end &&
+            !fuzz_node_edge_has_error_recovery(prev_node, prev_end, true) &&
+            !fuzz_node_edge_has_error_recovery(child, (uint64_t) cloc.start, false)) {
             const char *kind = (cloc.start == prev_start && cloc.length == prev_len && prev_len > 0)
                 ? "duplicate_part"
                 : "sibling_overlap";
@@ -675,7 +781,8 @@ static void fuzz_check_node_list_relations(
         }
 
         if (!is_heredoc) {
-            if (cloc.start < parent_loc.start) {
+            if (cloc.start < parent_loc.start &&
+                !fuzz_node_edge_has_error_recovery(child, (uint64_t) cloc.start, false)) {
                 fuzz_invariant_fail(
                     "INVARIANT[node_relation]: parent=%s child=%s kind=start_after_child [detail: idx=%zu parent_start=%u child_start=%u]\n",
                     parent_name,
@@ -685,7 +792,8 @@ static void fuzz_check_node_list_relations(
                     cloc.start
                 );
             }
-            if (cend > pend) {
+            if (cend > pend &&
+                !fuzz_node_edge_has_error_recovery(child, cend, true)) {
                 fuzz_invariant_fail(
                     "INVARIANT[node_relation]: parent=%s child=%s kind=child_oob [detail: idx=%zu parent_end=%llu child_end=%llu]\n",
                     parent_name,
@@ -695,7 +803,8 @@ static void fuzz_check_node_list_relations(
                     (unsigned long long) cend
                 );
             }
-            if (opening_valid && (uint64_t) cloc.start < opening_end) {
+            if (opening_valid && (uint64_t) cloc.start < opening_end &&
+                !fuzz_node_edge_has_error_recovery(child, (uint64_t) cloc.start, false)) {
                 fuzz_invariant_fail(
                     "INVARIANT[node_relation]: parent=%s child=%s kind=child_before_opening [detail: idx=%zu opening_end=%llu child_start=%u]\n",
                     parent_name,
@@ -705,7 +814,8 @@ static void fuzz_check_node_list_relations(
                     cloc.start
                 );
             }
-            if (closing_valid && cend > (uint64_t) closing_loc.start) {
+            if (closing_valid && cend > (uint64_t) closing_loc.start &&
+                !fuzz_node_edge_has_error_recovery(child, cend, true)) {
                 fuzz_invariant_fail(
                     "INVARIANT[node_relation]: parent=%s child=%s kind=child_after_closing [detail: idx=%zu closing_start=%u child_end=%llu]\n",
                     parent_name,
@@ -717,7 +827,7 @@ static void fuzz_check_node_list_relations(
             }
         }
 
-        has_prev = true;
+        prev_node = child;
         prev_start = cloc.start;
         prev_len = cloc.length;
         prev_end = cend;
@@ -789,6 +899,8 @@ static bool fuzz_is_iterative_chain_node(pm_node_type_t parent, pm_node_type_t c
         case PM_CONSTANT_PATH_NODE:
         case PM_IF_NODE:
         case PM_RESCUE_NODE:
+        case PM_ALTERNATION_PATTERN_NODE:
+        case PM_CAPTURE_PATTERN_NODE:
             return true;
         default:
             return false;
@@ -830,13 +942,23 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
         );
     }
 
+#if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_NO_PARSER_ERRORS_SIZE)
+    if (PM_NODE_TYPE_P(node, PM_ERROR_RECOVERY_NODE) && ctx->parser != NULL && pm_parser_errors_size(ctx->parser) == 0) {
+        const char *parent_name = ctx->parent_type == 0 ? "ROOT" : fuzz_safe_node_name(ctx->parent_type);
+        fuzz_invariant_fail(
+            "INVARIANT[error_recovery]: kind=zero_errors [detail: parent=%s start=%u length=%u parsed_size=%zu]\n",
+            parent_name,
+            loc.start,
+            loc.length,
+            ctx->parsed_size
+        );
+    }
+#endif
+
 #ifdef PRISM_FUZZ_NO_VISIT_NODE
     (void) node;
     (void) ctx;
 #else
-#if !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
-    fuzz_check_node_relations(node, ctx->source, ctx->parsed_size);
-#endif
 #if !defined(PRISM_FUZZ_NO_DIAGNOSTIC_TYPE) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
     size_t cur_depth = ctx->depth + (fuzz_is_iterative_chain_node(ctx->parent_type, node->type) ? 0u : 1u);
     if (cur_depth > FUZZ_MAX_NON_ITER_DEPTH && ctx->parser != NULL && !fuzz_parser_has_depth_or_stack_error(ctx->parser)) {
@@ -859,6 +981,11 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
         .depth = cur_depth,
     };
     pm_visit_child_nodes(node, check_node_location, &child_ctx);
+#if !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
+    /* Check container relations after descendants so child node_location
+     * underflows/OOB report before parent list geometry checks. */
+    fuzz_check_node_relations(node, ctx->source, ctx->parsed_size);
+#endif
 #endif
     return PM_VISIT_SKIP;
 }
@@ -1009,10 +1136,27 @@ static inline void fuzz_buffer_reset(pm_buffer_t *buffer) {
     !defined(PRISM_FUZZ_LEGACY_NO_ARENA) && !defined(PRISM_FUZZ_LEGACY_ARENA_STRUCT) && !defined(PRISM_FUZZ_LEGACY_PARSER_INIT) && \
     !defined(PRISM_FUZZ_LEGACY_PARSER_DATA_LOC) && !defined(PRISM_FUZZ_LEGACY_BUFFER_STRUCT) && !defined(PRISM_FUZZ_NO_PARSER_ERRORS_SIZE)
 /* TRIAGE_SLICE_BEGIN(stream_diff) */
-static bool fuzz_has_eof_control_byte(const uint8_t *buf, size_t len) {
+static uint64_t fuzz_stream_node_end(const pm_node_t *node, size_t max_size) {
+#ifndef PRISM_FUZZ_POINTER_LOCATIONS
+    if (node != NULL &&
+        (size_t) node->location.start <= max_size &&
+        (size_t) node->location.length <= max_size - (size_t) node->location.start) {
+        return (uint64_t) node->location.start + (uint64_t) node->location.length;
+    }
+#else
+    (void) node;
+    (void) max_size;
+#endif
+    return 0;
+}
+
+/* Only treat \0, ^D, ^Z as having halted lexing before __END__ when the byte is
+ * at or past the last AST span end; earlier bytes (e.g., #\x00 in a comment)
+ * must not mask a spurious __END__ stop later in a string/heredoc. */
+static bool fuzz_has_eof_control_byte(const uint8_t *buf, size_t len, uint64_t ast_end) {
     for (size_t i = 0; i < len; i++) {
         uint8_t byte = buf[i];
-        if (byte == '\0' || byte == '\004' || byte == '\032') {
+        if ((byte == '\0' || byte == '\004' || byte == '\032') && (uint64_t) i + 1 >= ast_end) {
             return true;
         }
     }
@@ -1077,7 +1221,10 @@ static void fuzz_check_stream_diff(
         if (stream_data->length == 0) {
             // An early-EOF byte (\0, ^D, ^Z) stops lexing before pm_source_stream_read's __END__ marker, leaving data_loc empty on both parses.
             // pm_serialize checksums the full input buffer, so only full_data, error/warning counts, prettyprint, and prefix serialization can match here.
-            if (full_data->length != 0 || parsed_size > size || !fuzz_has_eof_control_byte(source_buf, parsed_size)) {
+            uint64_t stream_end = fuzz_stream_node_end(node, parsed_size);
+            uint64_t ref_end = fuzz_stream_node_end(ref_node, size);
+            uint64_t ast_end = stream_end > ref_end ? stream_end : ref_end;
+            if (full_data->length != 0 || parsed_size > size || !fuzz_has_eof_control_byte(source_buf, parsed_size, ast_end)) {
                 fuzz_invariant_fail(
                     "INVARIANT[stream_diff]: kind=spurious_stop [detail: parsed_size=%zu size=%zu]\n",
                     parsed_size,

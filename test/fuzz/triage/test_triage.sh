@@ -270,13 +270,27 @@ tc_node_loc_c = c_program(
   "test node loc",
   crash_output: "INVARIANT[node_location]: type=PM_CALL_NODE kind=end_oob\n"
 )
+tc_err_rec_c = c_program(
+  node_loc_in,
+  "test error recovery",
+  crash_output: "INVARIANT[error_recovery]: kind=zero_errors\n"
+)
+err_rec_fail_in = File.join(workdir, "repro_err_rec_fail.bin")
+File.binwrite(err_rec_fail_in, "\x00\x00\x03\x01module:A\nend\n".b)
+tc_err_rec_fail_c = c_program(
+  err_rec_fail_in,
+  "test error recovery fail",
+  crash_output: "INVARIANT[error_recovery]: kind=zero_errors\n"
+)
 tc_node_rel_c = c_program(
   node_loc_in,
   "test node rel",
   crash_output: "INVARIANT[node_relation]: parent=PM_INTERPOLATED_SYMBOL_NODE child=PM_STRING_NODE kind=duplicate_part\n"
 )
+diag_sem_unicode_in = File.join(workdir, "repro_diag_sem_unicode.bin")
+File.binwrite(diag_sem_unicode_in, "\x00\x00\x03\x01#encoding:ascii\n\"\\u{de}\"\n".b)
 tc_diag_sem_c = c_program(
-  node_loc_in,
+  diag_sem_unicode_in,
   "test diag semantic",
   crash_output: "INVARIANT[diagnostic_semantic]: type=mixed_encoding kind=wrong_byte\n"
 )
@@ -311,7 +325,7 @@ tc_ubsan_c = c_program(
 expected_ubsan_url = "https://stevenjohnstone.github.io/prism-loupe/?code=&san=1&ruby_ver=4.1"
 raise "expected san=1 in UBSAN Loupe URL:\n#{tc_ubsan_c}" unless tc_ubsan_c.include?("Prism Loupe: #{expected_ubsan_url}")
 
-[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c, tc_node_rel_c, tc_diag_sem_c, tc_rec_depth_c, tc_stream_diff_c].each do |src|
+[tc_nonempty_c, tc_empty_c, tc_min_oob_c, tc_stream_slow_c, tc_node_loc_c, tc_err_rec_c, tc_err_rec_fail_c, tc_node_rel_c, tc_diag_sem_c, tc_rec_depth_c, tc_stream_diff_c].each do |src|
   %w[harness( harness_parse fuzz_options_t PRISM_FUZZ_IJON prism/internal/ #ifdef\ SLOW].each do |forbidden|
     raise "forbidden harness noise #{forbidden.inspect} found in:\n#{src}" if src.include?(forbidden)
   end
@@ -327,6 +341,8 @@ File.write(File.join(workdir, "tc_empty.c"), tc_empty_c)
 File.write(File.join(workdir, "tc_min_oob.c"), tc_min_oob_c)
 File.write(File.join(workdir, "tc_stream_slow.c"), tc_stream_slow_c)
 File.write(File.join(workdir, "tc_node_loc.c"), tc_node_loc_c)
+File.write(File.join(workdir, "tc_err_rec.c"), tc_err_rec_c)
+File.write(File.join(workdir, "tc_err_rec_fail.c"), tc_err_rec_fail_c)
 File.write(File.join(workdir, "tc_node_rel.c"), tc_node_rel_c)
 File.write(File.join(workdir, "tc_diag_sem.c"), tc_diag_sem_c)
 File.write(File.join(workdir, "tc_rec_depth.c"), tc_rec_depth_c)
@@ -524,7 +540,7 @@ mkdir -p "$WORKDIR/prism_objs"
 )
 ar rcs "$WORKDIR/libprism_test.a" "$WORKDIR/prism_objs/"*.o
 
-for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_node_rel tc_diag_sem tc_rec_depth tc_stream_diff; do
+for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_err_rec tc_err_rec_fail tc_node_rel tc_diag_sem tc_rec_depth tc_stream_diff; do
     clang -O1 -c -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror \
         -fsanitize=address,undefined -Iinclude "$WORKDIR/$name.c" -o "$WORKDIR/$name.o"
     clang -fsanitize=address,undefined "$WORKDIR/$name.o" "$WORKDIR/libprism_test.a" -o "$WORKDIR/$name"
@@ -535,6 +551,12 @@ done
 "$WORKDIR/tc_min_oob"
 "$WORKDIR/tc_stream_slow"
 "$WORKDIR/tc_node_loc"
+"$WORKDIR/tc_err_rec"
+set +e
+"$WORKDIR/tc_err_rec_fail" > /dev/null 2>&1
+err_rec_rc=$?
+set -e
+[ "$err_rec_rc" -eq 134 ] || fail "expected tc_err_rec_fail to abort (134), got $err_rec_rc"
 "$WORKDIR/tc_node_rel"
 "$WORKDIR/tc_diag_sem"
 "$WORKDIR/tc_rec_depth"
@@ -585,10 +607,17 @@ File.binwrite(File.join(workdir, "sd_ctrld.bin"), "\x40\x00\x03\x01\x04\n__END__
 File.binwrite(File.join(workdir, "sd_ctrlz.bin"), "\x40\x00\x03\x01\x1a\n__END__\n ".b)
 File.binwrite(File.join(workdir, "sd_midline.bin"), "\x40\x00\x03\x01".b + ("a".b * 4095) + "__END__\n ".b)
 File.binwrite(File.join(workdir, "sd_nul_in_str_midline.bin"), "\x40\x00\x03\x01\"a\x00\"\n".b + ("x".b * 4095) + "__END__\nputs 1\n".b)
+File.binwrite(File.join(workdir, "mixed_enc_unicode_ok.bin"), "\x00\x00\x03\x01#encoding:ascii\n\"\\u{de}\"\n".b)
+File.binwrite(File.join(workdir, "rec_depth_alt_ok.bin"), "\x00\x00\x03\x01case 1; in ".b + (["a"] * 140).join("|").b + "; end\n".b)
+File.binwrite(File.join(workdir, "er_lookahead_ok.bin"), "\x00\x00\x03\x01[,\n".b)
+File.binwrite(File.join(workdir, "zero_er_fail.bin"), "\x00\x00\x03\x01module:A\nend\n".b)
 EOF
 
 for ok in sd_nul.bin sd_ctrld.bin sd_ctrlz.bin; do
     "$WORKDIR/harness_slow" "$WORKDIR/$ok" || fail "expected $ok not to trigger INVARIANT[stream_diff]"
+done
+for ok in mixed_enc_unicode_ok.bin rec_depth_alt_ok.bin er_lookahead_ok.bin; do
+    "$WORKDIR/harness_slow" "$WORKDIR/$ok" || fail "expected $ok not to trigger parse invariant"
 done
 
 set +e
@@ -596,11 +625,15 @@ set +e
 sd_midline_rc=$?
 "$WORKDIR/harness_slow" "$WORKDIR/sd_nul_in_str_midline.bin" >"$WORKDIR/sd_str.out" 2>"$WORKDIR/sd_str.err"
 sd_str_rc=$?
+"$WORKDIR/harness_slow" "$WORKDIR/zero_er_fail.bin" >"$WORKDIR/zero_er.out" 2>"$WORKDIR/zero_er.err"
+zero_er_rc=$?
 set -e
 [ "$sd_midline_rc" -ne 0 ] || fail "expected 4096B mid-line __END__ to abort"
 grep -q "INVARIANT\[stream_diff\]: kind=spurious_stop" "$WORKDIR/sd_midline.err" || fail "expected kind=spurious_stop on mid-line __END__, got: $(cat "$WORKDIR/sd_midline.err")"
 [ "$sd_str_rc" -ne 0 ] || fail "expected NUL inside string + mid-line __END__ to abort"
-grep -q "INVARIANT\[stream_diff\]: kind=ast_mismatch" "$WORKDIR/sd_str.err" || fail "expected kind=ast_mismatch on NUL-in-string + mid-line __END__, got: $(cat "$WORKDIR/sd_str.err")"
+grep -q "INVARIANT\[stream_diff\]: kind=spurious_stop" "$WORKDIR/sd_str.err" || fail "expected kind=spurious_stop on NUL-in-string + mid-line __END__, got: $(cat "$WORKDIR/sd_str.err")"
+[ "$zero_er_rc" -ne 0 ] || fail "expected module:A\\nend zero-error ErrorRecoveryNode to abort"
+grep -q "INVARIANT\[error_recovery\]: kind=zero_errors" "$WORKDIR/zero_er.err" || fail "expected kind=zero_errors on module:A\\nend, got: $(cat "$WORKDIR/zero_er.err")"
 
 FUZZ_MAX_INPUT_SIZE=8192 ruby test/fuzz/runtime/corpus.rb --no-minimize "$WORKDIR/corpus_8k" >/dev/null
 [ -f "$WORKDIR/corpus_8k/opt_stream_long_line.rb" ] || fail "expected opt_stream_long_line.rb when FUZZ_MAX_INPUT_SIZE=8192"
@@ -2317,11 +2350,23 @@ if [ -f /opt/ruby/libruby-static.a ] && [ -f /opt/ruby/parse.c ]; then
   mkdir -p "$diff_bucket"
   # Known filtered parse.y/Onigmo/NUL divergences pass verify_runner; an unfiltered
   # ast_block_owner_mismatch fails verify_runner, and valid `1 + 2` passes.
-  for filtered_src in "a[b c do end]" "/[/" $'/\x8e/' $'#coding:Window\x00-31J'; do
+  for filtered_src in "a[b c do end]" "/[/" $'/\x8e/' $'#coding:Window\x00-31J' $'/(?<\r/' "%r (#\$ " $'while def d;break end\nend '; do
     printf '\0\0\003\001%s' "$filtered_src" > "$diff_bucket/input.min"
     VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
       --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_filtered_pass.json"
   done
+  printf '\0\0\003\001module:A\nend\n' > "$diff_bucket/input.min"
+  cat > "$diff_bucket/testcase.c" << 'C'
+/*
+INVARIANT[diff_parse_y]: kind=ast_zero_error_recovery
+*/
+C
+  set +e
+  VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_zero_er_fail.json"
+  diff_zero_er_rc=$?
+  set -e
+  [ "$diff_zero_er_rc" -eq 1 ] || fail "expected verify_bucket.sh diff_parse_y ast_zero_error_recovery FAIL exit 1, got $diff_zero_er_rc"
   printf '\0\0\003\001def f\n  1.times { check 1, case 1 when 1 then return b&r do end end }\nend\n' > "$diff_bucket/input.min"
   cat > "$diff_bucket/testcase.c" << 'C'
 /*
@@ -2347,6 +2392,7 @@ workdir = ARGV.fetch(0)
   ["segv", "case;when 1;case;c;in 1;end;end", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"],
   ["inv", "a[b c do end]", "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block\n", "ABRT"],
   ["ast_block", "def f\n  1.times { check 1, case 1 when 1 then return b&r do end end }\nend\n", "INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator\n", "ABRT"],
+  ["zero_er", "module:A\nend\n", "INVARIANT[diff_parse_y]: kind=ast_zero_error_recovery\n", "ABRT"],
   ["locals_pass", "x = 1 + 2", "INVARIANT[diff_parse_y]: kind=locals_count_mismatch\n", "ABRT"],
   ["empty_pass", "", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"]
 ].each do |name, code, cout, reason|
@@ -2364,6 +2410,7 @@ EOF
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_segv/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_inv/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_ast_block/build.sh"
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_zero_er/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_locals_pass/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_empty_pass/build.sh"
 
@@ -2374,6 +2421,8 @@ EOF
   inv_rc=$?
   timeout -k 1 5 "$WORKDIR/diff_repro_ast_block/testcase" > "$WORKDIR/diff_repro_ast_block.out" 2>&1
   ast_block_rc=$?
+  timeout -k 1 5 "$WORKDIR/diff_repro_zero_er/testcase" > "$WORKDIR/diff_repro_zero_er.out" 2>&1
+  zero_er_diff_rc=$?
   set -e
   [ "$segv_rc" -eq 139 ] || fail "expected diff_repro_segv/testcase exit 139 (SIGSEGV), got $segv_rc: $(cat "$WORKDIR/diff_repro_segv.out")"
   grep -q "\[BUG\] Segmentation fault" "$WORKDIR/diff_repro_segv.out" || fail "expected CRuby bug report in diff_repro_segv output"
@@ -2381,6 +2430,8 @@ EOF
   grep -q "INVARIANT\[diff_parse_y\]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block" "$WORKDIR/diff_repro_inv.out" || fail "expected granular diff invariant in diff_repro_inv output"
   [ "$ast_block_rc" -eq 134 ] || fail "expected diff_repro_ast_block/testcase exit 134 (SIGABRT), got $ast_block_rc: $(cat "$WORKDIR/diff_repro_ast_block.out")"
   grep -q "INVARIANT\[diff_parse_y\]: kind=ast_block_owner_mismatch sub=operator" "$WORKDIR/diff_repro_ast_block.out" || fail "expected ast_block_owner_mismatch invariant in diff_repro_ast_block output"
+  [ "$zero_er_diff_rc" -eq 134 ] || fail "expected diff_repro_zero_er/testcase exit 134 (SIGABRT), got $zero_er_diff_rc: $(cat "$WORKDIR/diff_repro_zero_er.out")"
+  grep -q "INVARIANT\[diff_parse_y\]: kind=ast_zero_error_recovery" "$WORKDIR/diff_repro_zero_er.out" || fail "expected ast_zero_error_recovery invariant in diff_repro_zero_er output"
   "$WORKDIR/diff_repro_locals_pass/testcase"
   "$WORKDIR/diff_repro_empty_pass/testcase"
 

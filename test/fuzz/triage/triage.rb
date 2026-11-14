@@ -375,8 +375,10 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     need_node: false,
     need_parsed_size: false,
     need_check_node_helper: false,
+    need_check_error_recovery_helper: false,
     need_check_node_relation_helper: false,
     need_check_recursion_depth_helper: false,
+    need_mixed_encoding_helper: false,
     need_stream_diff_helper: false,
     need_stream_helpers: stream_mode,
     need_assert: false,
@@ -413,6 +415,15 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_check_node_helper] = true
     plan[:need_assert] = true
     plan[:lines] = ["pm_visit_node(node, check_node_location, &parsed_size);"]
+  elsif crash_output.include?("INVARIANT[error_recovery]:")
+    plan[:need_node] = true
+    plan[:need_check_error_recovery_helper] = true
+    plan[:need_assert] = true
+    plan[:lines] = [
+      "if (pm_parser_errors_size(parser) == 0) {",
+      "  pm_visit_node(node, check_zero_errors_no_error_recovery, NULL);",
+      "}"
+    ]
   elsif crash_output.include?("INVARIANT[node_relation]:")
     plan[:need_node] = true
     plan[:need_parsed_size] = true
@@ -444,6 +455,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     ]
   elsif crash_output.include?("INVARIANT[diagnostic_semantic]:")
     plan[:need_parsed_size] = true
+    plan[:need_mixed_encoding_helper] = true
     plan[:need_assert] = true
     plan[:need_stdbool] = true
     plan[:need_string] = true
@@ -461,6 +473,9 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
       "        has_non_ascii_or_escape = true;",
       "        break;",
       "      }",
+      "    }",
+      "    if (!has_non_ascii_or_escape) {",
+      "      has_non_ascii_or_escape = fuzz_is_unicode_escape_mixed_encoding_span(#{source_ptr}, loc.start, loc.length);",
       "    }",
       "    assert(has_non_ascii_or_escape);",
       "  } else if (strcmp(diag_type, \"escape_invalid_unicode_literal\") == 0) {",
@@ -650,6 +665,9 @@ def diff_c_program(source, crash_details, crash_output, loupe_url)
   main_lines << 'char cruby_tag[128] = "ok";'
   main_lines << "volatile VALUE ast_node = diff_run_cruby((const char *)#{source_ptr}, input_size, &cruby_ok, exc_buf, sizeof(exc_buf), cruby_tag, sizeof(cruby_tag));"
   main_lines << ""
+  main_lines << "if (!prism_ok && cruby_ok) {"
+  main_lines << "  diff_run_cruby_compile((const char *)#{source_ptr}, input_size, &cruby_ok, exc_buf, sizeof(exc_buf), cruby_tag, sizeof(cruby_tag));"
+  main_lines << "}"
   main_lines << "if (prism_ok != cruby_ok) {"
   main_lines << "  diff_summary_free(&prism_ast);" if need_ast
   main_lines << "  diff_fail_syntax_mismatch((const uint8_t *)#{source_ptr}, input_size, prism_ok, prism_errs, prism_diag, cruby_ok, cruby_tag, exc_buf);"
@@ -804,6 +822,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   helpers << harness_slice("parse.c", "stream_helpers") if plan[:need_stream_helpers]
   helpers << harness_slice("parse.c", "shebang_cb") if need_shebang_cb
   helpers << harness_slice("parse.c", "invariant_fail") if need_invariant_fail
+  helpers << harness_slice("parse.c", "mixed_encoding_unicode_escape") if plan[:need_mixed_encoding_helper]
 
   if plan[:need_check_node_helper]
     helpers << <<~C.chomp
@@ -811,6 +830,16 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
         size_t parsed_size = *(const size_t *)data;
         assert((size_t)node->location.start <= parsed_size);
         assert((size_t)node->location.length <= parsed_size - (size_t)node->location.start);
+        return PM_VISIT_DESCEND;
+      }
+    C
+  end
+
+  if plan[:need_check_error_recovery_helper]
+    helpers << <<~C.chomp
+      static pm_visit_result_t check_zero_errors_no_error_recovery(const pm_node_t *node, void *data) {
+        (void)data;
+        assert(node->type != PM_ERROR_RECOVERY_NODE);
         return PM_VISIT_DESCEND;
       }
     C
@@ -828,8 +857,9 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
 
       static pm_visit_result_t check_node_relation(const pm_node_t *node, void *data) {
         const node_relation_ctx_t *ctx = (const node_relation_ctx_t *)data;
+        pm_visit_child_nodes(node, check_node_relation, data);
         fuzz_check_node_relations(node, ctx->source, ctx->parsed_size);
-        return PM_VISIT_DESCEND;
+        return PM_VISIT_SKIP;
       }
     C
   end
