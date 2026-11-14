@@ -127,13 +127,15 @@ if [ -z "$PROFILE" ]; then
       PROFILE="xallocator"
     elif [ -f "$BUCKET_DIR/meta.json" ] && grep -q -- '"verify_profile":[[:space:]]*"diff_parse_y"' "$BUCKET_DIR/meta.json" 2>/dev/null; then
       PROFILE="diff_parse_y"
-    elif [ -f "$BUCKET_DIR/testcase.c" ] && grep -q -- "INVARIANT\\[diff_parse_y\\]" "$BUCKET_DIR/testcase.c" 2>/dev/null; then
+    elif [ -f "$BUCKET_DIR/testcase.c" ] && grep -qE -- '(INVARIANT|CRASH)\[diff_parse_y\]|#include <ruby\.h>' "$BUCKET_DIR/testcase.c" 2>/dev/null; then
       PROFILE="diff_parse_y"
     elif [ -f "$BUCKET_DIR/build.sh" ]; then
       if grep -q -- "-fsanitize=memory" "$BUCKET_DIR/build.sh" 2>/dev/null; then
         PROFILE="msan_slow"
       elif grep -q -- "-fsanitize=leak" "$BUCKET_DIR/build.sh" 2>/dev/null; then
         PROFILE="lsan_slow"
+      elif grep -q -- "build_diff\.sh" "$BUCKET_DIR/build.sh" 2>/dev/null; then
+        PROFILE="diff_parse_y"
       elif grep -q -- "-DSLOW" "$BUCKET_DIR/build.sh" 2>/dev/null; then
         PROFILE="asan_ubsan_slow"
       else

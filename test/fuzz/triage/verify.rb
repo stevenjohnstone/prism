@@ -62,6 +62,7 @@ def infer_bucket_profile(bucket_dir, meta)
     text = File.read(build_sh)
     return "msan_slow" if text.include?("-fsanitize=memory")
     return "lsan_slow" if text.include?("-fsanitize=leak")
+    return "diff_parse_y" if text.include?("build_diff.sh")
     return "asan_ubsan_slow" if text.include?("-DSLOW")
   end
 

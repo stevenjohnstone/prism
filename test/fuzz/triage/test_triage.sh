@@ -410,18 +410,45 @@ raise "expected nil when stream bit unset" unless normalize_ijon_crash_bytes("\x
 raise "expected stream bit cleared" unless normalize_ijon_crash_bytes("\x6a\x11\x22\x33abc".b) == "\x2a\x11\x22\x33abc".b
 
 diff_inv = "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err [detail: prism_errs=0 cruby=SyntaxError]\n"
+diff_crash = "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n" \
+             "/prism/build/fuzz.diff(rb_print_backtrace+0x28) [0xaaaa0800] /opt/ruby/vm_dump.c:1108\n" \
+             "/prism/build/fuzz.diff(diff_fatal_signal_handler+0x4c) [0xaaaa1000] /prism/test/fuzz/harness/diff.c:96\n" \
+             "linux-vdso.so.1(__kernel_rt_sigreturn+0x0) [0xffff0000]\n" \
+             "/prism/build/fuzz.diff(rb_st_free_table+0x14) [0xaaaa2000] /opt/ruby/st.c:667\n" \
+             "/prism/build/fuzz.diff(ruby_yyparse+0x40) [0xaaaa3000] /prism/parse.y:4532\n" \
+             "/prism/build/fuzz.diff(ast_s_parse) /opt/ruby/ast.c:135\n"
 raise "expected diff_parse_y profile for fuzz.diff" unless bucket_verify_profile(reason: "ABRT", executable: "./build/fuzz.diff") == "diff_parse_y"
 raise "expected diff_parse_y profile for INVARIANT[diff_parse_y]" unless bucket_verify_profile(reason: "ABRT", executable: "./build/fuzz", crash_output: diff_inv) == "diff_parse_y"
+raise "expected diff_parse_y profile for CRASH[diff_parse_y]" unless bucket_verify_profile(reason: "SEGV", executable: "./build/fuzz", crash_output: diff_crash) == "diff_parse_y"
 diff_build = build_script(stream_slow_in, crash_output: diff_inv, reason: "ABRT", executable: "./build/fuzz.diff")
 raise "diff build.sh unexpected flags:\n#{diff_build}" if diff_build.include?("-DPRISM_DEPTH_MAXIMUM=128") || diff_build.include?("-DSLOW") || diff_build.include?("-DPM_ARENA_INITIAL_SIZE=0")
+raise "expected diff build.sh to invoke build_diff.sh --mode testcase:\n#{diff_build}" unless diff_build.include?("build_diff.sh") && diff_build.include?("--mode testcase") && diff_build.include?("--cflag")
 diff_tc = c_program(stream_slow_in, "test diff", crash_output: diff_inv, reason: "ABRT", executable: "./build/fuzz.diff")
-raise "diff testcase.c unexpected content:\n#{diff_tc}" unless diff_tc.include?('pm_options_version_set(options, "4.0", 3);') && diff_tc.include?("ruby_ver=4.0") && !diff_tc.include?("pm_parse_stream")
+raise "diff testcase.c unexpected content:\n#{diff_tc}" unless diff_tc.include?('pm_options_version_set(options, "4.0", 3);') && diff_tc.include?("ruby_ver=4.0") && !diff_tc.include?("pm_parse_stream") && diff_tc.include?("#include <ruby.h>") && diff_tc.include?("signal(SIGABRT, SIG_DFL)") && !diff_tc.include?("diff_compare_locals")
+diff_locals_tc = c_program(stream_slow_in, "test diff locals", crash_output: "INVARIANT[diff_parse_y]: kind=locals_count_mismatch [detail: prism=1 cruby=0]\n", reason: "ABRT", executable: "./build/fuzz.diff")
+raise "expected locals helper in diff_locals_tc:\n#{diff_locals_tc}" unless diff_locals_tc.include?("diff_compare_locals")
+diff_empty_tc = c_program(empty_in, "test diff empty", crash_output: diff_crash, reason: "SEGV", executable: "./build/fuzz.diff")
+raise "expected source_buf for empty diff input:\n#{diff_empty_tc}" unless diff_empty_tc.include?("source_buf") && diff_empty_tc.include?("input_size = 0")
 diff_io = input_and_options_metadata(stream_slow_in, reason: "ABRT", crash_output: diff_inv, executable: "./build/fuzz.diff")
 raise "diff io meta unexpected: #{diff_io["options"].inspect}" unless diff_io.dig("options", "ruby_version") == "4.0" && diff_io.dig("options", "stream_mode") == false
 parsed_diff = parse_crash_output(diff_inv)
 raise "unexpected diff invariant parse: #{parsed_diff.inspect}" unless parsed_diff.dig("symptom", "invariant", "namespace") == "diff_parse_y" &&
                                                                        parsed_diff.dig("symptom", "invariant", "fields", "kind") == "syntax_mismatch" &&
                                                                        parsed_diff.dig("symptom", "invariant", "fields", "sub") == "prism_ok_cruby_err"
+parsed_diff_crash = parse_crash_output(diff_crash)
+raise "unexpected diff crash parse: #{parsed_diff_crash.inspect}" unless parsed_diff_crash.dig("symptom", "headline") == "CRASH[diff_parse_y]: signal=SIGSEGV (11)" &&
+                                                                         parsed_diff_crash["frames"].size == 6 &&
+                                                                         parsed_diff_crash["frames"][1]["scope"] == "harness" &&
+                                                                         parsed_diff_crash["frames"][2]["func"] == "__kernel_rt_sigreturn" &&
+                                                                         parsed_diff_crash["frames"][3]["func"] == "rb_st_free_table" &&
+                                                                         parsed_diff_crash["frames"][3]["file"] == "/opt/ruby/st.c" &&
+                                                                         parsed_diff_crash["frames"][3]["line"] == 667 &&
+                                                                         parsed_diff_crash["frames"][4]["func"] == "ruby_yyparse" &&
+                                                                         parsed_diff_crash["frames"][4]["file"] == "parse.y" &&
+                                                                         parsed_diff_crash["frames"][4]["line"] == 4532 &&
+                                                                         parsed_diff_crash["frames"][5]["func"] == "ast_s_parse" &&
+                                                                         parsed_diff_crash["frames"][5]["file"] == "/opt/ruby/ast.c" &&
+                                                                         parsed_diff_crash["frames"][5]["line"] == 135
 
 parsed_inv = parse_crash_output(
   "Reading 11 bytes from x\n" \
@@ -1005,6 +1032,27 @@ t_mod.define_singleton_method(:run_testcase) do |exe, _input|
 end
 slow_res = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.slow")
 raise "expected ./build/fuzz.slow slow-only crash to keep ./build/fuzz.slow: #{slow_res.inspect}" unless slow_res[:executable] == "./build/fuzz.slow" && slow_res[:reason] == "signed-integer-overflow"
+
+t_mod.define_singleton_method(:run_testcase) do |exe, _input|
+  if exe == "./build/fuzz"
+    ["", false, false]
+  else
+    ["CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(rb_st_free_table+0x14) [0x1] /opt/ruby/st.c:667\n", true, false]
+  end
+end
+diff_crash_res = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.diff")
+raise "expected ./build/fuzz.diff CRASH[diff_parse_y] to classify as SEGV: #{diff_crash_res.inspect}" unless diff_crash_res[:executable] == "./build/fuzz.diff" && diff_crash_res[:reason] == "SEGV"
+
+workdir = File.dirname(slow_dir)
+real_segv_src = File.join(workdir, "real_segv.c")
+real_segv_bin = File.join(workdir, "real_segv")
+File.write(real_segv_src, "#include <signal.h>\nint main(void) { raise(SIGSEGV); return 0; }\n")
+system("clang", real_segv_src, "-o", real_segv_bin) || raise("failed to compile real_segv helper")
+t_sig_mod = Module.new
+t_sig_mod.module_eval(t_code, File.expand_path("test/fuzz/triage/triage.rb"))
+t_sig_mod.extend(t_sig_mod)
+silent_segv_res = t_sig_mod.classify_crash_execution("crashes", "/tmp/in", real_segv_bin)
+raise "expected silent SIGSEGV executable to classify as SEGV: #{silent_segv_res.inspect}" unless silent_segv_res[:reason] == "SEGV" && silent_segv_res[:crashed]
 EOF
 
 # 2) Deterministic verify.sh + verify.rb PARTIAL-fix & survivor extraction check.
@@ -2190,15 +2238,17 @@ ds3=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_err_cruby_
 [ "$ds1" = "$ds2" ] || fail "expected identical diff signature across details, got $ds1 vs $ds2"
 [ "$ds1" != "$ds3" ] || fail "expected distinct diff signatures across sub kinds ($ds1 == $ds3)"
 
+dc1=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(diff_fatal_signal_handler+0x4c) [0xaaaa1000] /prism/test/fuzz/harness/diff.c:96\nlinux-vdso.so.1(__kernel_rt_sigreturn+0x0) [0xffff0000]\n/prism/build/fuzz.diff(rb_st_free_table+0x14) [0xaaaa2000] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
+dc2=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/other/build/fuzz.diff(diff_fatal_signal_handler+0x99) [0xbbbb1000] /other/test/fuzz/harness/diff.c:96\n/other/build/fuzz.diff(rb_st_free_table+0x28) [0xbbbb2000] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
+dc3=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(other_cruby_fn+0x10) [0xaaaa3000] /opt/ruby/parse.y:999\n' | ./test/fuzz/triage/signature.sh)
+[ "$dc1" = "$dc2" ] || fail "expected identical diff crash signature across ASLR/paths, got $dc1 vs $dc2"
+[ "$dc1" != "$dc3" ] || fail "expected distinct diff crash signatures for distinct frames ($dc1 == $dc3)"
+
 if [ -f /opt/ruby/libruby-static.a ] && [ -f /opt/ruby/parse.c ]; then
   diff_bucket="$WORKDIR/diff_triage_test/ABRT/diff_bucket"
   mkdir -p "$diff_bucket"
-  python3 - "$diff_bucket" << 'PY'
-import os, sys
-bdir = sys.argv[1]
-# Fixed known 4.0.9 parse.y divergence (`3.4-4.0/command_call_do_block_in_index_arguments`) fails verify_runner; valid `1 + 2` passes.
-open(os.path.join(bdir, "input.min"), "wb").write(b"\x00\x00\x03\x01a[b c do end]")
-PY
+  # Fixed known 4.0.9 parse.y divergence (`3.4-4.0/command_call_do_block_in_index_arguments`) fails verify_runner; valid `1 + 2` passes.
+  printf '\0\0\003\001%s' "a[b c do end]" > "$diff_bucket/input.min"
   cat > "$diff_bucket/testcase.c" << 'C'
 /*
 INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err
@@ -2210,13 +2260,56 @@ C
   diff_fail_rc=$?
   set -e
   [ "$diff_fail_rc" -eq 1 ] || fail "expected verify_bucket.sh diff_parse_y FAIL exit 1, got $diff_fail_rc"
-  python3 - "$diff_bucket/input.min" << 'PY'
-import sys
-open(sys.argv[1], "wb").write(b"\x00\x00\x03\x011 + 2")
-PY
+  printf '\0\0\003\001%s' "1 + 2" > "$diff_bucket/input.min"
   VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
     --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_pass.json"
-  echo "  differential diff_parse_y verify_bucket.sh checks passed"
+
+  ruby - "$WORKDIR" << 'EOF'
+ENV["TRIAGE_LIB_ONLY"] = "1"
+load "./test/fuzz/triage/triage.rb"
+workdir = ARGV.fetch(0)
+
+[
+  ["segv", "case;when 1;case;c;in 1;end;end", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"],
+  ["inv", "a[b c do end]", "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err\n", "ABRT"],
+  ["locals_pass", "x = 1 + 2", "INVARIANT[diff_parse_y]: kind=locals_count_mismatch\n", "ABRT"],
+  ["empty_pass", "", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"]
+].each do |name, code, cout, reason|
+  dir = File.join(workdir, "diff_repro_#{name}")
+  FileUtils.mkdir_p(dir)
+  in_path = File.join(dir, "input.min")
+  File.binwrite(in_path, "\x00\x00\x03\x01".b + code.b)
+  File.write(File.join(dir, "testcase.c"), c_program(in_path, "test #{name}\n#{cout}", crash_output: cout, reason: reason, executable: "./build/fuzz.diff"))
+  bpath = File.join(dir, "build.sh")
+  File.write(bpath, build_script(in_path, crash_output: cout, reason: reason, executable: "./build/fuzz.diff"))
+  File.chmod(0o755, bpath)
+end
+EOF
+
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_segv/build.sh"
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_inv/build.sh"
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_locals_pass/build.sh"
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_empty_pass/build.sh"
+
+  set +e
+  timeout -k 1 5 "$WORKDIR/diff_repro_segv/testcase" > "$WORKDIR/diff_repro_segv.out" 2>&1
+  segv_rc=$?
+  timeout -k 1 5 "$WORKDIR/diff_repro_inv/testcase" > "$WORKDIR/diff_repro_inv.out" 2>&1
+  inv_rc=$?
+  set -e
+  [ "$segv_rc" -eq 139 ] || fail "expected diff_repro_segv/testcase exit 139 (SIGSEGV), got $segv_rc: $(cat "$WORKDIR/diff_repro_segv.out")"
+  grep -q "\[BUG\] Segmentation fault" "$WORKDIR/diff_repro_segv.out" || fail "expected CRuby bug report in diff_repro_segv output"
+  [ "$inv_rc" -eq 134 ] || fail "expected diff_repro_inv/testcase exit 134 (SIGABRT), got $inv_rc: $(cat "$WORKDIR/diff_repro_inv.out")"
+  grep -q "INVARIANT\[diff_parse_y\]: kind=syntax_mismatch sub=prism_ok_cruby_err" "$WORKDIR/diff_repro_inv.out" || fail "expected diff invariant in diff_repro_inv output"
+  "$WORKDIR/diff_repro_locals_pass/testcase"
+  "$WORKDIR/diff_repro_empty_pass/testcase"
+
+  # Auto-detection from #include <ruby.h> + build_diff.sh without INVARIANT[diff_parse_y] in testcase.c
+  printf '\0\0\003\001%s\n' "1 + 2" > "$WORKDIR/diff_repro_locals_pass/input.min"
+  VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$WORKDIR/diff_repro_locals_pass" --json > "$WORKDIR/diff_autodetect.json"
+
+  echo "  differential diff_parse_y verify_bucket.sh and standalone reproducer checks passed"
 fi
 
 echo "PASS: Fuzz crash triage and minimization suite verified."

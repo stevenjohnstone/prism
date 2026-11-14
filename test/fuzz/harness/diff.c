@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <ruby.h>
 
@@ -23,8 +24,9 @@
 #define DIFF_STACK_LOCAL_SLOTS 64
 #define DIFF_STACK_LOCAL_BYTES 2048
 
-/* CRuby internal helper in thread.c; stops timer thread cleanly before fork(). */
+/* CRuby internal helpers in thread.c / vm_dump.c (not exposed in public ruby.h). */
 extern void rb_thread_stop_timer_thread(void);
+extern void rb_print_backtrace(FILE *errout);
 
 typedef struct {
     uint32_t offset;
@@ -65,6 +67,37 @@ static VALUE diff_warning_warn(int argc, VALUE *argv, VALUE self) {
 }
 
 static const int diff_crash_signals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGPIPE };
+static const int diff_fatal_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+
+static void diff_write_stderr_str(const char *s, size_t len) {
+    while (len > 0) {
+        ssize_t written = write(STDERR_FILENO, s, len);
+        if (written <= 0) {
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        s += written;
+        len -= (size_t) written;
+    }
+}
+
+static void diff_fatal_signal_handler(int sig) {
+    const char *msg = "CRASH[diff_parse_y]: signal=SIGNAL\n";
+    switch (sig) {
+        case SIGSEGV: msg = "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n"; break;
+        case SIGBUS:  msg = "CRASH[diff_parse_y]: signal=SIGBUS (7)\n"; break;
+        case SIGILL:  msg = "CRASH[diff_parse_y]: signal=SIGILL (4)\n"; break;
+        case SIGFPE:  msg = "CRASH[diff_parse_y]: signal=SIGFPE (8)\n"; break;
+        default:      break;
+    }
+    diff_write_stderr_str(msg, strlen(msg));
+    rb_print_backtrace(stderr);
+    fflush(stderr);
+    raise(sig);
+    _exit(128 + sig);
+}
 
 static void diff_snapshot_signals(struct sigaction saved[5]) {
     for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
@@ -75,6 +108,18 @@ static void diff_snapshot_signals(struct sigaction saved[5]) {
 static void diff_restore_signals(const struct sigaction saved[5]) {
     for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
         sigaction(diff_crash_signals[i], &saved[i], NULL);
+    }
+}
+
+static void diff_install_fatal_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = diff_fatal_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    /* Reset to SIG_DFL on delivery so raise(sig) kills with WTERMSIG == sig and nested faults cannot loop. */
+    sa.sa_flags = SA_RESETHAND;
+    for (size_t i = 0; i < sizeof(diff_fatal_signals) / sizeof(diff_fatal_signals[0]); i++) {
+        sigaction(diff_fatal_signals[i], &sa, NULL);
     }
 }
 
@@ -103,6 +148,7 @@ static void diff_oracle_init(void) {
     (void) ruby_options(5, opts);
 
     diff_restore_signals(saved);
+    diff_install_fatal_signal_handlers();
 
     VALUE warning_mod = rb_const_get(rb_cObject, rb_intern("Warning"));
     rb_define_singleton_method(warning_mod, "warn", diff_warning_warn, -1);
