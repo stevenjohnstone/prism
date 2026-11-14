@@ -424,9 +424,11 @@ diff_build = build_script(stream_slow_in, crash_output: diff_inv, reason: "ABRT"
 raise "diff build.sh unexpected flags:\n#{diff_build}" if diff_build.include?("-DPRISM_DEPTH_MAXIMUM=128") || diff_build.include?("-DSLOW") || diff_build.include?("-DPM_ARENA_INITIAL_SIZE=0")
 raise "expected diff build.sh to invoke build_diff.sh --mode testcase:\n#{diff_build}" unless diff_build.include?("build_diff.sh") && diff_build.include?("--mode testcase") && diff_build.include?("--cflag")
 diff_tc = c_program(stream_slow_in, "test diff", crash_output: diff_inv, reason: "ABRT", executable: "./build/fuzz.diff")
-raise "diff testcase.c unexpected content:\n#{diff_tc}" unless diff_tc.include?('pm_options_version_set(options, "4.0", 3);') && diff_tc.include?("ruby_ver=4.0") && !diff_tc.include?("pm_parse_stream") && diff_tc.include?("#include <ruby.h>") && diff_tc.include?("signal(SIGABRT, SIG_DFL)") && !diff_tc.include?("diff_compare_locals")
+raise "diff testcase.c unexpected content:\n#{diff_tc}" unless diff_tc.include?('pm_options_version_set(options, "4.0", 3);') && diff_tc.include?("ruby_ver=4.0") && !diff_tc.include?("pm_parse_stream") && diff_tc.include?("#include <ruby.h>") && diff_tc.include?("signal(SIGABRT, SIG_DFL)") && !diff_tc.include?("diff_compare_locals") && diff_tc.include?("diff_classify_cruby_msg") && diff_tc.include?("nul=%d utf8=%d") && diff_tc.include?("prism=%s cruby=%s")
 diff_locals_tc = c_program(stream_slow_in, "test diff locals", crash_output: "INVARIANT[diff_parse_y]: kind=locals_count_mismatch [detail: prism=1 cruby=0]\n", reason: "ABRT", executable: "./build/fuzz.diff")
-raise "expected locals helper in diff_locals_tc:\n#{diff_locals_tc}" unless diff_locals_tc.include?("diff_compare_locals")
+raise "expected locals helper in diff_locals_tc:\n#{diff_locals_tc}" unless diff_locals_tc.include?("diff_compare_locals") && diff_locals_tc.include?("diff_compare_asts")
+diff_ast_tc = c_program(stream_slow_in, "test diff ast", crash_output: "INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator [detail: idx=0 prism=r cruby=&]\n", reason: "ABRT", executable: "./build/fuzz.diff")
+raise "expected AST helper in diff_ast_tc:\n#{diff_ast_tc}" unless diff_ast_tc.include?("diff_compare_locals") && diff_ast_tc.include?("diff_compare_asts")
 diff_empty_tc = c_program(empty_in, "test diff empty", crash_output: diff_crash, reason: "SEGV", executable: "./build/fuzz.diff")
 raise "expected source_buf for empty diff input:\n#{diff_empty_tc}" unless diff_empty_tc.include?("source_buf") && diff_empty_tc.include?("input_size = 0")
 diff_io = input_and_options_metadata(stream_slow_in, reason: "ABRT", crash_output: diff_inv, executable: "./build/fuzz.diff")
@@ -435,6 +437,20 @@ parsed_diff = parse_crash_output(diff_inv)
 raise "unexpected diff invariant parse: #{parsed_diff.inspect}" unless parsed_diff.dig("symptom", "invariant", "namespace") == "diff_parse_y" &&
                                                                        parsed_diff.dig("symptom", "invariant", "fields", "kind") == "syntax_mismatch" &&
                                                                        parsed_diff.dig("symptom", "invariant", "fields", "sub") == "prism_ok_cruby_err"
+parsed_diff_granular = parse_crash_output(
+  "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=1 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: prism_errs=0 cruby=ArgumentError: unknown encoding name: foo]\n"
+)
+raise "unexpected granular diff invariant parse: #{parsed_diff_granular.inspect}" unless parsed_diff_granular.dig("symptom", "invariant", "fields", "nul") == 1 &&
+                                                                                         parsed_diff_granular.dig("symptom", "invariant", "fields", "utf8") == 0 &&
+                                                                                         parsed_diff_granular.dig("symptom", "invariant", "fields", "prism") == "ok" &&
+                                                                                         parsed_diff_granular.dig("symptom", "invariant", "fields", "cruby") == "ArgumentError:unknown_encoding"
+parsed_diff_ast = parse_crash_output(
+  "INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator [detail: idx=0 prism=r cruby=&]\n"
+)
+raise "unexpected AST diff invariant parse: #{parsed_diff_ast.inspect}" unless parsed_diff_ast.dig("symptom", "invariant", "fields", "kind") == "ast_block_owner_mismatch" &&
+                                                                               parsed_diff_ast.dig("symptom", "invariant", "fields", "sub") == "operator" &&
+                                                                               parsed_diff_ast.dig("symptom", "invariant", "detail", "prism") == "r" &&
+                                                                               parsed_diff_ast.dig("symptom", "invariant", "detail", "cruby") == "&"
 parsed_diff_crash = parse_crash_output(diff_crash)
 raise "unexpected diff crash parse: #{parsed_diff_crash.inspect}" unless parsed_diff_crash.dig("symptom", "headline") == "CRASH[diff_parse_y]: signal=SIGSEGV (11)" &&
                                                                          parsed_diff_crash["frames"].size == 6 &&
@@ -2232,11 +2248,26 @@ grep -q "^${c15_sha} is the first bad commit$" "$WORKDIR/bisect_xyz_skip.out" ||
 echo "  external target verification, template regen, 2026 API shims, exit 125/128, --invert/--fail-fast, and bisect.rb checks passed"
 
 # 1b. Differential parse.y signature deduplication & live verify_bucket.sh --profile diff_parse_y (when /opt/ruby oracle exists)
-ds1=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err [detail: a]\n' | ./test/fuzz/triage/signature.sh)
-ds2=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err [detail: b]\n' | ./test/fuzz/triage/signature.sh)
-ds3=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_err_cruby_ok [detail: b]\n' | ./test/fuzz/triage/signature.sh)
+ds1=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=1 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: prism_errs=0 cruby=ArgumentError: unknown encoding name: foo]\n' | ./test/fuzz/triage/signature.sh)
+ds2=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=1 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: prism_errs=0 cruby=ArgumentError: unknown encoding name: bar]\n' | ./test/fuzz/triage/signature.sh)
+ds3=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_err_cruby_ok nul=0 utf8=1 prism=expect_rparen cruby=ok [detail: prism_errs=1 cruby=ok]\n' | ./test/fuzz/triage/signature.sh)
+ds4=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block [detail: a]\n' | ./test/fuzz/triage/signature.sh)
+ds5=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=1 utf8=1 prism=ok cruby=ArgumentError:unknown_encoding [detail: a]\n' | ./test/fuzz/triage/signature.sh)
+ds6=$(printf 'INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator [detail: idx=0 prism=r cruby=&]\n' | ./test/fuzz/triage/signature.sh)
+ds7=$(printf 'INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator [detail: idx=1 prism=foo cruby=+]\n' | ./test/fuzz/triage/signature.sh)
+ds8=$(printf 'INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=method [detail: idx=0 prism=a cruby=b]\n' | ./test/fuzz/triage/signature.sh)
+ds9=$(printf 'INVARIANT[diff_parse_y]: kind=locals_count_mismatch scope=def [detail: scope_idx=1 prism=1 cruby=0]\n' | ./test/fuzz/triage/signature.sh)
+ds10=$(printf 'INVARIANT[diff_parse_y]: kind=locals_count_mismatch scope=program [detail: scope_idx=0 prism=1 cruby=0]\n' | ./test/fuzz/triage/signature.sh)
+ds11=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=SyntaxError:invalid_multibyte_utf8 [detail: \377\376]\n' | ./test/fuzz/triage/signature.sh)
+ds12=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=SyntaxError:invalid_multibyte_utf8 [detail: a]\n' | ./test/fuzz/triage/signature.sh)
 [ "$ds1" = "$ds2" ] || fail "expected identical diff signature across details, got $ds1 vs $ds2"
 [ "$ds1" != "$ds3" ] || fail "expected distinct diff signatures across sub kinds ($ds1 == $ds3)"
+[ "$ds1" != "$ds4" ] || fail "expected distinct diff signatures across cruby/hygiene tags ($ds1 == $ds4)"
+[ "$ds1" != "$ds5" ] || fail "expected distinct diff signatures across utf8 flag ($ds1 == $ds5)"
+[ "$ds6" = "$ds7" ] || fail "expected identical ast_block_owner_mismatch signatures across details ($ds6 vs $ds7)"
+[ "$ds6" != "$ds8" ] || fail "expected distinct ast_block_owner_mismatch signatures across sub ($ds6 == $ds8)"
+[ "$ds9" != "$ds10" ] || fail "expected distinct locals_count_mismatch signatures across scope ($ds9 == $ds10)"
+[ "$ds11" = "$ds12" ] || fail "expected identical diff signature when [detail: ...] contains non-UTF-8 bytes ($ds11 != $ds12)"
 
 dc1=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(diff_fatal_signal_handler+0x4c) [0xaaaa1000] /prism/test/fuzz/harness/diff.c:96\nlinux-vdso.so.1(__kernel_rt_sigreturn+0x0) [0xffff0000]\n/prism/build/fuzz.diff(rb_st_free_table+0x14) [0xaaaa2000] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
 dc2=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/other/build/fuzz.diff(diff_fatal_signal_handler+0x99) [0xbbbb1000] /other/test/fuzz/harness/diff.c:96\n/other/build/fuzz.diff(rb_st_free_table+0x28) [0xbbbb2000] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
@@ -2271,7 +2302,8 @@ workdir = ARGV.fetch(0)
 
 [
   ["segv", "case;when 1;case;c;in 1;end;end", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"],
-  ["inv", "a[b c do end]", "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err\n", "ABRT"],
+  ["inv", "a[b c do end]", "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block\n", "ABRT"],
+  ["ast_block", "def f\n  1.times { check 1, case 1 when 1 then return b&r do end end }\nend\n", "INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator\n", "ABRT"],
   ["locals_pass", "x = 1 + 2", "INVARIANT[diff_parse_y]: kind=locals_count_mismatch\n", "ABRT"],
   ["empty_pass", "", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"]
 ].each do |name, code, cout, reason|
@@ -2288,6 +2320,7 @@ EOF
 
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_segv/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_inv/build.sh"
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_ast_block/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_locals_pass/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_empty_pass/build.sh"
 
@@ -2296,11 +2329,15 @@ EOF
   segv_rc=$?
   timeout -k 1 5 "$WORKDIR/diff_repro_inv/testcase" > "$WORKDIR/diff_repro_inv.out" 2>&1
   inv_rc=$?
+  timeout -k 1 5 "$WORKDIR/diff_repro_ast_block/testcase" > "$WORKDIR/diff_repro_ast_block.out" 2>&1
+  ast_block_rc=$?
   set -e
   [ "$segv_rc" -eq 139 ] || fail "expected diff_repro_segv/testcase exit 139 (SIGSEGV), got $segv_rc: $(cat "$WORKDIR/diff_repro_segv.out")"
   grep -q "\[BUG\] Segmentation fault" "$WORKDIR/diff_repro_segv.out" || fail "expected CRuby bug report in diff_repro_segv output"
   [ "$inv_rc" -eq 134 ] || fail "expected diff_repro_inv/testcase exit 134 (SIGABRT), got $inv_rc: $(cat "$WORKDIR/diff_repro_inv.out")"
-  grep -q "INVARIANT\[diff_parse_y\]: kind=syntax_mismatch sub=prism_ok_cruby_err" "$WORKDIR/diff_repro_inv.out" || fail "expected diff invariant in diff_repro_inv output"
+  grep -q "INVARIANT\[diff_parse_y\]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block" "$WORKDIR/diff_repro_inv.out" || fail "expected granular diff invariant in diff_repro_inv output"
+  [ "$ast_block_rc" -eq 134 ] || fail "expected diff_repro_ast_block/testcase exit 134 (SIGABRT), got $ast_block_rc: $(cat "$WORKDIR/diff_repro_ast_block.out")"
+  grep -q "INVARIANT\[diff_parse_y\]: kind=ast_block_owner_mismatch sub=operator" "$WORKDIR/diff_repro_ast_block.out" || fail "expected ast_block_owner_mismatch invariant in diff_repro_ast_block output"
   "$WORKDIR/diff_repro_locals_pass/testcase"
   "$WORKDIR/diff_repro_empty_pass/testcase"
 
