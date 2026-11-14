@@ -6,6 +6,7 @@ PRISM_ROOT=""
 FUZZ_ROOT=""
 RUBY_DIR="${RUBY_ORACLE_DIR:-/opt/ruby}"
 ORACLE_DIR=""
+SOURCE_ARG=""
 OUTPUT=""
 AFL_PATH_ARG=""
 CC_BIN="${CC:-clang}"
@@ -14,14 +15,15 @@ EXTRA_CFLAGS=()
 
 usage() {
   cat <<'EOF'
-Usage: build_diff.sh --mode {fuzz|verify} --prism-root DIR --output FILE [OPTIONS]
-  --mode MODE             fuzz (AFL PCGUARD) or verify (standalone verify_runner)
+Usage: build_diff.sh --mode {fuzz|verify|testcase} --prism-root DIR --output FILE [OPTIONS]
+  --mode MODE             fuzz (AFL PCGUARD), verify (verify_runner), or testcase (standalone C)
   --prism-root DIR        Prism repository root containing include/ and src/
   --fuzz-root DIR         Fuzz harness repository root (defaults to --prism-root)
   --ruby-dir DIR          Built CRuby static source tree (default: /opt/ruby)
   --oracle-dir DIR        Cache directory for libcruby_oracle.a and objects
+  --source FILE           Standalone C reproducer source path (required for --mode testcase)
   --afl-path DIR          AFL++ instrumentation directory (required for --mode fuzz)
-  --cc BIN                C compiler (for --mode verify; default: $CC or clang)
+  --cc BIN                C compiler (for --mode verify|testcase; default: $CC or clang)
   --max-input-size N      FUZZ_MAX_INPUT_SIZE value (default: 1024)
   --cflag FLAG            Extra C compiler flag for Prism/harness sources (repeatable)
   --output FILE           Output binary path
@@ -40,6 +42,8 @@ while [ "$#" -gt 0 ]; do
       RUBY_DIR="${2:-}"; shift 2 ;;
     --oracle-dir)
       ORACLE_DIR="${2:-}"; shift 2 ;;
+    --source)
+      SOURCE_ARG="${2:-}"; shift 2 ;;
     --afl-path)
       AFL_PATH_ARG="${2:-}"; shift 2 ;;
     --cc)
@@ -65,6 +69,12 @@ if [ -z "$PRISM_ROOT" ] || [ -z "$OUTPUT" ]; then
   exit 2
 fi
 
+if [ "$MODE" = "testcase" ] && [ -z "$SOURCE_ARG" ]; then
+  echo "build_diff.sh: --source is required for --mode testcase" >&2
+  usage >&2
+  exit 2
+fi
+
 if [ -z "$FUZZ_ROOT" ]; then
   FUZZ_ROOT="$PRISM_ROOT"
 fi
@@ -72,6 +82,8 @@ fi
 if [ -z "$ORACLE_DIR" ]; then
   if [ "$MODE" = "fuzz" ]; then
     ORACLE_DIR="$PRISM_ROOT/build/diff-oracle"
+  elif [ "$MODE" = "testcase" ]; then
+    ORACLE_DIR="$PRISM_ROOT/build/diff-testcase-oracle"
   else
     ORACLE_DIR="$(dirname "$OUTPUT")/diff-oracle"
   fi
@@ -131,6 +143,11 @@ else
   ORACLE_DEP="$(command -v "$CC_BIN" 2>/dev/null || printf '%s' "$CC_BIN")"
 fi
 
+ORACLE_MODE="host"
+if [ "$MODE" = "fuzz" ]; then
+  ORACLE_MODE="fuzz"
+fi
+
 ORACLE_STAMP_FILE="$ORACLE_DIR/.oracle.stamp"
 ORACLE_ARCHIVE="$ORACLE_DIR/libcruby_oracle.a"
 
@@ -147,7 +164,7 @@ oracle_fp="$(ruby -rdigest -e '
     end
   end
   puts d.hexdigest
-' "$MODE" "$RUBY_PARSE_FLAGS" "$RUBY_DIR/libruby-static.a" "$RUBY_DIR/parse.c" "$ORACLE_DEP")"
+' "$ORACLE_MODE" "$RUBY_PARSE_FLAGS" "$RUBY_DIR/libruby-static.a" "$RUBY_DIR/parse.c" "$ORACLE_DEP")"
 
 if [ ! -f "$ORACLE_ARCHIVE" ] || [ ! -f "$ORACLE_STAMP_FILE" ] || [ "$(cat "$ORACLE_STAMP_FILE" 2>/dev/null)" != "$oracle_fp" ]; then
   tmp_parse_o="$ORACLE_DIR/parse.o.tmp.$$"
@@ -183,11 +200,46 @@ if [ "${#PRISM_SRCS[@]}" -eq 0 ]; then
   exit 2
 fi
 
+compile_prism_objs() {
+  local obj_dir=$1
+  local incremental=$2
+  mkdir -p "$obj_dir"
+
+  local newest_header=""
+  local force_objs=1
+  local flags_stamp="$obj_dir/.flags.stamp"
+  local cur_stamp="$PRISM_ROOT|${PRISM_CC[*]}|${PRISM_CFLAGS[*]}"
+
+  if [ "$incremental" -eq 1 ]; then
+    newest_header="$(find "$PRISM_ROOT/include" -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
+    force_objs=0
+    if [ ! -f "$flags_stamp" ] || [ "$(cat "$flags_stamp" 2>/dev/null)" != "$cur_stamp" ]; then
+      force_objs=1
+    fi
+  fi
+
+  PRISM_OBJS=()
+  for src in "${PRISM_SRCS[@]}"; do
+    local rel="${src#"$PRISM_ROOT/src/"}"
+    local obj="$obj_dir/${rel%.c}.o"
+    mkdir -p "$(dirname "$obj")"
+    if [ "$force_objs" -eq 1 ] || [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$0" -nt "$obj" ] || { [ -n "$newest_header" ] && [ "$newest_header" -nt "$obj" ]; }; then
+      "${PRISM_CC[@]}" "${PRISM_CFLAGS[@]}" -c "$src" -o "$obj"
+    fi
+    PRISM_OBJS+=("$obj")
+  done
+  printf '%s\n' "$cur_stamp" > "$flags_stamp"
+}
+
+LINK_EXPORT_FLAGS=()
+if [ "$(uname -s)" = "Linux" ]; then
+  LINK_EXPORT_FLAGS=(-Wl,--export-dynamic)
+fi
+
 if [ "$MODE" = "fuzz" ]; then
-  OBJ_DIR="$ORACLE_DIR/prism_objs"
-  mkdir -p "$OBJ_DIR"
+  PRISM_CC=(env "AFL_PATH=$AFL_PATH_ARG" "AFL_LLVM_INSTRUMENT=PCGUARD" afl-clang-fast)
   PRISM_CFLAGS=(
-    -g -O2 -std=c99
+    -g -gdwarf-4 -O2 -std=c99
     -Wall -Werror -Wextra -Wpedantic -Wundef -Wconversion -Wno-missing-braces
     -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32
     -Wno-switch -Wno-implicit-function-declaration
@@ -198,31 +250,11 @@ if [ "$MODE" = "fuzz" ]; then
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE"
     ${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"}
   )
-
-  NEWEST_HEADER="$(find "$PRISM_ROOT/include" -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
-  FLAGS_STAMP="$OBJ_DIR/.flags.stamp"
-  CUR_FLAGS="${PRISM_CFLAGS[*]}"
-  FORCE_OBJS=0
-  if [ ! -f "$FLAGS_STAMP" ] || [ "$(cat "$FLAGS_STAMP" 2>/dev/null)" != "$CUR_FLAGS" ]; then
-    FORCE_OBJS=1
-  fi
-
-  PRISM_OBJS=()
-  for src in "${PRISM_SRCS[@]}"; do
-    rel="${src#"$PRISM_ROOT/src/"}"
-    obj="$OBJ_DIR/${rel%.c}.o"
-    mkdir -p "$(dirname "$obj")"
-    if [ "$FORCE_OBJS" -eq 1 ] || [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$0" -nt "$obj" ] || { [ -n "$NEWEST_HEADER" ] && [ "$NEWEST_HEADER" -nt "$obj" ]; }; then
-      AFL_PATH="$AFL_PATH_ARG" AFL_LLVM_INSTRUMENT=PCGUARD afl-clang-fast \
-        "${PRISM_CFLAGS[@]}" -c "$src" -o "$obj"
-    fi
-    PRISM_OBJS+=("$obj")
-  done
-  printf '%s\n' "$CUR_FLAGS" > "$FLAGS_STAMP"
+  compile_prism_objs "$ORACLE_DIR/prism_objs" 1
 
   DIFF_OBJ="$ORACLE_DIR/diff.o"
-  AFL_PATH="$AFL_PATH_ARG" AFL_LLVM_INSTRUMENT=PCGUARD afl-clang-fast \
-    -g -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fPIE \
+  "${PRISM_CC[@]}" \
+    -g -gdwarf-4 -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fPIE \
     "-I$PRISM_ROOT/include" \
     "${RUBY_EMBED_INC[@]}" \
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE" \
@@ -230,17 +262,17 @@ if [ "$MODE" = "fuzz" ]; then
 
   tmp_out="$OUTPUT.tmp.$$"
   rm -f "$tmp_out"
-  AFL_PATH="$AFL_PATH_ARG" AFL_LLVM_INSTRUMENT=PCGUARD afl-clang-fast \
-    -g -O2 -fPIE -Wl,--export-dynamic \
+  "${PRISM_CC[@]}" \
+    -g -gdwarf-4 -O2 -fPIE "${LINK_EXPORT_FLAGS[@]}" \
     "$DIFF_OBJ" "${PRISM_OBJS[@]}" "$ORACLE_ARCHIVE" \
     "${MAINLIBS_ARR[@]}" \
     -o "$tmp_out"
   mv -f "$tmp_out" "$OUTPUT"
-elif [ "$MODE" = "verify" ]; then
-  OBJ_DIR="$ORACLE_DIR/verify_objs"
-  mkdir -p "$OBJ_DIR"
+elif [ "$MODE" = "verify" ] || [ "$MODE" = "testcase" ]; then
+  OBJ_DIR="$ORACLE_DIR/${MODE}_objs"
+  PRISM_CC=("$CC_BIN")
   PRISM_CFLAGS=(
-    -O1 -fno-omit-frame-pointer -ggdb3 -std=c99
+    -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=c99
     -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32
     -Wno-switch -Wno-implicit-function-declaration
     "-I$PRISM_ROOT/include"
@@ -248,40 +280,55 @@ elif [ "$MODE" = "verify" ]; then
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE"
     ${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"}
   )
+  if [ "$MODE" = "testcase" ]; then
+    compile_prism_objs "$OBJ_DIR" 1
+    TC_OBJ="$(dirname "$OUTPUT")/.testcase.$$.o"
+    rm -f "$TC_OBJ"
+    "$CC_BIN" \
+      -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=gnu99 \
+      -Wall -Wextra -Wno-unused-parameter -fPIE \
+      "-I$PRISM_ROOT/include" \
+      "${RUBY_EMBED_INC[@]}" \
+      ${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"} \
+      -c "$SOURCE_ARG" -o "$TC_OBJ"
 
-  PRISM_OBJS=()
-  for src in "${PRISM_SRCS[@]}"; do
-    rel="${src#"$PRISM_ROOT/src/"}"
-    obj="$OBJ_DIR/${rel%.c}.o"
-    mkdir -p "$(dirname "$obj")"
-    "$CC_BIN" "${PRISM_CFLAGS[@]}" -c "$src" -o "$obj"
-    PRISM_OBJS+=("$obj")
-  done
+    tmp_out="$OUTPUT.tmp.$$"
+    rm -f "$tmp_out"
+    "$CC_BIN" \
+      -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -fPIE "${LINK_EXPORT_FLAGS[@]}" \
+      "$TC_OBJ" "${PRISM_OBJS[@]}" "$ORACLE_ARCHIVE" \
+      "${MAINLIBS_ARR[@]}" \
+      -o "$tmp_out"
+    rm -f "$TC_OBJ"
+    mv -f "$tmp_out" "$OUTPUT"
+  else
+    compile_prism_objs "$OBJ_DIR" 0
 
-  DIFF_OBJ="$OBJ_DIR/diff.o"
-  "$CC_BIN" \
-    -O1 -fno-omit-frame-pointer -ggdb3 -std=gnu99 \
-    -Wall -Wextra -Wno-unused-parameter -fPIE -DPRISM_DIFF_NO_MAIN \
-    "-I$PRISM_ROOT/include" \
-    "${RUBY_EMBED_INC[@]}" \
-    "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE" \
-    -c "$FUZZ_ROOT/test/fuzz/harness/diff.c" -o "$DIFF_OBJ"
+    DIFF_OBJ="$OBJ_DIR/diff.o"
+    "$CC_BIN" \
+      -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=gnu99 \
+      -Wall -Wextra -Wno-unused-parameter -fPIE -DPRISM_DIFF_NO_MAIN \
+      "-I$PRISM_ROOT/include" \
+      "${RUBY_EMBED_INC[@]}" \
+      "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE" \
+      -c "$FUZZ_ROOT/test/fuzz/harness/diff.c" -o "$DIFF_OBJ"
 
-  RUNNER_OBJ="$OBJ_DIR/verify_runner.o"
-  "$CC_BIN" \
-    -O1 -fno-omit-frame-pointer -ggdb3 -std=gnu99 \
-    -Wall -Wextra -Wno-unused-parameter -fPIE \
-    -c "$FUZZ_ROOT/test/fuzz/triage/verify_runner.c" -o "$RUNNER_OBJ"
+    RUNNER_OBJ="$OBJ_DIR/verify_runner.o"
+    "$CC_BIN" \
+      -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=gnu99 \
+      -Wall -Wextra -Wno-unused-parameter -fPIE \
+      -c "$FUZZ_ROOT/test/fuzz/triage/verify_runner.c" -o "$RUNNER_OBJ"
 
-  tmp_out="$OUTPUT.tmp.$$"
-  rm -f "$tmp_out"
-  "$CC_BIN" \
-    -O1 -fno-omit-frame-pointer -ggdb3 -fPIE -Wl,--export-dynamic \
-    "$RUNNER_OBJ" "$DIFF_OBJ" "${PRISM_OBJS[@]}" "$ORACLE_ARCHIVE" \
-    "${MAINLIBS_ARR[@]}" \
-    -o "$tmp_out"
-  mv -f "$tmp_out" "$OUTPUT"
+    tmp_out="$OUTPUT.tmp.$$"
+    rm -f "$tmp_out"
+    "$CC_BIN" \
+      -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -fPIE "${LINK_EXPORT_FLAGS[@]}" \
+      "$RUNNER_OBJ" "$DIFF_OBJ" "${PRISM_OBJS[@]}" "$ORACLE_ARCHIVE" \
+      "${MAINLIBS_ARR[@]}" \
+      -o "$tmp_out"
+    mv -f "$tmp_out" "$OUTPUT"
+  fi
 else
-  echo "build_diff.sh: invalid --mode '$MODE' (expected fuzz or verify)" >&2
+  echo "build_diff.sh: invalid --mode '$MODE' (expected fuzz, verify, or testcase)" >&2
   exit 2
 fi

@@ -119,7 +119,8 @@ def sanitizer_loupe_crash?(reason, crash_output)
 end
 
 def diff_bucket?(executable: "", crash_output: "")
-  executable.to_s.end_with?("diff") || crash_output.to_s.include?("INVARIANT[diff_parse_y]")
+  co = crash_output.to_s
+  executable.to_s.end_with?("diff") || co.include?("INVARIANT[diff_parse_y]") || co.include?("CRASH[diff_parse_y]")
 end
 
 def build_diff_loupe_url(source)
@@ -517,12 +518,257 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
   plan
 end
 
+def diff_c_program(source, crash_details, crash_output, loupe_url)
+  need_locals = crash_output.include?("kind=locals_") || crash_output.include?("kind=ast_")
+  source_ptr = source.empty? ? "source_buf" : "source"
+
+  includes = [
+    "#include <assert.h>",
+    "#include <limits.h>",
+    "#include <prism.h>",
+    "#include <signal.h>",
+    "#include <stdarg.h>",
+    "#include <stdbool.h>",
+    "#include <stddef.h>",
+    "#include <stdint.h>",
+    "#include <stdio.h>",
+    "#include <stdlib.h>",
+    "#include <string.h>",
+    "#include <ruby.h>"
+  ]
+
+  helpers = []
+  helpers << <<~'C'.chomp
+    static void diff_invariant_fail(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+    static void diff_invariant_fail(const char *fmt, ...) {
+      va_list args;
+      va_start(args, fmt);
+      vfprintf(stderr, fmt, args);
+      va_end(args);
+      fflush(stderr);
+      signal(SIGABRT, SIG_DFL);
+      abort();
+    }
+
+    static VALUE diff_warning_warn(int argc, VALUE *argv, VALUE self) {
+      return Qnil;
+    }
+
+    static VALUE diff_ast_parse_cb(VALUE src_str) {
+      VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
+      VALUE rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
+      return rb_funcall(rb_mAST, rb_intern("parse"), 1, src_str);
+    }
+
+    static void diff_format_exception(VALUE err, char *buf, size_t cap) {
+      if (cap == 0) return;
+      if (NIL_P(err)) {
+        snprintf(buf, cap, "nil");
+        return;
+      }
+      const char *cname = rb_obj_classname(err);
+      VALUE msg = rb_funcall(err, rb_intern("message"), 0);
+      const char *mptr = (RB_TYPE_P(msg, T_STRING) && RSTRING_LEN(msg) > 0) ? RSTRING_PTR(msg) : "";
+      long mlen = RB_TYPE_P(msg, T_STRING) ? RSTRING_LEN(msg) : 0;
+      long first_line_len = 0;
+      while (first_line_len < mlen && first_line_len < 96 && mptr[first_line_len] != '\n' && mptr[first_line_len] != '\r') {
+        first_line_len++;
+      }
+      snprintf(buf, cap, "%s: %.*s", cname ? cname : "Exception", (int)first_line_len, mptr);
+      RB_GC_GUARD(msg);
+    }
+  C
+
+  if need_locals
+    helpers << <<~'C'.chomp
+      typedef struct {
+        uint32_t offset;
+        uint32_t length;
+      } diff_local_span_t;
+
+      typedef struct {
+        size_t count;
+        diff_local_span_t *spans;
+        char *buf;
+        size_t bytes_used;
+      } diff_locals_t;
+
+      static void diff_locals_free(diff_locals_t *locals) {
+        free(locals->spans);
+        free(locals->buf);
+        locals->count = 0;
+        locals->spans = NULL;
+        locals->buf = NULL;
+        locals->bytes_used = 0;
+      }
+
+      static void diff_extract_prism_locals(const pm_parser_t *parser, const pm_program_node_t *program, diff_locals_t *locals) {
+        size_t count = program->locals.size;
+        if (count == 0) return;
+        locals->spans = malloc(count * sizeof(diff_local_span_t));
+        assert(locals->spans != NULL);
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < count; i++) {
+          const pm_constant_t *c = pm_parser_constant(parser, program->locals.ids[i]);
+          size_t len = pm_constant_length(c);
+          assert(len <= UINT32_MAX && total_bytes <= SIZE_MAX - len);
+          total_bytes += len;
+        }
+        if (total_bytes > 0) {
+          locals->buf = malloc(total_bytes);
+          assert(locals->buf != NULL);
+        }
+        size_t off = 0;
+        for (size_t i = 0; i < count; i++) {
+          const pm_constant_t *c = pm_parser_constant(parser, program->locals.ids[i]);
+          const uint8_t *start = pm_constant_start(c);
+          size_t len = pm_constant_length(c);
+          locals->spans[i].offset = (uint32_t)off;
+          locals->spans[i].length = (uint32_t)len;
+          if (len > 0) {
+            memcpy(locals->buf + off, start, len);
+            off += len;
+          }
+        }
+        locals->count = count;
+        locals->bytes_used = off;
+      }
+
+      static void diff_compare_locals(VALUE ast_node, diff_locals_t *prism_locals) {
+        volatile VALUE children = rb_funcall(ast_node, rb_intern("children"), 0);
+        if (!RB_TYPE_P(children, T_ARRAY) || RARRAY_LEN(children) < 1) {
+          long clen = RB_TYPE_P(children, T_ARRAY) ? RARRAY_LEN(children) : -1L;
+          diff_locals_free(prism_locals);
+          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_shape [detail: children_len=%ld]\n", clen);
+        }
+        volatile VALUE tbl = RARRAY_AREF(children, 0);
+        if (!RB_TYPE_P(tbl, T_ARRAY)) {
+          int t = (int)TYPE(tbl);
+          diff_locals_free(prism_locals);
+          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=ast_tbl_type [detail: type=%d]\n", t);
+        }
+        long cruby_count = RARRAY_LEN(tbl);
+        if ((size_t)cruby_count != prism_locals->count) {
+          size_t pcount = prism_locals->count;
+          diff_locals_free(prism_locals);
+          diff_invariant_fail("INVARIANT[diff_parse_y]: kind=locals_count_mismatch [detail: prism=%zu cruby=%ld]\n", pcount, cruby_count);
+        }
+        for (long i = 0; i < cruby_count; i++) {
+          VALUE sym = RARRAY_AREF(tbl, i);
+          volatile VALUE sym_str = SYMBOL_P(sym) ? rb_sym2str(sym) : Qnil;
+          const diff_local_span_t *span = &prism_locals->spans[i];
+          const char *p_ptr = prism_locals->buf + span->offset;
+          size_t p_len = span->length;
+          if (!RB_TYPE_P(sym_str, T_STRING) || (size_t)RSTRING_LEN(sym_str) != p_len ||
+              (p_len > 0 && memcmp(RSTRING_PTR(sym_str), p_ptr, p_len) != 0)) {
+            diff_invariant_fail(
+              "INVARIANT[diff_parse_y]: kind=locals_name_mismatch [detail: idx=%ld prism=%.*s cruby=%.*s]\n",
+              i,
+              (int)p_len,
+              p_ptr,
+              RB_TYPE_P(sym_str, T_STRING) ? (int)RSTRING_LEN(sym_str) : 3,
+              RB_TYPE_P(sym_str, T_STRING) ? RSTRING_PTR(sym_str) : "nil"
+            );
+          }
+          RB_GC_GUARD(sym_str);
+        }
+        RB_GC_GUARD(tbl);
+        RB_GC_GUARD(children);
+      }
+    C
+  end
+
+  main_lines = []
+  if source.empty?
+    main_lines << "uint8_t *source = malloc(input_size);"
+    main_lines << 'const uint8_t *source_buf = source != NULL ? source : (const uint8_t *)"";'
+  else
+    main_lines << "uint8_t *source = malloc(input_size);"
+    main_lines << "assert(source != NULL);"
+    main_lines << "memcpy(source, input, input_size);"
+  end
+  main_lines << ""
+  main_lines << "pm_options_t *options = pm_options_new();"
+  main_lines << 'pm_options_version_set(options, "4.0", 3);'
+  main_lines << ""
+  main_lines << "pm_arena_t *arena = pm_arena_new();"
+  main_lines << "pm_parser_t *parser = pm_parser_new(arena, #{source_ptr}, input_size, options);"
+  if need_locals
+    main_lines << "pm_node_t *root = pm_parse(parser);"
+  else
+    main_lines << "(void)pm_parse(parser);"
+  end
+  main_lines << "size_t prism_errs = pm_parser_errors_size(parser);"
+  main_lines << "bool prism_ok = (prism_errs == 0);"
+  if need_locals
+    main_lines << "diff_locals_t prism_locals = {.count = 0, .spans = NULL, .buf = NULL, .bytes_used = 0};"
+    main_lines << "if (prism_ok && root != NULL && PM_NODE_TYPE_P(root, PM_PROGRAM_NODE)) {"
+    main_lines << "  diff_extract_prism_locals(parser, (const pm_program_node_t *)root, &prism_locals);"
+    main_lines << "}"
+  end
+  main_lines << "pm_parser_free(parser);"
+  main_lines << "pm_arena_free(arena);"
+  main_lines << "pm_options_free(options);"
+  main_lines << ""
+  main_lines << "RUBY_INIT_STACK;"
+  main_lines << "if (ruby_setup() != 0) {"
+  main_lines << '  fprintf(stderr, "ruby_setup() failed\n");'
+  main_lines << "  free(source);"
+  main_lines << "  diff_locals_free(&prism_locals);" if need_locals
+  main_lines << "  signal(SIGABRT, SIG_DFL);"
+  main_lines << "  abort();"
+  main_lines << "}"
+  main_lines << 'char *opts[] = {(char *)"ruby", (char *)"--disable=gems", (char *)"--parser=parse.y", (char *)"-e", (char *)""};'
+  main_lines << "(void)ruby_options(5, opts);"
+  main_lines << 'rb_define_singleton_method(rb_const_get(rb_cObject, rb_intern("Warning")), "warn", diff_warning_warn, -1);'
+  main_lines << ""
+  main_lines << "assert(input_size <= (size_t)LONG_MAX);"
+  main_lines << "volatile VALUE src_str = rb_utf8_str_new((const char *)#{source_ptr}, (long)input_size);"
+  main_lines << "free(source);"
+  main_lines << "int state = 0;"
+  main_lines << "volatile VALUE ast_node = rb_protect(diff_ast_parse_cb, src_str, &state);"
+  main_lines << "bool cruby_ok = (state == 0);"
+  main_lines << 'char exc_buf[160] = "";'
+  main_lines << "if (!cruby_ok) {"
+  main_lines << "  VALUE err = rb_errinfo();"
+  main_lines << "  rb_set_errinfo(Qnil);"
+  main_lines << "  diff_format_exception(err, exc_buf, sizeof(exc_buf));"
+  main_lines << "}"
+  main_lines << "RB_GC_GUARD(src_str);"
+  main_lines << ""
+  main_lines << "if (prism_ok != cruby_ok) {"
+  main_lines << '  const char *sub = prism_ok ? "prism_ok_cruby_err" : "prism_err_cruby_ok";'
+  main_lines << "  diff_locals_free(&prism_locals);" if need_locals
+  main_lines << '  diff_invariant_fail("INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=%s [detail: prism_errs=%zu cruby=%s]\n", sub, prism_errs, cruby_ok ? "ok" : exc_buf);'
+  main_lines << "}"
+  if need_locals
+    main_lines << "if (prism_ok && cruby_ok) {"
+    main_lines << "  diff_compare_locals(ast_node, &prism_locals);"
+    main_lines << "}"
+    main_lines << "diff_locals_free(&prism_locals);"
+  end
+  main_lines << "RB_GC_GUARD(ast_node);"
+  main_lines << "return 0;"
+
+  sections = [
+    includes.join("\n"),
+    "/*\n#{escape_c_comment(crash_details)}\n*/",
+    *helpers,
+    c_array(source, loupe_url),
+    "int main(void) {\n#{main_lines.map { |l| l.empty? ? '' : "  #{l}" }.join("\n")}\n}"
+  ]
+
+  clang_format("#{sections.join("\n\n")}\n")
+end
+
 def c_program(input_file, crash_details, crash_output: "", reason: "unknown", executable: "")
   h = decode_fuzz_header(File.binread(input_file))
   source = h[:source]
   is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
-  stream_mode = is_diff ? false : h[:stream_mode]
-  loupe_url = is_diff ? build_diff_loupe_url(source) : build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
+  return diff_c_program(source, crash_details, crash_output, build_diff_loupe_url(source)) if is_diff
+
+  stream_mode = h[:stream_mode]
+  loupe_url = build_prism_loupe_url(h[:padded_raw], sanitize: sanitizer_loupe_crash?(reason, crash_output))
 
   source_ptr = source.empty? ? "source_buf" : "source"
   plan = post_parse_plan(crash_output, executable, stream_mode, source_ptr)
@@ -981,10 +1227,42 @@ def verify_script(reason:, executable: "", crash_output: "")
 end
 
 def build_script(input_file, crash_output: "", reason: "unknown", executable: "")
+  is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
+  if is_diff
+    return <<~SH
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      #{repo_root_lookup_bash}
+
+      ORACLE_DIR="${DIFF_ORACLE_DIR:-}"
+      if [ -z "$ORACLE_DIR" ]; then
+        if mkdir -p "$REPO_ROOT/build" 2>/dev/null && [ -w "$REPO_ROOT/build" ]; then
+          ORACLE_DIR="$REPO_ROOT/build/diff-testcase-oracle"
+        else
+          ORACLE_DIR="$SCRIPT_DIR/.diff-oracle"
+        fi
+      fi
+
+      args=(
+        --mode testcase
+        --prism-root "$REPO_ROOT"
+        --fuzz-root "$REPO_ROOT"
+        --oracle-dir "$ORACLE_DIR"
+        --source "$SCRIPT_DIR/testcase.c"
+        --output "$SCRIPT_DIR/testcase"
+      )
+      for flag in "$@"; do
+        args+=(--cflag "$flag")
+      done
+
+      exec "$REPO_ROOT/test/fuzz/harness/build_diff.sh" "${args[@]}"
+    SH
+  end
+
   raw = File.binread(input_file)
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
 
-  is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
   is_native_only = executable.end_with?("ijon", "native")
   is_invariant = crash_output.include?("INVARIANT[")
   is_arith_ub = reason == "undefined-behavior" && !crash_output.include?("arena")
@@ -1035,9 +1313,14 @@ def testcase_output_signature(testcase_output, siglines = 10)
 end
 
 def run_testcase(executable, input_file)
+  Thread.current[:last_testcase_signal] = nil
   o, s = Open3.capture2e(SANITIZER_ENV, "timeout", "-k", "1", "5", executable, input_file)
   timed_out = s.exitstatus == 124 || s.exitstatus == 137
   crashed = !s.success? && !timed_out
+  sig = if crashed
+          s.termsig || (s.exitstatus && s.exitstatus > 128 ? s.exitstatus - 128 : nil)
+        end
+  Thread.current[:last_testcase_signal] = sig && (1..64).include?(sig) ? Signal.signame(sig) : nil
   [o, crashed, timed_out]
 end
 
@@ -1282,6 +1565,28 @@ def parse_crash_output(crash_output)
         "module" => Regexp.last_match(2),
         "scope" => "external"
       }
+      next
+    elsif line =~ /\A\s*([^\s(]+)?\(([^)]*)\)\s+\[0x[0-9a-fA-F]+\](?:\s+(.+?))?\s*\z/ ||
+          line =~ /\A\s*([^\s(]+)\(([^)\s]+)\)\s+((?:\/|[^\s]+:\d+)\S*)\s*\z/
+      seen_frames = true
+      next if frames.size >= 64
+
+      mod_path = Regexp.last_match(1)
+      sym_part = Regexp.last_match(2).to_s
+      loc_part = Regexp.last_match(3)
+      func = sym_part.sub(/\+0x[0-9a-fA-F]+\z/, "")
+      func = nil if func.empty?
+      file, line_no, col_no, loc_mod = loc_part && !loc_part.empty? ? parse_frame_location(loc_part) : [nil, nil, nil, nil]
+      mod = file ? loc_mod : (mod_path && !mod_path.empty? ? "#{mod_path}(#{sym_part})" : loc_mod)
+      frames << {
+        "depth" => frames.size,
+        "func" => func,
+        "file" => file,
+        "line" => line_no,
+        "col" => col_no,
+        "module" => mod,
+        "scope" => frame_scope(file)
+      }.compact
       next
     end
 
@@ -1547,6 +1852,7 @@ end
 def classify_crash_execution(crash_dir, crash_input, executable)
   reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
   timed_out = false
+  Thread.current[:last_testcase_signal] = nil
 
   if reason == "hang"
     testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
@@ -1562,10 +1868,12 @@ def classify_crash_execution(crash_dir, crash_input, executable)
     if crashed
       executable = "./build/fuzz"
     else
+      Thread.current[:last_testcase_signal] = nil
       testcase_output, crashed, timed_out = run_testcase("./build/fuzz.lsan", crash_input)
       if crashed
         executable = "./build/fuzz.lsan"
       else
+        Thread.current[:last_testcase_signal] = nil
         testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
       end
     end
@@ -1579,12 +1887,14 @@ def classify_crash_execution(crash_dir, crash_input, executable)
     if crashed
       executable = "./build/fuzz"
     else
+      Thread.current[:last_testcase_signal] = nil
       testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
     end
   else
     testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
   end
 
+  sig_name = crashed ? Thread.current[:last_testcase_signal] : nil
   unreproducible = !crashed && !(reason == "hang" && timed_out)
 
   if crashed
@@ -1599,6 +1909,10 @@ def classify_crash_execution(crash_dir, crash_input, executable)
         reason = "allocation-size-too-big"
       elsif testcase_output.include?("Assertion `") || testcase_output.include?("INVARIANT[")
         reason = "ABRT"
+      elsif testcase_output =~ /^CRASH\[[^\]]+\]:\s*signal=SIG([A-Z0-9_]+)/
+        reason = Regexp.last_match(1)
+      elsif sig_name && !sig_name.empty?
+        reason = sig_name
       end
     end
   end
