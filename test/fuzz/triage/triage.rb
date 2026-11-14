@@ -125,8 +125,21 @@ def harness_slice(filename, slice_name)
   HARNESS_SLICE_MUTEX.synchronize { HARNESS_SLICES_CACHE[key] ||= sliced }
 end
 
+# Convert arbitrary bytes or malformed text into valid UTF-8 while replacing invalid sequences.
+def utf8_safe(text)
+  return "" if text.nil?
+
+  s = text.to_s
+  if s.encoding == Encoding::BINARY
+    s = s.dup.force_encoding(Encoding::UTF_8)
+  elsif s.encoding != Encoding::UTF_8
+    return s.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "?")
+  end
+  s.valid_encoding? ? s : s.scrub("?")
+end
+
 def escape_c_comment(text)
-  text.gsub("*/", "* /")
+  utf8_safe(text).gsub("*/", "* /")
 end
 
 def format_uint8_bitmask(value, flags)
@@ -146,10 +159,11 @@ def encode_loupe_scope_local(bytes)
 end
 
 def sanitizer_loupe_crash?(reason, crash_output)
-  return false if crash_output.include?("INVARIANT[") || crash_output.include?("Assertion `")
+  co = utf8_safe(crash_output)
+  return false if co.include?("INVARIANT[") || co.include?("Assertion `")
   return true if reason == "undefined-behavior"
-  return true if crash_output.match?(/SUMMARY: (?:Address|UndefinedBehavior)Sanitizer:/)
-  return true if crash_output.match?(/:\d+:\d+: runtime error: |fuzz_(?:free|realloc)_sized/)
+  return true if co.match?(/SUMMARY: (?:Address|UndefinedBehavior)Sanitizer:/)
+  return true if co.match?(/:\d+:\d+: runtime error: |fuzz_(?:free|realloc)_sized/)
 
   %w[
     heap-buffer-overflow stack-buffer-overflow global-buffer-overflow
@@ -159,7 +173,7 @@ def sanitizer_loupe_crash?(reason, crash_output)
 end
 
 def diff_bucket?(executable: "", crash_output: "")
-  co = crash_output.to_s
+  co = utf8_safe(crash_output)
   executable.to_s.end_with?("diff") || co.include?("INVARIANT[diff_parse_y]") || co.include?("CRASH[diff_parse_y]")
 end
 
@@ -355,6 +369,7 @@ def slow_consumer_lines(stream_mode, source_ptr)
 end
 
 def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
+  crash_output = utf8_safe(crash_output)
   size_var = stream_mode ? "parsed_size" : "input_size"
   plan = {
     need_node: false,
@@ -557,6 +572,7 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
 end
 
 def diff_c_program(source, crash_details, crash_output, loupe_url)
+  crash_output = utf8_safe(crash_output)
   need_ast = crash_output.include?("kind=locals_") || crash_output.include?("kind=ast_")
   source_ptr = source.empty? ? "source_buf" : "source"
 
@@ -998,6 +1014,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
     SH
   end
 
+  crash_output = utf8_safe(crash_output)
   raw = File.binread(input_file)
   source = raw.bytesize > 4 ? raw.byteslice(4..) : "".b
 
@@ -1046,7 +1063,7 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
 end
 
 def testcase_output_signature(testcase_output, siglines = 10)
-  o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, "./test/fuzz/triage/signature.sh", stdin_data: testcase_output)
+  o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, "./test/fuzz/triage/signature.sh", stdin_data: testcase_output.to_s.b)
   o.strip
 end
 
@@ -1059,7 +1076,7 @@ def run_testcase(executable, input_file)
           s.termsig || (s.exitstatus && s.exitstatus > 128 ? s.exitstatus - 128 : nil)
         end
   Thread.current[:last_testcase_signal] = sig && (1..64).include?(sig) ? Signal.signame(sig) : nil
-  [o, crashed, timed_out]
+  [o.b, crashed, timed_out]
 end
 
 def clang_format(c_code)
@@ -1207,12 +1224,6 @@ def normalize_ijon_crash_bytes(raw)
   out = raw.b.dup
   out.setbyte(0, out.getbyte(0) & ~0x40)
   out
-end
-
-def utf8_safe(text)
-  return "" if text.nil?
-
-  text.to_s.encode("UTF-8", invalid: :replace, undef: :replace, replace: "?")
 end
 
 def normalize_repo_path(path)
@@ -1635,19 +1646,21 @@ def classify_crash_execution(crash_dir, crash_input, executable)
   sig_name = crashed ? Thread.current[:last_testcase_signal] : nil
   unreproducible = !crashed && !(reason == "hang" && timed_out)
 
+  clean_output = utf8_safe(testcase_output)
+
   if crashed
     reason = "unknown" if reason == "hang"
-    testcase_output.match(/SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: ([[:alpha:]-]*) .*/) do |m|
+    clean_output.match(/SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: ([[:alpha:]-]*) .*/) do |m|
       reason = m.captures[1]
     end
     if reason == "unknown"
-      if testcase_output.match?(/ERROR: LeakSanitizer: detected memory leaks/) || testcase_output.include?("Assertion `allocated == 0' failed")
+      if clean_output.match?(/ERROR: LeakSanitizer: detected memory leaks/) || clean_output.include?("Assertion `allocated == 0' failed")
         reason = "memory-leak"
-      elsif testcase_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
+      elsif clean_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
         reason = "allocation-size-too-big"
-      elsif testcase_output.include?("Assertion `") || testcase_output.include?("INVARIANT[")
+      elsif clean_output.include?("Assertion `") || clean_output.include?("INVARIANT[")
         reason = "ABRT"
-      elsif testcase_output =~ /^CRASH\[[^\]]+\]:\s*signal=SIG([A-Z0-9_]+)/
+      elsif clean_output =~ /^CRASH\[[^\]]+\]:\s*signal=SIG([A-Z0-9_]+)/
         reason = Regexp.last_match(1)
       elsif sig_name && !sig_name.empty?
         reason = sig_name
@@ -1740,8 +1753,9 @@ def collect_showmap_batch(inputs_by_key, bin_path, showmap_path)
       "-i", in_dir, "-o", out_dir, "--", bin_path, "@@"
     )
 
-    if out.include?("Fork server handshake failed") || out.include?("PROGRAM ABORT")
-      return { ok: false, reason: "afl-showmap forkserver handshake failed for #{bin_path}: #{out.lines.last&.strip}" }
+    out_utf8 = utf8_safe(out)
+    if out_utf8.include?("Fork server handshake failed") || out_utf8.include?("PROGRAM ABORT")
+      return { ok: false, reason: "afl-showmap forkserver handshake failed for #{bin_path}: #{out_utf8.lines.last&.strip}" }
     end
 
     maps = {}
@@ -1975,7 +1989,7 @@ def legacy_bucket_ijon?(bucket_dir)
   tc_path = File.join(bucket_dir, "testcase.c")
   return false unless File.file?(tc_path)
 
-  head = File.read(tc_path, 4096)
+  head = utf8_safe(File.binread(tc_path, 4096))
   crash_line = head[/^(?:Crash|Unreproducible crash):\s*(.+)$/, 1]
   !crash_line.nil? && crash_line.include?("/afl-ijon/")
 end
@@ -2065,7 +2079,7 @@ def seed_legacy_occurrences(bucket_dir)
   tc_path = File.join(bucket_dir, "testcase.c")
   recorded_crash_path = nil
   if File.file?(tc_path)
-    head = File.read(tc_path, 4096)
+    head = utf8_safe(File.binread(tc_path, 4096))
     recorded_crash_path = head[/^(?:Crash|Unreproducible crash):\s*(.+)$/, 1]&.strip
   end
 
@@ -2132,7 +2146,7 @@ def backfill_bucket_meta(bucket_dir)
 
       out, crashed, t_out = run_testcase(cand, min_path)
       if crashed || (reason == "hang" && t_out)
-        crash_output = out
+        crash_output = utf8_safe(out)
         timed_out = t_out
         used_exec = cand
         break
@@ -2478,12 +2492,13 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
         end
       end
 
+      clean_crash_output = utf8_safe(testcase_output)
       details = if unreproducible
-                  "Unreproducible crash: #{crash}"
+                  "Unreproducible crash: #{utf8_safe(crash)}"
                 else
-                  "Crash: #{crash}\n#{testcase_output}"
+                  "Crash: #{utf8_safe(crash)}\n#{clean_crash_output}"
                 end
-      effective_output = unreproducible ? "" : testcase_output
+      effective_output = unreproducible ? "" : clean_crash_output
       c_testcase = c_program(
         minimized_input,
         details,

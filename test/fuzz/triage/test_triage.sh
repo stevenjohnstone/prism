@@ -466,6 +466,17 @@ raise "unexpected diff crash parse: #{parsed_diff_crash.inspect}" unless parsed_
                                                                          parsed_diff_crash["frames"][5]["file"] == "/opt/ruby/ast.c" &&
                                                                          parsed_diff_crash["frames"][5]["line"] == 135
 
+nonutf8_out = "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: prism_errs=0 cruby=ArgumentError: unknown encoding name: Windows-31J\xBB\xFF]\n".b.dup.force_encoding("UTF-8")
+raise "expected valid UTF-8 scrubbing from utf8_safe" unless utf8_safe(nonutf8_out).valid_encoding? && utf8_safe(nonutf8_out.b).valid_encoding?
+raise "expected non-UTF-8 crash output helpers to succeed" unless diff_bucket?(crash_output: nonutf8_out) &&
+                                                                   !sanitizer_loupe_crash?("ABRT", nonutf8_out) &&
+                                                                   post_parse_plan(nonutf8_out, "./build/fuzz", false, "source").is_a?(Hash) &&
+                                                                   escape_c_comment("Crash: */ \xBB").valid_encoding? &&
+                                                                   c_program(stream_slow_in, "Crash: x\n#{nonutf8_out}", crash_output: nonutf8_out, reason: "ABRT", executable: "./build/fuzz.diff").valid_encoding? &&
+                                                                   build_script(stream_slow_in, crash_output: nonutf8_out, reason: "ABRT", executable: "./build/fuzz.diff").valid_encoding? &&
+                                                                   JSON.pretty_generate(parse_crash_output(nonutf8_out)).valid_encoding?
+
+
 parsed_inv = parse_crash_output(
   "Reading 11 bytes from x\n" \
   "INVARIANT[node_location]: type=PM_WHILE_NODE kind=length_underflow [detail: parent=PM_STATEMENTS_NODE start=6 length=4294967294 parsed_size=12]\n" \
@@ -1069,6 +1080,32 @@ t_sig_mod.module_eval(t_code, File.expand_path("test/fuzz/triage/triage.rb"))
 t_sig_mod.extend(t_sig_mod)
 silent_segv_res = t_sig_mod.classify_crash_execution("crashes", "/tmp/in", real_segv_bin)
 raise "expected silent SIGSEGV executable to classify as SEGV: #{silent_segv_res.inspect}" unless silent_segv_res[:reason] == "SEGV" && silent_segv_res[:crashed]
+
+nonutf8_src = File.join(workdir, "nonutf8_inv.c")
+nonutf8_bin = File.join(workdir, "nonutf8_inv")
+File.write(nonutf8_src, <<~C)
+  #include <stdio.h>
+  #include <stdlib.h>
+  int main(void) {
+    static const char msg[] = "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: prism_errs=0 cruby=ArgumentError: unknown encoding name: Windows-31J\\xbb\\xff]\\n";
+    fwrite(msg, 1, sizeof(msg) - 1, stderr);
+    fflush(stderr);
+    abort();
+  }
+C
+system("clang", nonutf8_src, "-o", nonutf8_bin) || raise("failed to compile nonutf8_inv helper")
+nonutf8_cls = t_sig_mod.classify_crash_execution("crashes", "/tmp/in", nonutf8_bin)
+raise "expected non-UTF-8 INVARIANT binary to classify as ABRT: #{nonutf8_cls.inspect}" unless nonutf8_cls[:reason] == "ABRT" && nonutf8_cls[:crashed]
+
+t_mod.define_singleton_method(:run_testcase) do |_exe, _input|
+  ["INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: Windows-31J\xBB]\n", true, false]
+end
+mock_nonutf8 = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.diff")
+raise "expected mocked UTF-8-invalid crash output to classify as ABRT: #{mock_nonutf8.inspect}" unless mock_nonutf8[:reason] == "ABRT" && mock_nonutf8[:crashed]
+
+sig_raw = t_sig_mod.testcase_output_signature(nonutf8_cls[:testcase_output], nonutf8_cls[:sig_lines])
+sig_clean = t_sig_mod.testcase_output_signature("INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: other]\n", nonutf8_cls[:sig_lines])
+raise "expected identical signature for non-UTF-8 [detail: ...]: #{sig_raw} vs #{sig_clean}" unless sig_raw == sig_clean
 EOF
 
 # 2) Deterministic verify.sh + verify.rb PARTIAL-fix & survivor extraction check.
