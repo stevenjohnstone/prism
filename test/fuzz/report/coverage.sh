@@ -133,7 +133,7 @@ ruby -rdigest -rjson -rfileutils -e '
 
   worker_dirs = []
   seen_workers = {}
-  ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon", "tmp/fuzz/afl-diff"].each do |root|
+  ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].each do |root|
     next unless Dir.exist?(root)
     Dir.glob(File.join(root, "*")).sort.each do |d|
       w = File.basename(d)

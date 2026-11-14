@@ -2,7 +2,6 @@
 
 AFL_DIR=${1:-./tmp/fuzz/afl}
 AFL_IJON_DIR="${AFL_DIR}-ijon"
-AFL_DIFF_DIR="${AFL_DIR}-diff"
 CORPUS_DIR=${2:-./tmp/fuzz/corpus}
 SEEDS_BACKUP_DIR="$(dirname "$AFL_DIR")/seeds"
 MAX_INPUT_SIZE=${FUZZ_MAX_INPUT_SIZE:-1024}
@@ -162,16 +161,16 @@ else
     IJON_SYNC_FLAGS="-S ijon"
 fi
 
-# When diff (worker 5) is active, run it as an isolated master (-M diff) in
-# $AFL_DIFF_DIR (separate map size spanning both Prism and CRuby parse.c) seeded
-# only with parse.y-compatible corpus seeds, and expose its queue one-way to main
-# via $AFL_DIR/diff_peer/queue.
-if [ "$FUZZ_WORKERS" -ge 6 ]; then
-    mkdir -p "$AFL_DIFF_DIR/diff/queue" "$AFL_DIR/diff_peer"
-    ln -sfn "../../$(basename "$AFL_DIFF_DIR")/diff/queue" "$AFL_DIR/diff_peer/queue"
-    rm -f "$AFL_DIR/diff_peer/is_main_node"
-else
-    rm -rf "$AFL_DIR/diff_peer"
+# diff (worker 5) runs as a standard secondary (-S diff) in $AFL_DIR so it
+# syncs bidirectionally with -M main while seeding from parse.y-compatible
+# corpus inputs. Remove any legacy diff_peer symlink and migrate an existing
+# isolated ${AFL_DIR}-diff/diff directory into $AFL_DIR/diff if present.
+rm -rf "$AFL_DIR/diff_peer"
+if [ -d "${AFL_DIR}-diff/diff" ] && [ ! -d "$AFL_DIR/diff" ]; then
+    mkdir -p "$AFL_DIR"
+    mv "${AFL_DIR}-diff/diff" "$AFL_DIR/diff"
+    rm -f "$AFL_DIR/diff/is_main_node"
+    rmdir "${AFL_DIR}-diff" 2>/dev/null || true
 fi
 
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
@@ -196,7 +195,7 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             ;;
         5)
             prepare_diff_seeds
-            add_worker "diff" "afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/diff/seeds -o $AFL_DIFF_DIR -M diff -p explore -- ./build/fuzz.diff"
+            add_worker "diff" "afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/diff/seeds -o $AFL_DIR -S diff -p explore -- ./build/fuzz.diff"
             ;;
         *)
             idx=$(( i - 6 ))

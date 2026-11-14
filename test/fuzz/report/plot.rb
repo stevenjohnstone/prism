@@ -78,7 +78,7 @@ def normalize_sync_source(src)
 end
 
 def worker_root_dirs(afl_dir)
-  [afl_dir, "#{afl_dir}-ijon", "#{afl_dir}-diff"].select { |d| Dir.exist?(d) }
+  [afl_dir, "#{afl_dir}-ijon"].select { |d| Dir.exist?(d) }
 end
 
 def discover_fuzzer_dirs(afl_dir)
@@ -674,7 +674,7 @@ fuzzers.each do |f|
   end
 
   is_isolated_root = File.expand_path(File.dirname(f[:dir])) != expanded_afl_dir
-  shadow_synced_path = %w[ijon diff].include?(peer_name) ? File.join(main_fuzzer[:dir], ".synced", "#{peer_name}_peer") : nil
+  shadow_synced_path = peer_name == "ijon" ? File.join(main_fuzzer[:dir], ".synced", "#{peer_name}_peer") : nil
   has_shadow_peer = !!(shadow_synced_path && File.file?(shadow_synced_path))
   is_foreign_queue = is_isolated_root && !has_shadow_peer
   peer_total = f[:corpus_count]

@@ -1,7 +1,6 @@
 FUZZ_DIR = $(CURDIR)/tmp/fuzz
 FUZZ_AFL_DIR = $(FUZZ_DIR)/afl
 FUZZ_AFL_IJON_DIR = $(FUZZ_DIR)/afl-ijon
-FUZZ_AFL_DIFF_DIR = $(FUZZ_DIR)/afl-diff
 FUZZ_CORPUS_DIR = $(FUZZ_DIR)/corpus
 FUZZ_SEEDS_DIR = $(FUZZ_DIR)/seeds
 FUZZ_COVERAGE_DIR = $(FUZZ_DIR)/coverage
@@ -223,7 +222,7 @@ fuzz-coverage: fuzz-docker-build fuzz-gen-templates
 
 fuzz-plot: fuzz-docker-build fuzz-gen-templates
 	@if [ -z "$(FUZZ_SKIP_COVERAGE)" ] && [ -d "$(FUZZ_AFL_DIR)" ]; then \
-		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_AFL_DIFF_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ] || [ -n "$$(find $(FUZZ_SEEDS_DIR) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
+		if [ ! -f "$(FUZZ_COVERAGE_DIR)/coverage.json" ] || [ -n "$$(find $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) \( -name 'queue' -o -name 'crashes' -o -name 'hangs' \) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ] || [ -n "$$(find $(FUZZ_SEEDS_DIR) -newer $(FUZZ_COVERAGE_DIR)/coverage.json -print -quit 2>/dev/null)" ]; then \
 			echo "collecting coverage (set FUZZ_SKIP_COVERAGE=1 to skip)"; \
 			$(FUZZ_RUN_COVERAGE); \
 		fi; \
@@ -248,7 +247,6 @@ define FUZZ_CLEAN_CONFIRM
 	echo "This will permanently delete:"; \
 	echo "  - tmp/fuzz/afl      ($(FUZZ_FINDINGS) crash/hang findings)"; \
 	echo "  - tmp/fuzz/afl-ijon"; \
-	echo "  - tmp/fuzz/afl-diff"; \
 	echo "  - tmp/fuzz/corpus"; \
 	echo "  - tmp/fuzz/seeds"; \
 	echo "  - tmp/fuzz/coverage"; \
@@ -270,11 +268,11 @@ define FUZZ_CLEAN_CONFIRM
 fi
 endef
 
-fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FUZZ_AFL_IJON_DIR)/*/{crashes,hangs} $(FUZZ_AFL_DIFF_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FUZZ_AFL_IJON_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 fuzz-clean:
 	$(FUZZ_CLEAN_CONFIRM)
 	$(ECHO) "Removing fuzz data (preserving tmp/fuzz/triage)"
-	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_AFL_DIFF_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
+	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
 	$(ECHO) "done"
 
 .PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test

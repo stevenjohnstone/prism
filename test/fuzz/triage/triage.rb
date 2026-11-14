@@ -20,7 +20,7 @@ require cluster_lib if cluster_lib
 TRIAGE_FILE_DIR = __dir__
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
-OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon", "tmp/fuzz/afl-diff"].freeze
+OUTPUT_DIRS = ["tmp/fuzz/afl", "tmp/fuzz/afl-ijon"].freeze
 TESTCASES_DIR = "tmp/fuzz/triage"
 TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
 MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
