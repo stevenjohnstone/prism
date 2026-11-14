@@ -2315,11 +2315,17 @@ dc3=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(o
 if [ -f /opt/ruby/libruby-static.a ] && [ -f /opt/ruby/parse.c ]; then
   diff_bucket="$WORKDIR/diff_triage_test/ABRT/diff_bucket"
   mkdir -p "$diff_bucket"
-  # Fixed known 4.0.9 parse.y divergence (`3.4-4.0/command_call_do_block_in_index_arguments`) fails verify_runner; valid `1 + 2` passes.
-  printf '\0\0\003\001%s' "a[b c do end]" > "$diff_bucket/input.min"
+  # Known filtered parse.y/Onigmo/NUL divergences pass verify_runner; an unfiltered
+  # ast_block_owner_mismatch fails verify_runner, and valid `1 + 2` passes.
+  for filtered_src in "a[b c do end]" "/[/" $'/\x8e/' $'#coding:Window\x00-31J'; do
+    printf '\0\0\003\001%s' "$filtered_src" > "$diff_bucket/input.min"
+    VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+      --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_filtered_pass.json"
+  done
+  printf '\0\0\003\001def f\n  1.times { check 1, case 1 when 1 then return b&r do end end }\nend\n' > "$diff_bucket/input.min"
   cat > "$diff_bucket/testcase.c" << 'C'
 /*
-INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err
+INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator
 */
 C
   set +e

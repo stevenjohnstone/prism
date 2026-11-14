@@ -1438,6 +1438,40 @@ static void diff_run_prism(
     free(copy);
 }
 
+static bool
+diff_ignore_syntax_mismatch(bool prism_ok, bool cruby_ok, const char *cruby_tag, const char *exc_buf) {
+    if (!(prism_ok && !cruby_ok)) {
+        return false;
+    }
+
+    // Prism intentionally defers full Onigmo regexp compilation errors and
+    // tolerates raw invalid UTF-8 bytes in string/regexp literals.
+    if (strcmp(cruby_tag, "SyntaxError:invalid_multibyte_utf8") == 0) {
+        return true;
+    }
+    if (strncmp(cruby_tag, "SyntaxError:regexp_", 19) == 0) {
+        return true;
+    }
+
+    // Documented Prism vs CRuby 4.0 parse.y divergences (test/prism/fixtures_test.rb):
+    // 3.4/command_call_do_block_in_arguments.txt, 3.4-4.0/command_call_do_block_in_index_arguments.txt,
+    // and pattern_alternation_non_captures.txt (Ruby #22310).
+    if (strcmp(cruby_tag, "SyntaxError:unexpected_do_block") == 0) {
+        return true;
+    }
+    if (strstr(exc_buf, "alternative pattern after variable capture") != NULL) {
+        return true;
+    }
+
+    // RubyVM::AbstractSyntaxTree.parse (ast.c) fails converting valid parse.y
+    // NODE_ITER(NODE_DASGN) even when `ruby --parser=parse.y` accepts the code.
+    if (strstr(exc_buf, "get_nd_args: unexpected node:") != NULL) {
+        return true;
+    }
+
+    return false;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!diff_oracle_initialized) {
         diff_oracle_init();
@@ -1450,6 +1484,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     const uint8_t *source = data + 4;
     size_t source_size = size - 4;
+
+    // CRuby parse.y treats NUL bytes as EOF in lexing and truncates C strings in
+    // magic-comment/error helpers, making NUL-containing inputs non-comparable.
+    if (diff_has_nul(source, source_size)) {
+        return 0;
+    }
 
     bool prism_ok = false;
     size_t prism_errs = 0;
@@ -1474,6 +1514,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     if (prism_ok != cruby_ok) {
         diff_summary_free(&prism_ast);
+        if (diff_ignore_syntax_mismatch(prism_ok, cruby_ok, cruby_tag, exc_buf)) {
+            return 0;
+        }
         diff_fail_syntax_mismatch(source, source_size, prism_ok, prism_errs, prism_diag, cruby_ok, cruby_tag, exc_buf);
     }
 
