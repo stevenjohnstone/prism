@@ -490,6 +490,7 @@ typedef struct {
     ID scope, defn, defs, cls, mod, scls, iter, lambda, for_n, postexe;
     ID if_n, unless_n, while_n, until_n, yield_n, return_n, break_n, next_n;
     ID super_n, zsuper_n, defined_n, alias_n, valias_n, undef_n, case_n, case2_n;
+    ID masgn;
     ID fcall, vcall, call, qcall, opcall;
 } diff_cruby_ids_t;
 
@@ -542,6 +543,7 @@ static void diff_ast_ids_init(void) {
         { &diff_ids.undef_n,   "UNDEF" },
         { &diff_ids.case_n,    "CASE" },
         { &diff_ids.case2_n,   "CASE2" },
+        { &diff_ids.masgn,     "MASGN" },
         { &diff_ids.fcall,     "FCALL" },
         { &diff_ids.vcall,     "VCALL" },
         { &diff_ids.call,      "CALL" },
@@ -1165,6 +1167,13 @@ static void diff_cruby_visit_node(VALUE node, diff_summary_t *out, int depth) {
         diff_cruby_visit_scope_child(RARRAY_AREF(ch, 1), -1, out, depth + 1);
     } else if (tid == diff_ids.postexe && len >= 1) {
         diff_cruby_visit_scope_child(RARRAY_AREF(ch, 0), -1, out, depth + 1);
+    } else if (tid == diff_ids.masgn && len >= 2) {
+        /* RubyVM::AbstractSyntaxTree stores MASGN as [rhs_value, lhs_targets, ...],
+         * whereas Prism's MultiWriteNode visits targets before value. */
+        for (long i = 1; i < len; i++) {
+            diff_cruby_visit_val(RARRAY_AREF(ch, i), out, depth + 1);
+        }
+        diff_cruby_visit_val(RARRAY_AREF(ch, 0), out, depth + 1);
     } else {
         diff_cruby_count_if_matched(tid, out);
         for (long i = 0; i < len; i++) {

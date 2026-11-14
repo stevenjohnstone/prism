@@ -2350,7 +2350,7 @@ if [ -f /opt/ruby/libruby-static.a ] && [ -f /opt/ruby/parse.c ]; then
   mkdir -p "$diff_bucket"
   # Known filtered parse.y/Onigmo/NUL divergences pass verify_runner; an unfiltered
   # ast_block_owner_mismatch fails verify_runner, and valid `1 + 2` passes.
-  for filtered_src in "a[b c do end]" "/[/" $'/\x8e/' $'#coding:Window\x00-31J' $'/(?<\r/' "%r (#\$ " $'while def d;break end\nend '; do
+  for filtered_src in "a[b c do end]" "/[/" $'/\x8e/' $'#coding:Window\x00-31J' $'/(?<\r/' "%r (#\$ " $'while def d;break end\nend ' '(unless def ! =s then end.o,(((::B,))))=unless{}then end::B{}end'; do
     printf '\0\0\003\001%s' "$filtered_src" > "$diff_bucket/input.min"
     VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
       --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_filtered_pass.json"
