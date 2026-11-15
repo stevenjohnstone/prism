@@ -439,6 +439,15 @@ typedef enum {
     DIFF_CNT_ALIAS,
     DIFF_CNT_UNDEF,
     DIFF_CNT_CASE,
+    DIFF_CNT_BREAK,
+    DIFF_CNT_NEXT,
+    DIFF_CNT_REDO,
+    DIFF_CNT_RETRY,
+    DIFF_CNT_POSTEXE,
+    DIFF_CNT_CASE_MATCH,
+    DIFF_CNT_IN,
+    DIFF_CNT_RESCUE,
+    DIFF_CNT_ENSURE,
     DIFF_CNT_LEN
 } diff_count_kind_t;
 
@@ -488,8 +497,9 @@ typedef struct {
 
 typedef struct {
     ID scope, defn, defs, cls, mod, scls, iter, lambda, for_n, postexe;
-    ID if_n, unless_n, while_n, until_n, yield_n, return_n, break_n, next_n;
+    ID if_n, unless_n, while_n, until_n, yield_n, return_n, break_n, next_n, redo_n, retry_n;
     ID super_n, zsuper_n, defined_n, alias_n, valias_n, undef_n, case_n, case2_n;
+    ID case3_n, in_n, resbody, ensure_n;
     ID masgn;
     ID fcall, vcall, call, qcall, opcall;
 } diff_cruby_ids_t;
@@ -535,6 +545,8 @@ static void diff_ast_ids_init(void) {
         { &diff_ids.return_n,  "RETURN" },
         { &diff_ids.break_n,   "BREAK" },
         { &diff_ids.next_n,    "NEXT" },
+        { &diff_ids.redo_n,    "REDO" },
+        { &diff_ids.retry_n,   "RETRY" },
         { &diff_ids.super_n,   "SUPER" },
         { &diff_ids.zsuper_n,  "ZSUPER" },
         { &diff_ids.defined_n, "DEFINED" },
@@ -543,6 +555,10 @@ static void diff_ast_ids_init(void) {
         { &diff_ids.undef_n,   "UNDEF" },
         { &diff_ids.case_n,    "CASE" },
         { &diff_ids.case2_n,   "CASE2" },
+        { &diff_ids.case3_n,   "CASE3" },
+        { &diff_ids.in_n,      "IN" },
+        { &diff_ids.resbody,   "RESBODY" },
+        { &diff_ids.ensure_n,  "ENSURE" },
         { &diff_ids.masgn,     "MASGN" },
         { &diff_ids.fcall,     "FCALL" },
         { &diff_ids.vcall,     "VCALL" },
@@ -568,7 +584,8 @@ static const char *diff_scope_kind_name(diff_scope_kind_t kind) {
 static const char *diff_count_kind_name(diff_count_kind_t kind) {
     static const char *const names[] = {
         "class", "module", "sclass", "for", "if", "unless", "while", "until",
-        "yield", "return", "super", "defined", "alias", "undef", "case"
+        "yield", "return", "super", "defined", "alias", "undef", "case",
+        "break", "next", "redo", "retry", "postexe", "case_match", "in", "rescue", "ensure"
     };
     size_t idx = (size_t) kind;
     return idx < (sizeof(names) / sizeof(names[0])) ? names[idx] : "unknown";
@@ -769,7 +786,7 @@ static void diff_finalize_summary(diff_summary_t *s) {
         }
         sc->local_count = (uint32_t) unique;
     }
-    diff_sort_spans(s->block_owners.items, s->block_owners.count, s->strbuf.data);
+    /* Keep block_owners in AST traversal order rather than sorting them. */
 }
 
 /* Ignore CRuby synthetic parameter table entries (*, **, &, ..., <it>) so scope locals align. */
@@ -842,7 +859,22 @@ static pm_visit_result_t diff_prism_visit_cb(const pm_node_t *node, void *data) 
         case PM_PROGRAM_NODE: {
             const pm_program_node_t *prog = (const pm_program_node_t *) node;
             diff_prism_push_scope(ctx->parser, ctx->out, DIFF_SCOPE_PROGRAM, &prog->locals);
-            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
+            if (prog->statements != NULL) {
+                /*
+                 * CRuby parse.y hoists top-level BEGIN{} (NODE_BEGIN) blocks
+                 * ahead of all other top-level statements in source order.
+                 */
+                const pm_node_list_t *stmts = &prog->statements->body;
+                for (int pass = 0; pass < 2; pass++) {
+                    bool want_pre = (pass == 0);
+                    for (size_t i = 0; i < stmts->size; i++) {
+                        const pm_node_t *stmt = stmts->nodes[i];
+                        if (stmt != NULL && (PM_NODE_TYPE_P(stmt, PM_PRE_EXECUTION_NODE) != 0) == want_pre) {
+                            pm_visit_node(stmt, diff_prism_visit_cb, ctx);
+                        }
+                    }
+                }
+            }
             break;
         }
         case PM_DEF_NODE: {
@@ -943,6 +975,25 @@ static pm_visit_result_t diff_prism_visit_cb(const pm_node_t *node, void *data) 
             break;
         case PM_UNDEF_NODE:  ctx->out->counts[DIFF_CNT_UNDEF]++;  pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
         case PM_CASE_NODE:   ctx->out->counts[DIFF_CNT_CASE]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_BREAK_NODE:  ctx->out->counts[DIFF_CNT_BREAK]++;  pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_NEXT_NODE:   ctx->out->counts[DIFF_CNT_NEXT]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_REDO_NODE:   ctx->out->counts[DIFF_CNT_REDO]++;   pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_RETRY_NODE:  ctx->out->counts[DIFF_CNT_RETRY]++;  pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_POST_EXECUTION_NODE: ctx->out->counts[DIFF_CNT_POSTEXE]++; pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_CASE_MATCH_NODE: ctx->out->counts[DIFF_CNT_CASE_MATCH]++; pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_IN_NODE:     ctx->out->counts[DIFF_CNT_IN]++;     pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
+        case PM_MATCH_PREDICATE_NODE:
+        case PM_MATCH_REQUIRED_NODE:
+            ctx->out->counts[DIFF_CNT_CASE_MATCH]++;
+            ctx->out->counts[DIFF_CNT_IN]++;
+            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
+            break;
+        case PM_RESCUE_NODE:
+        case PM_RESCUE_MODIFIER_NODE:
+            ctx->out->counts[DIFF_CNT_RESCUE]++;
+            pm_visit_child_nodes(node, diff_prism_visit_cb, ctx);
+            break;
+        case PM_ENSURE_NODE: ctx->out->counts[DIFF_CNT_ENSURE]++; pm_visit_child_nodes(node, diff_prism_visit_cb, ctx); break;
         case PM_ERROR_RECOVERY_NODE: {
             uint32_t start = node->location.start;
             uint32_t length = node->location.length;
@@ -1115,6 +1166,15 @@ static void diff_cruby_count_if_matched(ID tid, diff_summary_t *out) {
     else if (tid == diff_ids.alias_n || tid == diff_ids.valias_n) out->counts[DIFF_CNT_ALIAS]++;
     else if (tid == diff_ids.undef_n)   out->counts[DIFF_CNT_UNDEF]++;
     else if (tid == diff_ids.case_n || tid == diff_ids.case2_n)   out->counts[DIFF_CNT_CASE]++;
+    else if (tid == diff_ids.break_n)                              out->counts[DIFF_CNT_BREAK]++;
+    else if (tid == diff_ids.next_n)                               out->counts[DIFF_CNT_NEXT]++;
+    else if (tid == diff_ids.redo_n)                               out->counts[DIFF_CNT_REDO]++;
+    else if (tid == diff_ids.retry_n)                              out->counts[DIFF_CNT_RETRY]++;
+    else if (tid == diff_ids.postexe)                              out->counts[DIFF_CNT_POSTEXE]++;
+    else if (tid == diff_ids.case3_n)                              out->counts[DIFF_CNT_CASE_MATCH]++;
+    else if (tid == diff_ids.in_n)                                 out->counts[DIFF_CNT_IN]++;
+    else if (tid == diff_ids.resbody)                              out->counts[DIFF_CNT_RESCUE]++;
+    else if (tid == diff_ids.ensure_n)                             out->counts[DIFF_CNT_ENSURE]++;
 }
 
 static void diff_cruby_visit_node(VALUE node, diff_summary_t *out, int depth) {
@@ -1166,6 +1226,7 @@ static void diff_cruby_visit_node(VALUE node, diff_summary_t *out, int depth) {
         diff_cruby_visit_val(RARRAY_AREF(ch, 0), out, depth + 1);
         diff_cruby_visit_scope_child(RARRAY_AREF(ch, 1), -1, out, depth + 1);
     } else if (tid == diff_ids.postexe && len >= 1) {
+        out->counts[DIFF_CNT_POSTEXE]++;
         diff_cruby_visit_scope_child(RARRAY_AREF(ch, 0), -1, out, depth + 1);
     } else if (tid == diff_ids.masgn && len >= 2) {
         /* RubyVM::AbstractSyntaxTree stores MASGN as [rhs_value, lhs_targets, ...],

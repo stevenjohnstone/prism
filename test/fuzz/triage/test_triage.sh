@@ -2435,6 +2435,22 @@ EOF
   "$WORKDIR/diff_repro_locals_pass/testcase"
   "$WORKDIR/diff_repro_empty_pass/testcase"
 
+  # Tightened diff.c parity checks: top-level BEGIN{} hoisting,
+  # unsorted block_owners traversal order, and break/next/redo/retry/postexe/case3/in/resbody/ensure counts.
+  mkdir -p "$WORKDIR/diff_tighten_pass" "$WORKDIR/diff_tighten_arch"
+  printf '\0\0\003\001->do end;BEGIN{b{}} ' > "$WORKDIR/diff_tighten_pass/input.min"
+  printf '\0\0\003\001BEGIN { a {} }; -> do end; BEGIN { b {} }\n' > "$WORKDIR/diff_tighten_arch/multi_begin.rb"
+  printf '\0\0\003\001m { a {} }; b {}\na {}.b {}\nf(g {}) {}\na, b {} = c {}\n' > "$WORKDIR/diff_tighten_arch/block_owners.rb"
+  printf '\0\0\003\001while 1; break; next; redo; end\nbegin; rescue A; rescue B; retry; ensure; end\n1 rescue 2\nEND {}\ncase 1; in 1; end\n1 in 1\n1 => a\ndef f; ensure; end\n' > "$WORKDIR/diff_tighten_arch/extra_counts.rb"
+  tar -czf "$WORKDIR/diff_tighten_pass/inputs.tar.gz" -C "$WORKDIR/diff_tighten_arch" multi_begin.rb block_owners.rb extra_counts.rb
+  VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$WORKDIR/diff_tighten_pass" --json > "$WORKDIR/diff_tighten.json"
+  ruby - "$WORKDIR/diff_tighten.json" << 'EOF'
+require "json"
+rep = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected diff_tighten PASS on 4 inputs: #{rep.inspect}" unless rep["total"] == 4 && rep["checked"] == 4 && rep["passed"] == 4 && rep["failed"] == 0 && rep["failures"].empty?
+EOF
+
   # Auto-detection from #include <ruby.h> + build_diff.sh without INVARIANT[diff_parse_y] in testcase.c
   printf '\0\0\003\001%s\n' "1 + 2" > "$WORKDIR/diff_repro_locals_pass/input.min"
   VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
