@@ -271,6 +271,17 @@ build_verify_runner() {
   ensure_target_templates "$REPO_ROOT" "$cache_dir"
   check_target_api_support "$REPO_ROOT"
 
+  local sub_loc_gen="$FUZZ_ROOT/test/fuzz/harness/gen_node_locations.rb"
+  local sub_loc_inc="$FUZZ_ROOT/test/fuzz/harness/node_locations.inc"
+  if [ -f "$sub_loc_gen" ] && [ -f "$FUZZ_ROOT/config.yml" ] && [ -w "$FUZZ_ROOT/test/fuzz/harness" ]; then
+    if [ ! -f "$sub_loc_inc" ] || [ "$FUZZ_ROOT/config.yml" -nt "$sub_loc_inc" ] || [ "$sub_loc_gen" -nt "$sub_loc_inc" ]; then
+      ruby "$sub_loc_gen" >&2 || {
+        echo "verify_bucket.sh: failed to generate $sub_loc_inc" >&2
+        exit 125
+      }
+    fi
+  fi
+
   local cc="${CC:-clang}"
   local max_input="${FUZZ_MAX_INPUT_SIZE:-1024}"
   local max_alloc="${FUZZ_MAX_ALLOCATED:-128}"
@@ -296,8 +307,9 @@ build_verify_runner() {
 
     # Probe historical Prism C API differences across 2024–2026 commits so older commits compile cleanly.
     local probe_flags
-    probe_flags="$(ruby -e '
+    probe_flags="$(VERIFY_PROBE_FUZZ_ROOT="$FUZZ_ROOT" ruby -e '
       inc = ARGV[0]
+      fuzz_root = ENV.fetch("VERIFY_PROBE_FUZZ_ROOT", "")
       hdrs = Dir.glob(File.join(inc, "**", "*.h")).sort.map { |p| File.read(p, encoding: "BINARY") }.join("\n")
       code = hdrs.gsub(%r{//[^\n]*|/\*.*?\*/}m, " ")
 
@@ -307,6 +319,30 @@ build_verify_runner() {
 
       unless File.file?(File.join(inc, "prism", "internal", "buffer.h"))
         out << "-DPRISM_FUZZ_NO_INTERNAL_BUFFER"
+      end
+
+      sub_loc_inc = fuzz_root.empty? ? nil : File.join(fuzz_root, "test", "fuzz", "harness", "node_locations.inc")
+      if sub_loc_inc && File.file?(sub_loc_inc)
+        struct_fields = {}
+        code.scan(/typedef\s+struct\s*[A-Za-z0-9_]*\s*\{([^}]*)\}\s*(pm_[A-Za-z0-9_]+_t)\s*;/) do |body, sname|
+          struct_fields[sname] = body.scan(/\bpm_location_t\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/).flatten
+        end
+        cur_struct = nil
+        sub_loc_compat = true
+        File.read(sub_loc_inc, encoding: "BINARY").each_line do |ln|
+          if ln =~ /\bcase\s+(PM_[A-Z0-9_]+):/
+            sub_loc_compat = false unless code.match?(/\b#{Regexp.escape(Regexp.last_match(1))}\b/)
+          elsif ln =~ /\(\s*const\s+(pm_[a-z0-9_]+_t)\s*\*\)/
+            cur_struct = Regexp.last_match(1)
+            sub_loc_compat = false unless struct_fields.key?(cur_struct)
+          elsif ln =~ /cast->([a-z0-9_]+)/
+            sub_loc_compat = false unless cur_struct && struct_fields[cur_struct]&.include?(Regexp.last_match(1))
+          end
+          break unless sub_loc_compat
+        end
+        out << "-DPRISM_FUZZ_NO_SUB_LOCATIONS" unless sub_loc_compat
+      else
+        out << "-DPRISM_FUZZ_NO_SUB_LOCATIONS"
       end
 
       # Options API

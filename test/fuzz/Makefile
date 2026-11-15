@@ -80,7 +80,11 @@ $(FUZZ_AFL_STAMP): test/fuzz/patches/aflplusplus.patch
 	$(Q) touch $@
 
 
-$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(FUZZ_DIFF_DEPS) $(HEADERS) $(wildcard ext/prism/*) test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
+test/fuzz/harness/node_locations.inc: test/fuzz/harness/gen_node_locations.rb config.yml
+	$(ECHO) "generating $@"
+	$(Q) ruby ./test/fuzz/harness/gen_node_locations.rb
+
+$(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(FUZZ_DIFF_DEPS) $(HEADERS) $(wildcard ext/prism/*) test/fuzz/harness/node_locations.inc test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN (SLOW)"
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
@@ -170,12 +174,12 @@ fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 	fi; \
 	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
 
-fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP)
+fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP) test/fuzz/harness/node_locations.inc
 	$(ECHO) "Templates up to date"
 
 $(FUZZ_GEN_TEMPLATES_STAMP): $(FUZZ_TEMPLATE_DEPS) | $(FUZZ_DOCKER_STAMP)
 	$(ECHO) "generating templates"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "bundle exec rake templates"
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "bundle exec rake templates && ruby ./test/fuzz/harness/gen_node_locations.rb"
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
 

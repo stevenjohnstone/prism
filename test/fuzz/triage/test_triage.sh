@@ -68,6 +68,15 @@ n3=$(printf "INVARIANT[node_location]: type=PM_CALL_NODE kind=end_oob [detail: p
 [ "$n1" != "$n3" ] || fail "INVARIANT[node_location] collided across distinct node types ($n1 == $n3)"
 [ "$i1" != "$n1" ] || fail "INVARIANT[diagnostic] collided with INVARIANT[node_location] ($i1 == $n1)"
 
+sl1=$(printf "INVARIANT[node_sub_location]: type=PM_CALL_NODE field=message_loc kind=length_underflow [detail: parent=PM_STATEMENTS_NODE start=8 length=4294967292 parsed_size=20]\n#0 0x1 in fuzz_check_sub_location\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+sl2=$(printf "INVARIANT[node_sub_location]: type=PM_CALL_NODE field=message_loc kind=length_underflow [detail: parent=PM_CALL_NODE start=0 length=4294967290 parsed_size=12]\n#0 0x9 in fuzz_check_sub_location\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+sl3=$(printf "INVARIANT[node_sub_location]: type=PM_CALL_NODE field=opening_loc kind=length_underflow [detail: parent=PM_STATEMENTS_NODE start=8 length=4294967292 parsed_size=20]\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+sl4=$(printf "INVARIANT[node_sub_location]: type=PM_CALL_NODE field=message_loc kind=end_oob [detail: parent=PM_STATEMENTS_NODE start=8 length=4294967292 parsed_size=20]\n" | SIGLINES=15 ./test/fuzz/triage/signature.sh)
+[ "$sl1" = "$sl2" ] || fail "INVARIANT[node_sub_location] varied across offsets or parent ($sl1 != $sl2)"
+[ "$sl1" != "$sl3" ] || fail "INVARIANT[node_sub_location] collided across distinct fields ($sl1 == $sl3)"
+[ "$sl1" != "$sl4" ] || fail "INVARIANT[node_sub_location] collided across distinct violation kinds ($sl1 == $sl4)"
+[ "$sl1" != "$n3" ] || fail "INVARIANT[node_sub_location] collided with INVARIANT[node_location] ($sl1 == $n3)"
+
 ruby -e 'File.write(ARGV.fetch(0), "stack frame 0xdeadbeef in fn\n" * 5000)' "$WORKDIR/big_trace.txt"
 SIGLINES=3 ./test/fuzz/triage/signature.sh < "$WORKDIR/big_trace.txt" >/dev/null
 ruby -e 'File.write(ARGV.fetch(0), "INVARIANT[stream]: kind=parsed_size_oob [detail: parsed_size=9 size=4]\n" + ("stack frame 0xdeadbeef in fn\n" * 5000))' "$WORKDIR/big_inv_trace.txt"
@@ -270,6 +279,11 @@ tc_node_loc_c = c_program(
   "test node loc",
   crash_output: "INVARIANT[node_location]: type=PM_CALL_NODE kind=end_oob\n"
 )
+tc_node_sub_loc_c = c_program(
+  node_loc_in,
+  "test node sub loc",
+  crash_output: "INVARIANT[node_sub_location]: type=PM_CALL_NODE field=message_loc kind=length_underflow\n"
+)
 tc_err_rec_c = c_program(
   node_loc_in,
   "test error recovery",
@@ -341,6 +355,7 @@ File.write(File.join(workdir, "tc_empty.c"), tc_empty_c)
 File.write(File.join(workdir, "tc_min_oob.c"), tc_min_oob_c)
 File.write(File.join(workdir, "tc_stream_slow.c"), tc_stream_slow_c)
 File.write(File.join(workdir, "tc_node_loc.c"), tc_node_loc_c)
+File.write(File.join(workdir, "tc_node_sub_loc.c"), tc_node_sub_loc_c)
 File.write(File.join(workdir, "tc_err_rec.c"), tc_err_rec_c)
 File.write(File.join(workdir, "tc_err_rec_fail.c"), tc_err_rec_fail_c)
 File.write(File.join(workdir, "tc_node_rel.c"), tc_node_rel_c)
@@ -509,6 +524,17 @@ raise "unexpected invariant parse: #{parsed_inv.inspect}" unless parsed_inv.dig(
                                                                  parsed_inv["frames"][3]["file"] == "src/prism.c" &&
                                                                  parsed_inv["frames"][3]["line"] == 20_046
 
+parsed_sub_inv = parse_crash_output(
+  "INVARIANT[node_sub_location]: type=PM_CALL_NODE field=message_loc kind=length_underflow [detail: parent=PM_STATEMENTS_NODE start=8 length=4294967292 parsed_size=20]\n" \
+  "    #0 0xffff9c3374d8 in abort stdlib/abort.c:79:7\n" \
+  "    #1 0xaaaa in fuzz_check_sub_location /prism/test/fuzz/harness/parse.c:884:9\n"
+)
+raise "unexpected sub_location invariant parse: #{parsed_sub_inv.inspect}" unless parsed_sub_inv.dig("symptom", "invariant", "namespace") == "node_sub_location" &&
+                                                                                  parsed_sub_inv.dig("symptom", "invariant", "fields", "type") == "PM_CALL_NODE" &&
+                                                                                  parsed_sub_inv.dig("symptom", "invariant", "fields", "field") == "message_loc" &&
+                                                                                  parsed_sub_inv.dig("symptom", "invariant", "fields", "kind") == "length_underflow" &&
+                                                                                  parsed_sub_inv.dig("symptom", "invariant", "detail", "length") == 4_294_967_292
+
 parsed_ub = parse_crash_output(
   "src/prism.c:15213:5: runtime error: signed integer overflow: 1 + 2147483647 cannot be represented in type 'int32_t'\n" \
   "    #0 0xaaaa in parser_warn_indentation_mismatch /prism/src/prism.c:15213:5\n" \
@@ -540,7 +566,7 @@ mkdir -p "$WORKDIR/prism_objs"
 )
 ar rcs "$WORKDIR/libprism_test.a" "$WORKDIR/prism_objs/"*.o
 
-for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_err_rec tc_err_rec_fail tc_node_rel tc_diag_sem tc_rec_depth tc_stream_diff; do
+for name in tc_nonempty tc_empty tc_min_oob tc_stream_slow tc_node_loc tc_node_sub_loc tc_err_rec tc_err_rec_fail tc_node_rel tc_diag_sem tc_rec_depth tc_stream_diff; do
     clang -O1 -c -std=c99 -Wall -Wextra -Wpedantic -Wundef -Wconversion -Wstrict-prototypes -Werror \
         -fsanitize=address,undefined -Iinclude "$WORKDIR/$name.c" -o "$WORKDIR/$name.o"
     clang -fsanitize=address,undefined "$WORKDIR/$name.o" "$WORKDIR/libprism_test.a" -o "$WORKDIR/$name"
@@ -551,6 +577,7 @@ done
 "$WORKDIR/tc_min_oob"
 "$WORKDIR/tc_stream_slow"
 "$WORKDIR/tc_node_loc"
+"$WORKDIR/tc_node_sub_loc"
 "$WORKDIR/tc_err_rec"
 set +e
 "$WORKDIR/tc_err_rec_fail" > /dev/null 2>&1
@@ -634,6 +661,51 @@ grep -q "INVARIANT\[stream_diff\]: kind=spurious_stop" "$WORKDIR/sd_midline.err"
 grep -q "INVARIANT\[stream_diff\]: kind=spurious_stop" "$WORKDIR/sd_str.err" || fail "expected kind=spurious_stop on NUL-in-string + mid-line __END__, got: $(cat "$WORKDIR/sd_str.err")"
 [ "$zero_er_rc" -ne 0 ] || fail "expected module:A\\nend zero-error ErrorRecoveryNode to abort"
 grep -q "INVARIANT\[error_recovery\]: kind=zero_errors" "$WORKDIR/zero_er.err" || fail "expected kind=zero_errors on module:A\\nend, got: $(cat "$WORKDIR/zero_er.err")"
+
+cat << 'C' > "$WORKDIR/sub_loc_fast_test.c"
+#include "parse.c"
+
+int main(void) {
+    pm_call_node_t call = {
+        .base = {
+            .type = PM_CALL_NODE,
+            .location = { .start = 0, .length = 10 },
+        },
+        .message_loc = { .start = 8, .length = 4294967292U },
+    };
+    fuzz_node_check_t ctx = {
+        .source = (const uint8_t *) "<<H\n#{\"\"[e* =k&until",
+        .parsed_size = 20,
+        .parent_type = PM_STATEMENTS_NODE,
+        .parser = NULL,
+        .depth = 1,
+    };
+    fuzz_check_node_sub_locations(&call.base, &ctx);
+    return 0;
+}
+C
+clang -O1 -std=c99 -DPRISM_DEPTH_MAXIMUM=128 -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch \
+    -fsanitize=address,undefined -Iinclude -Itest/fuzz/harness "$WORKDIR/sub_loc_fast_test.c" "$WORKDIR/libprism_test.a" -o "$WORKDIR/sub_loc_fast_test"
+set +e
+"$WORKDIR/sub_loc_fast_test" >"$WORKDIR/sub_loc_fast.out" 2>"$WORKDIR/sub_loc_fast.err"
+sub_loc_rc=$?
+set -e
+[ "$sub_loc_rc" -ne 0 ] || fail "expected fast sub-location checker to abort on PM_CALL_NODE.message_loc length_underflow"
+grep -q "INVARIANT\[node_sub_location\]: type=PM_CALL_NODE field=message_loc kind=length_underflow" "$WORKDIR/sub_loc_fast.err" || fail "expected INVARIANT[node_sub_location] for PM_CALL_NODE.message_loc, got: $(cat "$WORKDIR/sub_loc_fast.err")"
+
+# Verify historical header probe falls back cleanly to -DPRISM_FUZZ_NO_SUB_LOCATIONS when node_locations.inc references a field absent from ast.h.
+mock_fuzz_root="$WORKDIR/mock_fuzz_root"
+mkdir -p "$mock_fuzz_root/test"
+cp -R "$PWD/test/fuzz" "$mock_fuzz_root/test/"
+cat << 'C' >> "$mock_fuzz_root/test/fuzz/harness/node_locations.inc"
+    case PM_CALL_NODE: {
+        const pm_call_node_t *cast = (const pm_call_node_t *) node;
+        fuzz_check_sub_location(node, "legacy_missing_loc", cast->legacy_missing_loc, ctx);
+        break;
+    }
+C
+legacy_runner="$(VERIFY_BUILD_DIR="$WORKDIR/sub_loc_compat_verify_build" "$PWD/test/fuzz/triage/verify_bucket.sh" --repo-root "$PWD" --fuzz-root "$mock_fuzz_root" --profile asan_ubsan --build-only)"
+[ -x "$legacy_runner" ] || fail "expected verify_bucket.sh to compile cleanly with missing sub-location field via -DPRISM_FUZZ_NO_SUB_LOCATIONS"
 
 FUZZ_MAX_INPUT_SIZE=8192 ruby test/fuzz/runtime/corpus.rb --no-minimize "$WORKDIR/corpus_8k" >/dev/null
 [ -f "$WORKDIR/corpus_8k/opt_stream_long_line.rb" ] || fail "expected opt_stream_long_line.rb when FUZZ_MAX_INPUT_SIZE=8192"

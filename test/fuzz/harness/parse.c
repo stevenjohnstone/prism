@@ -868,6 +868,41 @@ static void fuzz_check_node_relations(const pm_node_t *node, const uint8_t *sour
 /* TRIAGE_SLICE_END(node_relations) */
 #endif
 
+#if !defined(PRISM_FUZZ_NO_VISIT_NODE) && !defined(PRISM_FUZZ_NO_SUB_LOCATIONS)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void fuzz_check_sub_location(
+    const pm_node_t *node,
+    const char *field_name,
+    pm_location_t raw_loc,
+    const fuzz_node_check_t *ctx
+) {
+    fuzz_span_t loc = fuzz_loc_span(raw_loc, ctx->source);
+    const char *kind = fuzz_span_violation_kind(loc.start, loc.length, ctx->parsed_size);
+    if (kind != NULL) {
+        fuzz_invariant_fail(
+            "INVARIANT[node_sub_location]: type=%s field=%s kind=%s [detail: parent=%s start=%u length=%u parsed_size=%zu]\n",
+            fuzz_safe_node_name(node->type),
+            field_name,
+            kind,
+            ctx->parent_type == 0 ? "ROOT" : fuzz_safe_node_name(ctx->parent_type),
+            loc.start,
+            loc.length,
+            ctx->parsed_size
+        );
+    }
+}
+
+static void fuzz_check_node_sub_locations(const pm_node_t *node, const fuzz_node_check_t *ctx) {
+    switch (node->type) {
+#include "node_locations.inc"
+        default:
+            break;
+    }
+}
+#endif
+
 static void fuzz_for_each_error_diag(pm_parser_t *parser, void (*fn)(const pm_diagnostic_t *, void *), void *ctx) {
 #ifdef PRISM_FUZZ_LIST_ITERATORS
     for (const pm_diagnostic_t *d = (const pm_diagnostic_t *) parser->error_list.head; d != NULL; d = (const pm_diagnostic_t *) d->node.next) {
@@ -981,6 +1016,9 @@ static pm_visit_result_t check_node_location(const pm_node_t *node, void *data) 
         .depth = cur_depth,
     };
     pm_visit_child_nodes(node, check_node_location, &child_ctx);
+#if !defined(PRISM_FUZZ_NO_SUB_LOCATIONS)
+    fuzz_check_node_sub_locations(node, ctx);
+#endif
 #if !defined(PRISM_FUZZ_POINTER_LOCATIONS) && !defined(PRISM_FUZZ_NO_NODE_RELATIONS)
     /* Check container relations after descendants so child node_location
      * underflows/OOB report before parent list geometry checks. */

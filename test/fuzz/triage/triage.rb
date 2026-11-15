@@ -375,6 +375,8 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     need_node: false,
     need_parsed_size: false,
     need_check_node_helper: false,
+    need_check_node_sub_location_helper: false,
+    sub_loc_check: nil,
     need_check_error_recovery_helper: false,
     need_check_node_relation_helper: false,
     need_check_recursion_depth_helper: false,
@@ -415,6 +417,15 @@ def post_parse_plan(crash_output, executable, stream_mode, source_ptr)
     plan[:need_check_node_helper] = true
     plan[:need_assert] = true
     plan[:lines] = ["pm_visit_node(node, check_node_location, &parsed_size);"]
+  elsif crash_output.include?("INVARIANT[node_sub_location]:")
+    plan[:need_node] = true
+    plan[:need_parsed_size] = true
+    plan[:need_check_node_sub_location_helper] = true
+    if (m = crash_output.match(/\bINVARIANT\[node_sub_location\]:[^\r\n]*\btype=(PM_[A-Z0-9_]+)\b[^\r\n]*\bfield=([a-z0-9_]+)\b/))
+      plan[:sub_loc_check] = { node_type: m[1], struct_type: "#{m[1].downcase}_t", field: m[2] }
+    end
+    plan[:need_assert] = true
+    plan[:lines] = ["pm_visit_node(node, check_node_sub_location, &parsed_size);"]
   elsif crash_output.include?("INVARIANT[error_recovery]:")
     plan[:need_node] = true
     plan[:need_check_error_recovery_helper] = true
@@ -841,6 +852,29 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
         (void)data;
         assert(node->type != PM_ERROR_RECOVERY_NODE);
         return PM_VISIT_DESCEND;
+      }
+    C
+  end
+
+  if plan[:need_check_node_sub_location_helper]
+    sub = plan[:sub_loc_check]
+    check_expr =
+      if sub
+        <<~C.chomp
+          if (node->type == #{sub[:node_type]}) {
+              pm_location_t loc = ((const #{sub[:struct_type]} *)node)->#{sub[:field]};
+              assert((size_t)loc.start <= parsed_size && (size_t)loc.length <= parsed_size - (size_t)loc.start);
+            }
+        C
+      else
+        "assert((size_t)node->location.start <= parsed_size && (size_t)node->location.length <= parsed_size - (size_t)node->location.start);"
+      end
+    helpers << <<~C.chomp
+      static pm_visit_result_t check_node_sub_location(const pm_node_t *node, void *data) {
+        size_t parsed_size = *(const size_t *)data;
+        pm_visit_child_nodes(node, check_node_sub_location, data);
+        #{check_expr}
+        return PM_VISIT_SKIP;
       }
     C
   end

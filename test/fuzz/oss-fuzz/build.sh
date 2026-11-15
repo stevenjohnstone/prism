@@ -10,6 +10,7 @@ cd "$REPO_ROOT"
 
 # Generate C parser headers and sources from templates using Ruby stdlib only.
 ruby templates/template.rb
+ruby test/fuzz/harness/gen_node_locations.rb
 
 WORK_DIR="${WORK:-}"
 CLEANUP_WORK=0

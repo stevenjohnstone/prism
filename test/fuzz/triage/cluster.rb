@@ -51,6 +51,8 @@ module FuzzClustering
     fuzz_stream_fgets
     fuzz_stream_feof
     check_node_location
+    fuzz_check_sub_location
+    fuzz_check_node_sub_locations
     check_diagnostic_locations
     check_comment_locations
     harness_parse

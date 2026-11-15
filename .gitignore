@@ -66,6 +66,7 @@ out.svg
 /src/serialize.c
 /src/tokens.c
 /src/**/*.o
+/test/fuzz/harness/node_locations.inc
 
 compile_commands.json
 .cache/
