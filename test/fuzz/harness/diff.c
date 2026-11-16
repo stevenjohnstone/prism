@@ -992,6 +992,25 @@ static void diff_tree_open_attrasgn(diff_summary_t *out, const char *name, size_
     diff_tree_open(out, DIFF_TOK_ATTRASGN, name, len);
 }
 
+/* CRuby parse.y lowers conditional `/#{...}/` (and regexes like `/ #$ /`) to
+ * `(MATCH2 <REGX|DREGX> (GVAR :$_))`; lower both static and interpolated forms symmetrically. */
+static void diff_tree_open_match_last_line(diff_summary_t *out) {
+    diff_tree_open_cstr(out, DIFF_TOK_CALL, "=~");
+    diff_tree_open_slot(out, "recv");
+}
+
+static void diff_tree_close_match_last_line(diff_summary_t *out) {
+    diff_tree_close(out);
+    diff_tree_open_slot(out, "args");
+    diff_tree_open_slot(out, "arg");
+    diff_tree_leaf_cstr(out, DIFF_TOK_GVAR, "$_");
+    diff_tree_close(out);
+    diff_tree_close(out);
+    diff_tree_open_slot(out, "blk");
+    diff_tree_close(out);
+    diff_tree_close(out);
+}
+
 static void diff_summary_init(diff_summary_t *s) {
     diff_strbuf_init(&s->strbuf);
     diff_scope_vec_init(&s->scopes);
@@ -1929,12 +1948,14 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
                 size_t clen = 0;
                 diff_prism_const_buf(ctx->parser, call->name, &cname, &clen);
                 diff_prism_tree_open_const(ctx, tag, call->name);
-                /* CRuby parse.y lowers empty `not()` to `(OPCALL (NIL) :! nil)`. */
+                /* CRuby parse.y lowers unspaced `not()` to `(OPCALL (NIL) :! nil)`,
+                 * whereas `not ()` with whitespace becomes `(OPCALL (BEGIN nil) :! nil)`. */
                 bool is_empty_not = clen == 1 && cname[0] == '!' &&
                     call->message_loc.length == 3 &&
                     call->receiver != NULL &&
                     PM_NODE_TYPE_P(call->receiver, PM_PARENTHESES_NODE) &&
-                    ((const pm_parentheses_node_t *) call->receiver)->body == NULL;
+                    ((const pm_parentheses_node_t *) call->receiver)->body == NULL &&
+                    ((const pm_parentheses_node_t *) call->receiver)->opening_loc.start == call->message_loc.start + 3;
                 if (is_empty_not) {
                     diff_tree_open_slot(ctx->out, "recv");
                     diff_tree_leaf_cstr(ctx->out, DIFF_TOK_NIL, NULL);
@@ -2637,7 +2658,11 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
         case PM_SYMBOL_NODE:          diff_tree_leaf_cstr(ctx->out, DIFF_TOK_SYM, NULL);      break;
         case PM_REGULAR_EXPRESSION_NODE: diff_tree_leaf_cstr(ctx->out, DIFF_TOK_REGX, NULL);  break;
         case PM_X_STRING_NODE:        diff_tree_leaf_cstr(ctx->out, DIFF_TOK_XSTR, NULL);     break;
-        case PM_MATCH_LAST_LINE_NODE: diff_tree_leaf_cstr(ctx->out, DIFF_TOK_MATCH_LAST_LINE, NULL); break;
+        case PM_MATCH_LAST_LINE_NODE:
+            diff_tree_open_match_last_line(ctx->out);
+            diff_tree_leaf_cstr(ctx->out, DIFF_TOK_REGX, NULL);
+            diff_tree_close_match_last_line(ctx->out);
+            break;
         case PM_INTERPOLATED_STRING_NODE:
             diff_prism_visit_interpolated(node, &((const pm_interpolated_string_node_t *) node)->parts, DIFF_TOK_DSTR, DIFF_TOK_STR, ctx);
             break;
@@ -2651,19 +2676,9 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
             diff_prism_visit_interpolated(node, &((const pm_interpolated_x_string_node_t *) node)->parts, DIFF_TOK_DXSTR, DIFF_TOK_XSTR, ctx);
             break;
         case PM_INTERPOLATED_MATCH_LAST_LINE_NODE:
-            /* CRuby parse.y desugars conditional `/#{...}/` to `(MATCH2 (DREGX ...) (GVAR :$_))`. */
-            diff_tree_open_cstr(ctx->out, DIFF_TOK_CALL, "=~");
-            diff_tree_open_slot(ctx->out, "recv");
+            diff_tree_open_match_last_line(ctx->out);
             diff_prism_visit_interpolated(node, &((const pm_interpolated_match_last_line_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_REGX, ctx);
-            diff_tree_close(ctx->out);
-            diff_tree_open_slot(ctx->out, "args");
-            diff_tree_open_slot(ctx->out, "arg");
-            diff_tree_leaf_cstr(ctx->out, DIFF_TOK_GVAR, "$_");
-            diff_tree_close(ctx->out);
-            diff_tree_close(ctx->out);
-            diff_tree_open_slot(ctx->out, "blk");
-            diff_tree_close(ctx->out);
-            diff_tree_close(ctx->out);
+            diff_tree_close_match_last_line(ctx->out);
             break;
         case PM_ARRAY_PATTERN_NODE: {
             const pm_array_pattern_node_t *ap = (const pm_array_pattern_node_t *) node;
@@ -4147,7 +4162,9 @@ static void diff_cruby_visit_node_ctx(VALUE node, diff_cruby_ctx_t ctx) {
     } else if (tid == diff_ids.xstr) {
         diff_tree_leaf_cstr(ctx.out, DIFF_TOK_XSTR, NULL);
     } else if (tid == diff_ids.match_n) {
-        diff_tree_leaf_cstr(ctx.out, DIFF_TOK_MATCH_LAST_LINE, NULL);
+        diff_tree_open_match_last_line(ctx.out);
+        diff_tree_leaf_cstr(ctx.out, DIFF_TOK_REGX, NULL);
+        diff_tree_close_match_last_line(ctx.out);
     } else if (tid == diff_ids.dstr) {
         diff_cruby_visit_dstr_like(ch, DIFF_TOK_DSTR, DIFF_TOK_STR, ctx);
     } else if (tid == diff_ids.dsym) {
