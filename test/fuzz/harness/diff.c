@@ -1320,6 +1320,29 @@ static void diff_prism_emit_forwarding_args(diff_prism_ctx_t *ctx) {
     diff_tree_close(ctx->out);
 }
 
+static void diff_prism_emit_seq_elem(
+    const pm_node_t *elem,
+    size_t idx,
+    const char *slot_name,
+    diff_prism_ctx_t *ctx
+) {
+    if (idx > 0 && elem != NULL && PM_NODE_TYPE_P(elem, PM_SPLAT_NODE)) {
+        const pm_splat_node_t *sp = (const pm_splat_node_t *) elem;
+        if (sp->expression != NULL && PM_NODE_TYPE_P(sp->expression, PM_ARRAY_NODE)) {
+            const pm_array_node_t *inner = (const pm_array_node_t *) sp->expression;
+            for (size_t j = 0; j < inner->elements.size; j++) {
+                diff_prism_emit_seq_elem(inner->elements.nodes[j], idx + j, slot_name, ctx);
+            }
+            return;
+        }
+    }
+    diff_tree_open_slot(ctx->out, slot_name);
+    if (elem != NULL) {
+        diff_prism_visit_expr(elem, ctx, true);
+    }
+    diff_tree_close(ctx->out);
+}
+
 static void diff_prism_emit_arguments(
     const pm_arguments_node_t *args,
     const pm_node_t *block,
@@ -1335,11 +1358,7 @@ static void diff_prism_emit_arguments(
                 has_fwd = true;
                 diff_prism_emit_forwarding_args(ctx);
             } else {
-                diff_tree_open_slot(ctx->out, "arg");
-                if (arg != NULL) {
-                    diff_prism_visit_expr(arg, ctx, true);
-                }
-                diff_tree_close(ctx->out);
+                diff_prism_emit_seq_elem(arg, i, "arg", ctx);
             }
         }
     }
@@ -1569,59 +1588,38 @@ static void diff_prism_visit_hash_elems(const pm_node_list_t *elements, diff_pri
     diff_tree_close(ctx->out);
 }
 
-static void diff_prism_visit_logical(const pm_node_t *node, diff_tok_tag_t tag, pm_node_type_t ntype, diff_prism_ctx_t *ctx) {
-    /*
-     * CRuby AST::Node#children flattens right-nested AND/OR chains (a && (b && c) vs a && b && c),
-     * whereas Prism left-nests unparenthesized chains. Flatten unparenthesized left chains to match.
-     */
-    const pm_node_t *stack_items[16];
-    const pm_node_t **items = stack_items;
-    size_t chain_cap = 16;
-    size_t chain_len = 0;
-    const pm_node_t *cur = node;
-    while (cur != NULL && PM_NODE_TYPE_P(cur, ntype)) {
+static void diff_prism_visit_logical_leaf(const pm_node_t *node, pm_node_type_t ntype, diff_prism_ctx_t *ctx) {
+    if (node != NULL && PM_NODE_TYPE_P(node, ntype) && ctx->depth < DIFF_MAX_AST_DEPTH) {
         const pm_node_t *left = NULL;
         const pm_node_t *right = NULL;
         if (ntype == PM_AND_NODE) {
-            left = ((const pm_and_node_t *) cur)->left;
-            right = ((const pm_and_node_t *) cur)->right;
+            left = ((const pm_and_node_t *) node)->left;
+            right = ((const pm_and_node_t *) node)->right;
         } else if (ntype == PM_OR_NODE) {
-            left = ((const pm_or_node_t *) cur)->left;
-            right = ((const pm_or_node_t *) cur)->right;
+            left = ((const pm_or_node_t *) node)->left;
+            right = ((const pm_or_node_t *) node)->right;
         } else {
-            left = ((const pm_alternation_pattern_node_t *) cur)->left;
-            right = ((const pm_alternation_pattern_node_t *) cur)->right;
+            left = ((const pm_alternation_pattern_node_t *) node)->left;
+            right = ((const pm_alternation_pattern_node_t *) node)->right;
         }
-        if (chain_len == chain_cap) {
-            chain_cap *= 2;
-            const pm_node_t **next = (const pm_node_t **) (
-                items == stack_items
-                    ? malloc(chain_cap * sizeof(const pm_node_t *))
-                    : realloc(items, chain_cap * sizeof(const pm_node_t *))
-            );
-            if (next == NULL) {
-                if (items != stack_items) {
-                    free(items);
-                }
-                abort();
-            }
-            if (items == stack_items) {
-                memcpy(next, stack_items, chain_len * sizeof(const pm_node_t *));
-            }
-            items = next;
-        }
-        items[chain_len++] = right;
-        cur = left;
+        ctx->depth++;
+        diff_prism_visit_logical_leaf(left, ntype, ctx);
+        diff_prism_visit_logical_leaf(right, ntype, ctx);
+        ctx->depth--;
+        return;
     }
+    diff_prism_visit_child(node, ctx);
+}
+
+static void diff_prism_visit_logical(const pm_node_t *node, diff_tok_tag_t tag, pm_node_type_t ntype, diff_prism_ctx_t *ctx) {
+    /*
+     * CRuby AST::Node#children flattens right-nested AND/OR chains (e.g. `2 or 3 || 3`
+     * or `a && b && c`), while stopping at ParenthesesNode (`NODE_BLOCK`). Flatten both
+     * unparenthesized child chains recursively in Prism so precedence grouping matches.
+     */
     diff_tree_open_cstr(ctx->out, tag, NULL);
-    diff_prism_visit_child(cur, ctx);
-    for (size_t i = chain_len; i > 0; i--) {
-        diff_prism_visit_child(items[i - 1], ctx);
-    }
+    diff_prism_visit_logical_leaf(node, ntype, ctx);
     diff_tree_close(ctx->out);
-    if (items != stack_items) {
-        free(items);
-    }
 }
 
 static void diff_prism_visit_ret_like(const pm_arguments_node_t *args, diff_tok_tag_t tag, diff_prism_ctx_t *ctx) {
@@ -1632,9 +1630,7 @@ static void diff_prism_visit_ret_like(const pm_arguments_node_t *args, diff_tok_
         } else if (args->arguments.size > 1) {
             diff_tree_open_cstr(ctx->out, DIFF_TOK_ARRAY, NULL);
             for (size_t i = 0; i < args->arguments.size; i++) {
-                diff_tree_open_slot(ctx->out, "elem");
-                diff_prism_visit_child(args->arguments.nodes[i], ctx);
-                diff_tree_close(ctx->out);
+                diff_prism_emit_seq_elem(args->arguments.nodes[i], i, "elem", ctx);
             }
             diff_tree_close(ctx->out);
         }
@@ -2059,9 +2055,7 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
             diff_tree_open_cstr(ctx->out, DIFF_TOK_WHEN, NULL);
             diff_tree_open_slot(ctx->out, "conds");
             for (size_t i = 0; i < wn->conditions.size; i++) {
-                diff_tree_open_slot(ctx->out, "elem");
-                diff_prism_visit_expr(wn->conditions.nodes[i], ctx, true);
-                diff_tree_close(ctx->out);
+                diff_prism_emit_seq_elem(wn->conditions.nodes[i], i, "elem", ctx);
             }
             diff_tree_close(ctx->out);
             diff_tree_open_slot(ctx->out, "body");
@@ -2192,9 +2186,7 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
             }
             diff_tree_open_cstr(ctx->out, DIFF_TOK_ARRAY, NULL);
             for (size_t i = 0; i < an->elements.size; i++) {
-                diff_tree_open_slot(ctx->out, "elem");
-                diff_prism_visit_expr(an->elements.nodes[i], ctx, true);
-                diff_tree_close(ctx->out);
+                diff_prism_emit_seq_elem(an->elements.nodes[i], i, "elem", ctx);
             }
             diff_tree_close(ctx->out);
             break;
@@ -2641,7 +2633,19 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
             diff_prism_visit_interpolated(&((const pm_interpolated_x_string_node_t *) node)->parts, DIFF_TOK_DXSTR, DIFF_TOK_XSTR, ctx);
             break;
         case PM_INTERPOLATED_MATCH_LAST_LINE_NODE:
-            diff_prism_visit_interpolated(&((const pm_interpolated_match_last_line_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_MATCH_LAST_LINE, ctx);
+            /* CRuby parse.y desugars conditional `/#{...}/` to `(MATCH2 (DREGX ...) (GVAR :$_))`. */
+            diff_tree_open_cstr(ctx->out, DIFF_TOK_CALL, "=~");
+            diff_tree_open_slot(ctx->out, "recv");
+            diff_prism_visit_interpolated(&((const pm_interpolated_match_last_line_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_REGX, ctx);
+            diff_tree_close(ctx->out);
+            diff_tree_open_slot(ctx->out, "args");
+            diff_tree_open_slot(ctx->out, "arg");
+            diff_tree_leaf_cstr(ctx->out, DIFF_TOK_GVAR, "$_");
+            diff_tree_close(ctx->out);
+            diff_tree_close(ctx->out);
+            diff_tree_open_slot(ctx->out, "blk");
+            diff_tree_close(ctx->out);
+            diff_tree_close(ctx->out);
             break;
         case PM_ARRAY_PATTERN_NODE: {
             const pm_array_pattern_node_t *ap = (const pm_array_pattern_node_t *) node;
@@ -2997,7 +3001,9 @@ static void diff_cruby_emit_seq_elems(VALUE val, const char *slot_name, diff_cru
         diff_cruby_ctx_t sub = ctx;
         sub.depth = ctx.depth + 1;
         VALUE head = RARRAY_AREF(ch, 0);
+        VALUE body = RARRAY_AREF(ch, 1);
         ID htid = diff_cruby_node_tid(head);
+        ID btid = diff_cruby_node_tid(body);
         if (htid == diff_ids.splat) {
             diff_tree_open_slot(ctx.out, slot_name);
             diff_cruby_visit_val_ctx(head, sub);
@@ -3005,12 +3011,17 @@ static void diff_cruby_emit_seq_elems(VALUE val, const char *slot_name, diff_cru
         } else {
             diff_cruby_emit_seq_elems(head, slot_name, sub, skip_errinfo);
         }
-        diff_tree_open_slot(ctx.out, slot_name);
-        diff_tree_open_cstr(ctx.out, DIFF_TOK_SPLAT, NULL);
-        sub.in_container = false;
-        diff_cruby_visit_val_ctx(RARRAY_AREF(ch, 1), sub);
-        diff_tree_close(ctx.out);
-        diff_tree_close(ctx.out);
+        if (btid == diff_ids.zlist || btid == diff_ids.list_n ||
+            btid == diff_ids.argscat || btid == diff_ids.argspush) {
+            diff_cruby_emit_seq_elems(body, slot_name, sub, skip_errinfo);
+        } else {
+            diff_tree_open_slot(ctx.out, slot_name);
+            diff_tree_open_cstr(ctx.out, DIFF_TOK_SPLAT, NULL);
+            sub.in_container = false;
+            diff_cruby_visit_val_ctx(body, sub);
+            diff_tree_close(ctx.out);
+            diff_tree_close(ctx.out);
+        }
     } else if (tid == diff_ids.argspush && len >= 2) {
         diff_cruby_ctx_t sub = ctx;
         sub.depth = ctx.depth + 1;
