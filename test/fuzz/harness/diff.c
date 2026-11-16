@@ -1220,7 +1220,11 @@ static void diff_prism_visit_stmt_list(const pm_statements_node_t *stmts, diff_p
     }
 }
 
-static bool diff_prism_node_is_static_str(const pm_node_t *node) {
+/* Check whether a node contains only static string content within `embed_budget`
+ * levels of `#{...}` interpolation (-1 = unlimited). Adjacent string concatenation
+ * stays at the same level, matching CRuby parse.y folding 1-level `#{plain_str}`
+ * into the parent DSTR/DSYM/DREGX while keeping deeper `EVSTR(DSTR ...)` explicit. */
+static bool diff_prism_node_is_static_str_depth(const pm_node_t *node, int embed_budget) {
     if (node == NULL) {
         return true;
     }
@@ -1228,16 +1232,20 @@ static bool diff_prism_node_is_static_str(const pm_node_t *node) {
         case PM_STRING_NODE:
             return true;
         case PM_EMBEDDED_STATEMENTS_NODE: {
+            if (embed_budget == 0) {
+                return false;
+            }
             const pm_embedded_statements_node_t *emb = (const pm_embedded_statements_node_t *) node;
             if (emb->statements == NULL || emb->statements->body.size != 1) {
                 return false;
             }
-            return diff_prism_node_is_static_str(emb->statements->body.nodes[0]);
+            int next_budget = embed_budget > 0 ? embed_budget - 1 : -1;
+            return diff_prism_node_is_static_str_depth(emb->statements->body.nodes[0], next_budget);
         }
         case PM_INTERPOLATED_STRING_NODE: {
             const pm_interpolated_string_node_t *istr = (const pm_interpolated_string_node_t *) node;
             for (size_t i = 0; i < istr->parts.size; i++) {
-                if (!diff_prism_node_is_static_str(istr->parts.nodes[i])) {
+                if (!diff_prism_node_is_static_str_depth(istr->parts.nodes[i], embed_budget)) {
                     return false;
                 }
             }
@@ -1264,7 +1272,7 @@ static void diff_prism_visit_interpolated_parts(const pm_node_list_t *parts, dif
             }
             case PM_EMBEDDED_STATEMENTS_NODE: {
                 const pm_embedded_statements_node_t *emb = (const pm_embedded_statements_node_t *) part;
-                if (diff_prism_node_is_static_str(part)) {
+                if (diff_prism_node_is_static_str_depth(part, 1)) {
                     break;
                 }
                 diff_prism_visit_stmt_list(emb->statements, ctx);
@@ -1283,19 +1291,26 @@ static void diff_prism_visit_interpolated_parts(const pm_node_list_t *parts, dif
 }
 
 static void diff_prism_visit_interpolated(
+    const pm_node_t *node,
     const pm_node_list_t *parts,
     diff_tok_tag_t dyn_tag,
     diff_tok_tag_t leaf_tag,
     diff_prism_ctx_t *ctx
 ) {
-    bool all_static = true;
+    bool all_cruby_folded = true;
+    bool all_deep_static = PM_NODE_FLAG_P(node, PM_NODE_FLAG_STATIC_LITERAL);
     for (size_t i = 0; i < parts->size; i++) {
-        if (!diff_prism_node_is_static_str(parts->nodes[i])) {
-            all_static = false;
+        if (!diff_prism_node_is_static_str_depth(parts->nodes[i], 1)) {
+            all_cruby_folded = false;
+        }
+        if (all_deep_static && !diff_prism_node_is_static_str_depth(parts->nodes[i], -1)) {
+            all_deep_static = false;
+        }
+        if (!all_cruby_folded && !all_deep_static) {
             break;
         }
     }
-    if (all_static) {
+    if (all_cruby_folded || all_deep_static) {
         diff_tree_leaf_cstr(ctx->out, leaf_tag, NULL);
         return;
     }
@@ -2621,22 +2636,22 @@ static void diff_prism_visit_expr(const pm_node_t *node, diff_prism_ctx_t *ctx, 
         case PM_X_STRING_NODE:        diff_tree_leaf_cstr(ctx->out, DIFF_TOK_XSTR, NULL);     break;
         case PM_MATCH_LAST_LINE_NODE: diff_tree_leaf_cstr(ctx->out, DIFF_TOK_MATCH_LAST_LINE, NULL); break;
         case PM_INTERPOLATED_STRING_NODE:
-            diff_prism_visit_interpolated(&((const pm_interpolated_string_node_t *) node)->parts, DIFF_TOK_DSTR, DIFF_TOK_STR, ctx);
+            diff_prism_visit_interpolated(node, &((const pm_interpolated_string_node_t *) node)->parts, DIFF_TOK_DSTR, DIFF_TOK_STR, ctx);
             break;
         case PM_INTERPOLATED_SYMBOL_NODE:
-            diff_prism_visit_interpolated(&((const pm_interpolated_symbol_node_t *) node)->parts, DIFF_TOK_DSYM, DIFF_TOK_SYM, ctx);
+            diff_prism_visit_interpolated(node, &((const pm_interpolated_symbol_node_t *) node)->parts, DIFF_TOK_DSYM, DIFF_TOK_SYM, ctx);
             break;
         case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE:
-            diff_prism_visit_interpolated(&((const pm_interpolated_regular_expression_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_REGX, ctx);
+            diff_prism_visit_interpolated(node, &((const pm_interpolated_regular_expression_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_REGX, ctx);
             break;
         case PM_INTERPOLATED_X_STRING_NODE:
-            diff_prism_visit_interpolated(&((const pm_interpolated_x_string_node_t *) node)->parts, DIFF_TOK_DXSTR, DIFF_TOK_XSTR, ctx);
+            diff_prism_visit_interpolated(node, &((const pm_interpolated_x_string_node_t *) node)->parts, DIFF_TOK_DXSTR, DIFF_TOK_XSTR, ctx);
             break;
         case PM_INTERPOLATED_MATCH_LAST_LINE_NODE:
             /* CRuby parse.y desugars conditional `/#{...}/` to `(MATCH2 (DREGX ...) (GVAR :$_))`. */
             diff_tree_open_cstr(ctx->out, DIFF_TOK_CALL, "=~");
             diff_tree_open_slot(ctx->out, "recv");
-            diff_prism_visit_interpolated(&((const pm_interpolated_match_last_line_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_REGX, ctx);
+            diff_prism_visit_interpolated(node, &((const pm_interpolated_match_last_line_node_t *) node)->parts, DIFF_TOK_DREGX, DIFF_TOK_REGX, ctx);
             diff_tree_close(ctx->out);
             diff_tree_open_slot(ctx->out, "args");
             diff_tree_open_slot(ctx->out, "arg");
