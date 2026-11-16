@@ -1239,11 +1239,78 @@ static void diff_prism_visit_stmt_list(const pm_statements_node_t *stmts, diff_p
     }
 }
 
+static bool diff_is_embdoc_boundary(const uint8_t *buf, size_t stop, size_t pos, const char *kw, size_t kw_len) {
+    if (pos == 0 || buf[pos - 1] != '\n' || pos + kw_len > stop) {
+        return false;
+    }
+    if (memcmp(buf + pos, kw, kw_len) != 0) {
+        return false;
+    }
+    if (pos + kw_len == stop) {
+        return true;
+    }
+    uint8_t next = buf[pos + kw_len];
+    return next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == '\v' || next == '\f' || next == '\0';
+}
+
+static bool diff_prism_emb_has_leading_semicolon(const pm_parser_t *parser, const pm_embedded_statements_node_t *emb) {
+    if (parser == NULL || emb == NULL || emb->statements == NULL || emb->statements->body.size == 0) {
+        return false;
+    }
+    const pm_node_t *first = emb->statements->body.nodes[0];
+    if (first == NULL || emb->opening_loc.start > first->location.start) {
+        return false;
+    }
+    const uint8_t *start = pm_parser_start(parser);
+    const uint8_t *end = pm_parser_end(parser);
+    if (start == NULL || end == NULL || end < start) {
+        return false;
+    }
+    size_t len = (size_t) (end - start);
+    size_t pos = (size_t) emb->opening_loc.start + (size_t) emb->opening_loc.length;
+    size_t stop = (size_t) first->location.start;
+    if (pos >= stop || stop > len) {
+        return false;
+    }
+    while (pos < stop) {
+        uint8_t c = start[pos];
+        if (c == ';') {
+            return true;
+        }
+        if (c == '#') {
+            while (pos < stop && start[pos] != '\n') {
+                pos++;
+            }
+            continue;
+        }
+        if (diff_is_embdoc_boundary(start, stop, pos, "=begin", 6)) {
+            pos += 6;
+            while (pos < stop && !diff_is_embdoc_boundary(start, stop, pos, "=end", 4)) {
+                pos++;
+            }
+            while (pos < stop && start[pos] != '\n') {
+                pos++;
+            }
+            continue;
+        }
+        pos++;
+    }
+    return false;
+}
+
 /* Check whether a node contains only static string content within `embed_budget`
  * levels of `#{...}` interpolation (-1 = unlimited). Adjacent string concatenation
  * stays at the same level, matching CRuby parse.y folding 1-level `#{plain_str}`
- * into the parent DSTR/DSYM/DREGX while keeping deeper `EVSTR(DSTR ...)` explicit. */
-static bool diff_prism_node_is_static_str_depth(const pm_node_t *node, int embed_budget) {
+ * into the parent DSTR/DSYM/DREGX while keeping deeper `EVSTR(DSTR ...)` explicit.
+ * Unless `fold_leading_semi` is set (used only for DREGX where object identity diverges),
+ * a leading `;` inside `#{;...}` is treated as unpacked `EVSTR(BLOCK(...))` to suppress
+ * zero-runtime-difference mismatches on DSYM/DSTR/DXSTR. */
+static bool diff_prism_node_is_static_str_depth(
+    const pm_parser_t *parser,
+    const pm_node_t *node,
+    int embed_budget,
+    bool fold_leading_semi
+) {
     if (node == NULL) {
         return true;
     }
@@ -1258,13 +1325,16 @@ static bool diff_prism_node_is_static_str_depth(const pm_node_t *node, int embed
             if (emb->statements == NULL || emb->statements->body.size != 1) {
                 return false;
             }
+            if (!fold_leading_semi && diff_prism_emb_has_leading_semicolon(parser, emb)) {
+                return false;
+            }
             int next_budget = embed_budget > 0 ? embed_budget - 1 : -1;
-            return diff_prism_node_is_static_str_depth(emb->statements->body.nodes[0], next_budget);
+            return diff_prism_node_is_static_str_depth(parser, emb->statements->body.nodes[0], next_budget, fold_leading_semi);
         }
         case PM_INTERPOLATED_STRING_NODE: {
             const pm_interpolated_string_node_t *istr = (const pm_interpolated_string_node_t *) node;
             for (size_t i = 0; i < istr->parts.size; i++) {
-                if (!diff_prism_node_is_static_str_depth(istr->parts.nodes[i], embed_budget)) {
+                if (!diff_prism_node_is_static_str_depth(parser, istr->parts.nodes[i], embed_budget, fold_leading_semi)) {
                     return false;
                 }
             }
@@ -1291,7 +1361,7 @@ static void diff_prism_visit_interpolated_parts(const pm_node_list_t *parts, dif
             }
             case PM_EMBEDDED_STATEMENTS_NODE: {
                 const pm_embedded_statements_node_t *emb = (const pm_embedded_statements_node_t *) part;
-                if (diff_prism_node_is_static_str_depth(part, 1)) {
+                if (diff_prism_node_is_static_str_depth(ctx->parser, part, 1, false)) {
                     break;
                 }
                 diff_prism_visit_stmt_list(emb->statements, ctx);
@@ -1318,11 +1388,12 @@ static void diff_prism_visit_interpolated(
 ) {
     bool all_cruby_folded = true;
     bool all_deep_static = PM_NODE_FLAG_P(node, PM_NODE_FLAG_STATIC_LITERAL);
+    bool fold_deep_semi = (dyn_tag == DIFF_TOK_DREGX);
     for (size_t i = 0; i < parts->size; i++) {
-        if (!diff_prism_node_is_static_str_depth(parts->nodes[i], 1)) {
+        if (!diff_prism_node_is_static_str_depth(ctx->parser, parts->nodes[i], 1, false)) {
             all_cruby_folded = false;
         }
-        if (all_deep_static && !diff_prism_node_is_static_str_depth(parts->nodes[i], -1)) {
+        if (all_deep_static && !diff_prism_node_is_static_str_depth(ctx->parser, parts->nodes[i], -1, fold_deep_semi)) {
             all_deep_static = false;
         }
         if (!all_cruby_folded && !all_deep_static) {
