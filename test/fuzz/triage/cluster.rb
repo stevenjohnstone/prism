@@ -355,6 +355,48 @@ module FuzzClustering
     fields.is_a?(Hash) ? fields : nil
   end
 
+  def parse_afl_time_ms(name_or_path)
+    return nil if name_or_path.nil?
+
+    m = File.basename(name_or_path.to_s).match(/(?:\A|,)time:(\d+)(?:,|\z)/)
+    m ? m[1].to_i : nil
+  end
+
+  def timestamp_sort_key(iso_str)
+    return [1, Float::INFINITY, ""] if iso_str.nil? || iso_str.empty?
+
+    [0, Time.iso8601(iso_str).to_f, iso_str]
+  rescue ArgumentError
+    [0, Float::INFINITY, iso_str]
+  end
+
+  def extract_bucket_timestamps(bucket)
+    occ = bucket["occurrences"].is_a?(Hash) ? bucket["occurrences"] : {}
+    first_seen_str = occ["first_seen"].to_s.strip
+    first_seen = first_seen_str.empty? ? nil : first_seen_str
+    last_seen_str = occ["last_seen"].to_s.strip
+    last_seen = last_seen_str.empty? ? nil : last_seen_str
+
+    raw_elapsed = occ["first_elapsed_ms"]
+    first_elapsed_ms = raw_elapsed.nil? ? nil : raw_elapsed.to_i
+    if first_elapsed_ms.nil? && occ["sample_crashes"].is_a?(Array)
+      candidates = occ["sample_crashes"].filter_map do |sample|
+        next unless sample.is_a?(Hash)
+
+        t_ms = sample["time_ms"] || parse_afl_time_ms(sample["filename"] || sample["path"])
+        next unless t_ms
+
+        [timestamp_sort_key(sample["mtime"].to_s.strip), t_ms.to_i]
+      end
+      best = candidates.min_by { |ts_key, ms| [ts_key, ms] }
+      if best && (first_seen.nil? || best[0][0] == 1 || (best[0] <=> timestamp_sort_key(first_seen)) <= 0)
+        first_elapsed_ms = best[1]
+      end
+    end
+
+    [first_seen, last_seen, first_elapsed_ms]
+  end
+
   def build_bucket_feature(bucket, cov_model, corpus_edge_df, frame_decay: FRAME_DECAY)
     oracle = oracle_family(bucket)
     cov_vec, cov_norm2, cov_available = extract_coverage_vector(bucket, cov_model, corpus_edge_df)
@@ -364,6 +406,7 @@ module FuzzClustering
       oracle: oracle
     )
     occ = bucket.dig("occurrences", "count").to_i
+    first_seen, last_seen, first_elapsed_ms = extract_bucket_timestamps(bucket)
     min_size = bucket.dig("input", "min_size_bytes")
 
     {
@@ -373,6 +416,9 @@ module FuzzClustering
       oracle: oracle,
       diff_fields: extract_diff_fields(bucket),
       occurrences: occ,
+      first_seen: first_seen,
+      first_elapsed_ms: first_elapsed_ms,
+      last_seen: last_seen,
       min_size_bytes: min_size,
       headline: bucket.dig("symptom", "headline").to_s,
       cov_vec: cov_vec,
@@ -575,6 +621,9 @@ module FuzzClustering
       "reason" => feature[:reason],
       "signature" => feature[:signature],
       "occurrences" => feature[:occurrences],
+      "first_seen" => feature[:first_seen],
+      "first_elapsed_ms" => feature[:first_elapsed_ms],
+      "last_seen" => feature[:last_seen],
       "min_size_bytes" => feature[:min_size_bytes],
       "headline" => feature[:headline],
       "top_prism_frame" => feature[:top_prism_frame]
@@ -701,6 +750,12 @@ module FuzzClustering
       reasons = Hash.new(0)
       member_feats.each { |f| reasons[f[:reason]] += 1 }
       sorted_members = member_feats.sort_by { |f| [-f[:occurrences], f[:id]] }
+      earliest = member_feats
+        .select { |f| f[:first_seen] || f[:first_elapsed_ms] }
+        .min_by { |f| [timestamp_sort_key(f[:first_seen]), f[:first_elapsed_ms] || Float::INFINITY, f[:id]] }
+      latest = member_feats
+        .select { |f| f[:last_seen] }
+        .max_by { |f| [timestamp_sort_key(f[:last_seen]), f[:id]] }
 
       {
         raw_cluster: c,
@@ -708,6 +763,10 @@ module FuzzClustering
         bucket_count: member_feats.size,
         reasons: reasons.sort.to_h,
         representative: rep,
+        first_seen: earliest&.fetch(:first_seen),
+        first_elapsed_ms: earliest&.fetch(:first_elapsed_ms),
+        first_seen_bucket: earliest&.fetch(:id),
+        last_seen: latest&.fetch(:last_seen),
         min_merge_similarity: c[:min_merge_sim],
         mean_pairwise_similarity: cluster_mean_similarity(c[:members], sim_matrix),
         buckets: sorted_members.map { |f| format_bucket_entry(f) }
@@ -726,6 +785,10 @@ module FuzzClustering
         "cluster_id" => cid,
         "bucket_count" => entry[:bucket_count],
         "occurrences" => entry[:occurrences],
+        "first_seen" => entry[:first_seen],
+        "first_elapsed_ms" => entry[:first_elapsed_ms],
+        "first_seen_bucket" => entry[:first_seen_bucket],
+        "last_seen" => entry[:last_seen],
         "reasons" => entry[:reasons],
         "representative" => format_bucket_entry(entry[:representative]),
         "min_merge_similarity" => entry[:min_merge_similarity].round(6),
@@ -754,6 +817,12 @@ module FuzzClustering
     max_inter = inter_pairs.empty? ? nil : inter_pairs.first["similarity"]
     min_intra = merge_similarities.empty? ? nil : merge_similarities.min.round(6)
     total_occurrences = features.sum { |f| f[:occurrences] }
+    campaign_first_seen = features
+      .filter_map { |f| f[:first_seen] }
+      .min_by { |ts| timestamp_sort_key(ts) }
+    campaign_last_seen = features
+      .filter_map { |f| f[:last_seen] }
+      .max_by { |ts| timestamp_sort_key(ts) }
 
     {
       "schema_version" => SCHEMA_VERSION,
@@ -790,12 +859,35 @@ module FuzzClustering
         "cluster_count" => clusters_json.size,
         "total_occurrences" => total_occurrences,
         "singleton_clusters" => clusters_json.count { |c| c["bucket_count"] == 1 },
+        "first_seen" => campaign_first_seen,
+        "last_seen" => campaign_last_seen,
         "min_intra_merge_similarity" => min_intra,
         "max_inter_cluster_similarity" => max_inter,
         "nearest_inter_cluster_pairs" => inter_pairs.first(5)
       },
       "clusters" => clusters_json
     }
+  end
+
+  def format_first_seen_cell(cluster, campaign_first_seen = nil)
+    ms = cluster["first_elapsed_ms"]
+    if ms.nil? && !cluster["first_seen"].to_s.empty? && !campaign_first_seen.to_s.empty?
+      begin
+        ms = ((Time.iso8601(cluster["first_seen"]) - Time.iso8601(campaign_first_seen)) * 1000.0).round
+      rescue ArgumentError
+        ms = nil
+      end
+    end
+
+    unless ms.nil?
+      sec = [(ms.to_f / 1000.0).round, 0].max
+      return format("%2dh%02dm%02ds", sec / 3600, (sec % 3600) / 60, sec % 60)
+    end
+
+    fs = cluster["first_seen"].to_s
+    return fs[/T(\d{2}:\d{2}:\d{2}Z)\z/, 1] || fs[0, 10] unless fs.empty?
+
+    "-"
   end
 
   def format_summary_table(report)
@@ -809,22 +901,43 @@ module FuzzClustering
       return lines.join("\n")
     end
 
-    lines << format("%-12s %7s %8s  %-26s  %s", "Cluster", "Buckets", "Occur", "Reasons", "Representative")
-    lines << ("-" * 100)
+    campaign_first_seen = summary["first_seen"]
+    show_first = clusters.any? { |c| c["first_seen"] || !c["first_elapsed_ms"].nil? }
+    if show_first
+      lines << format("%-12s %7s %8s  %-9s  %-26s  %s", "Cluster", "Buckets", "Occur", "First", "Reasons", "Representative")
+      lines << ("-" * 111)
+    else
+      lines << format("%-12s %7s %8s  %-26s  %s", "Cluster", "Buckets", "Occur", "Reasons", "Representative")
+      lines << ("-" * 100)
+    end
+
     clusters.each do |c|
       reasons_str = c["reasons"].map { |r, n| "#{r}=#{n}" }.join(",")
       rep = c["representative"]
       headline = rep["headline"].to_s.tr("\n", " ")
       headline = "#{headline[0, 52]}..." if headline.length > 55
-      lines << format(
-        "%-12s %7d %8d  %-26s  %s  %s",
-        c["cluster_id"],
-        c["bucket_count"],
-        c["occurrences"],
-        reasons_str,
-        rep["bucket_id"],
-        headline
-      )
+      lines << if show_first
+        format(
+          "%-12s %7d %8d  %-9s  %-26s  %s  %s",
+          c["cluster_id"],
+          c["bucket_count"],
+          c["occurrences"],
+          format_first_seen_cell(c, campaign_first_seen),
+          reasons_str,
+          rep["bucket_id"],
+          headline
+        )
+      else
+        format(
+          "%-12s %7d %8d  %-26s  %s  %s",
+          c["cluster_id"],
+          c["bucket_count"],
+          c["occurrences"],
+          reasons_str,
+          rep["bucket_id"],
+          headline
+        )
+      end
     end
 
     lines << ""

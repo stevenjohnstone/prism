@@ -1542,18 +1542,30 @@ def input_and_options_metadata(minimized_input, reason:, crash_output:, raw_size
   }
 end
 
+def occurrence_time_ms(name_or_path)
+  return FuzzClustering.parse_afl_time_ms(name_or_path) if defined?(FuzzClustering)
+  return nil if name_or_path.nil?
+
+  m = File.basename(name_or_path.to_s).match(/(?:\A|,)time:(\d+)(?:,|\z)/)
+  m ? m[1].to_i : nil
+end
+
 def build_occurrence_record(crash_dir, crash, crash_hash)
+  filename = utf8_safe(File.basename(crash))
   worker_dir = File.dirname(crash_dir)
-  {
+  rec = {
     "sha256" => crash_hash,
     "path" => utf8_safe(crash),
-    "filename" => utf8_safe(File.basename(crash)),
+    "filename" => filename,
     "fuzzer" => utf8_safe(File.basename(File.dirname(worker_dir))),
     "worker" => utf8_safe(File.basename(worker_dir)),
     "queue" => utf8_safe(File.basename(crash_dir)),
     "size_bytes" => File.size(crash),
     "mtime" => File.mtime(crash).utc.iso8601
   }
+  time_ms = occurrence_time_ms(filename)
+  rec["time_ms"] = time_ms unless time_ms.nil?
+  rec
 end
 
 def append_occurrences(bucket_dir, records)
@@ -1584,7 +1596,10 @@ def read_occurrences(bucket_dir)
     next
   end
 
-  by_sha.values.sort_by { |r| [r["mtime"].to_s, r["sha256"].to_s] }
+  by_sha.values.sort_by do |r|
+    t_ms = r["time_ms"] || occurrence_time_ms(r["filename"] || r["path"])
+    [r["mtime"].to_s, t_ms.nil? ? Float::INFINITY : t_ms.to_i, r["sha256"].to_s]
+  end
 end
 
 def summarize_occurrences(bucket_dir)
@@ -1601,12 +1616,16 @@ def summarize_occurrences(bucket_dir)
     mtimes << rec["mtime"] if rec["mtime"]
   end
 
+  first_rec = records.first
+  first_elapsed_ms = first_rec && (first_rec["time_ms"] || occurrence_time_ms(first_rec["filename"] || first_rec["path"]))
+
   {
     "count" => records.size,
     "by_fuzzer" => by_fuzzer.sort.to_h,
     "by_worker" => by_worker.sort.to_h,
     "by_queue" => by_queue.sort.to_h,
     "first_seen" => mtimes.min,
+    "first_elapsed_ms" => first_elapsed_ms,
     "last_seen" => mtimes.max,
     "sample_crashes" => records.first(5).map do |r|
       {

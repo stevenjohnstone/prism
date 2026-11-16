@@ -294,4 +294,4 @@ conflict-aware `diff_parse_y` symptom scoring at the unchanged threshold
 ruby test/fuzz/triage/cluster.rb [--metadata PATH] [-o PATH|-] [--threshold FLOAT] [--reason-weight FLOAT] [--include-unreproducible] [--quiet]
 ```
 
-Each cluster selects a deterministic representative by `(-occurrences, min_size_bytes, bucket_id)` and emits schema v1 JSON to `tmp/fuzz/triage/clusters.json` (or stdout with `-o -`).
+Each cluster selects a deterministic representative by `(-occurrences, min_size_bytes, bucket_id)`, aggregates discovery timestamps across its member buckets (`first_seen`, `first_elapsed_ms`, `first_seen_bucket`, `last_seen`, falling back to `sample_crashes` `,time:<ms>` filenames when `first_elapsed_ms` is absent), and emits schema v1 JSON to `tmp/fuzz/triage/clusters.json` (or stdout with `-o -`).

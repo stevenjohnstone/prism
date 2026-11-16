@@ -759,8 +759,13 @@ File.binwrite(File.join(afl, "w2/crashes/id:000000,sig:06"), dup)
 
 # Two distinct INVARIANT[...] crashes sharing an identical C call stack (plus a shifted-offset duplicate)
 inv_hdr = "\x10\x44\x55\x66".b
-File.binwrite(File.join(afl, "w1/crashes/id:000010,sig:06"), inv_hdr + ("a = 1\n".b * 8) + "INV_TARGET\n".b)
-File.binwrite(File.join(afl, "w2/crashes/id:000011,sig:06"), inv_hdr + ("b = 222\n".b * 20) + "INV_TARGET\n".b)
+inv_first_path = File.join(afl, "w1/crashes/id:000010,sig:06,time:42100")
+inv_later_path = File.join(afl, "w2/crashes/id:000011,sig:06,time:95000")
+File.binwrite(inv_first_path, inv_hdr + ("a = 1\n".b * 8) + "INV_TARGET\n".b)
+File.binwrite(inv_later_path, inv_hdr + ("b = 222\n".b * 20) + "INV_TARGET\n".b)
+t_now = Time.now
+File.utime(t_now - 60, t_now - 60, inv_first_path)
+File.utime(t_now - 10, t_now - 10, inv_later_path)
 File.binwrite(File.join(afl, "w1/crashes/id:000012,sig:06"), inv_hdr + ("c = 3\n".b * 8) + "INV_DECOY\n".b)
 
 # Unreproducible crash (sig:06, exits 0 on replay)
@@ -832,6 +837,7 @@ abrt_dirs.each do |abrt_dir|
     raise "unexpected INV_TARGET invariant meta: #{meta.dig("symptom", "invariant").inspect}" unless meta.dig("symptom", "invariant", "namespace") == "diagnostic" && meta.dig("symptom", "invariant", "fields", "type") == "heredoc_term"
     raise "unexpected INV_TARGET frames: #{meta["frames"].inspect}" unless meta["frames"].size == 2 && meta["frames"][0]["func"] == "fail_invariant_at_shared_site"
     raise "unexpected INV_TARGET by_worker: #{meta.dig("occurrences", "by_worker").inspect}" unless meta.dig("occurrences", "by_worker") == { "w1" => 1, "w2" => 1 }
+    raise "expected INV_TARGET first_elapsed_ms == 42100, got #{meta.dig("occurrences", "first_elapsed_ms").inspect}" unless meta.dig("occurrences", "first_elapsed_ms") == 42100
     tokens_found << "INV_TARGET"
     counts_by_token["INV_TARGET"] = meta.dig("occurrences", "count")
   elsif body.include?("INV_DECOY".b)
@@ -869,6 +875,9 @@ clusters_path = File.join(triage_dir, "clusters.json")
 raise "missing consolidated clusters.json" unless File.file?(clusters_path)
 clusters = JSON.parse(File.read(clusters_path))
 raise "expected schema_version 1 in clusters.json" unless clusters["schema_version"] == 1
+raise "expected first_seen in clusters.json summary" if clusters.dig("summary", "first_seen").to_s.empty?
+inv_cluster = clusters["clusters"].find { |c| c["buckets"].any? { |b| b["headline"].to_s.include?("heredoc_term") } }
+raise "expected INV_TARGET cluster first_elapsed_ms == 42100, got #{inv_cluster.inspect}" unless inv_cluster && inv_cluster["first_elapsed_ms"] == 42100 && !inv_cluster["first_seen"].to_s.empty?
 EOF
 echo "  concurrent deduplication, header minimization, coalescing, sentinel, and JSON metadata checks passed"
 
@@ -1627,6 +1636,52 @@ d_conf = [
     fields: { "kind" => "ast_mismatch", "sub" => "node_kind", "node" => "YieldNode", "scope" => "block" })
 ]
 raise "conflicting diff_parse_y scope falsely merged" unless FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => diff_corpus, "buckets" => d_conf }).dig("summary", "cluster_count") == 2
+
+# Regression 5: cluster-level discovery timestamps aggregate across members and fall back cleanly
+ts_rep_b = make_bucket.call(id: "ABRT/ts_rep", reason: "ABRT", occ: 10, edges: { "10" => 1, "11" => 1 }).merge(
+  "occurrences" => {
+    "count" => 10,
+    "first_seen" => "2026-11-15T14:00:00Z",
+    "first_elapsed_ms" => 1_200_000,
+    "last_seen" => "2026-11-15T16:00:00Z"
+  }
+)
+ts_early_b = make_bucket.call(id: "ABRT/ts_early", reason: "ABRT", occ: 2, edges: { "10" => 1, "11" => 1 }).merge(
+  "occurrences" => {
+    "count" => 2,
+    "first_seen" => "2026-11-15T13:45:00Z",
+    "last_seen" => "2026-11-15T17:00:00Z",
+    "sample_crashes" => [
+      { "mtime" => "2026-11-15T13:45:00Z", "path" => "tmp/fuzz/afl/main/crashes/id:000001,sig:06,src:000001,time:300000,execs:100" }
+    ]
+  }
+)
+ts_sync_b = make_bucket.call(id: "ABRT/ts_sync", reason: "ABRT", occ: 1, edges: { "40" => 1 }).merge(
+  "occurrences" => {
+    "count" => 1,
+    "first_seen" => "2026-11-15T13:48:10Z",
+    "last_seen" => "2026-11-15T13:48:10Z",
+    "sample_crashes" => [
+      { "mtime" => "2026-11-15T13:48:10Z", "path" => "tmp/fuzz/afl/diff/crashes/id:000033,sig:06,sync:main,src:008749" }
+    ]
+  }
+)
+ts_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [ts_rep_b, ts_early_b, ts_sync_b] })
+ts_c1 = ts_rep["clusters"].find { |c| c.dig("representative", "bucket_id") == "ABRT/ts_rep" }
+ts_c2 = ts_rep["clusters"].find { |c| c.dig("representative", "bucket_id") == "ABRT/ts_sync" }
+unless ts_c1 && ts_c1["first_seen"] == "2026-11-15T13:45:00Z" &&
+       ts_c1["first_elapsed_ms"] == 300_000 &&
+       ts_c1["first_seen_bucket"] == "ABRT/ts_early" &&
+       ts_c1["last_seen"] == "2026-11-15T17:00:00Z" &&
+       ts_c2 && ts_c2["first_seen"] == "2026-11-15T13:48:10Z" && ts_c2["first_elapsed_ms"].nil? &&
+       ts_rep.dig("summary", "first_seen") == "2026-11-15T13:45:00Z" &&
+       ts_rep.dig("summary", "last_seen") == "2026-11-15T17:00:00Z"
+  raise "cluster timestamp aggregation failed: #{ts_rep.inspect}"
+end
+ts_table = FuzzClustering.format_summary_table(ts_rep)
+unless ts_table.include?("First") && ts_table.include?("0h05m00s") && ts_table.include?("0h03m10s")
+  raise "cluster summary table missing First column/elapsed formatting:\n#{ts_table}"
+end
 
 # Exercise CLI file and stdout output paths
 meta_path = File.join(workdir, "cluster_meta.json")

@@ -126,10 +126,10 @@ At the end of triage, `finalize_triage_metadata` updates stale `meta.json` files
 
 ### Per-Bucket Files (`occurrences.jsonl` and `meta.json`)
 
-- **`occurrences.jsonl`**: Append-only JSON Lines; each record captures `sha256`, `path`, `filename`, `fuzzer` (`afl`/`afl-ijon`), `worker`, `queue`, `size_bytes`, and `mtime`. Readers deduplicate by `sha256`.
+- **`occurrences.jsonl`**: Append-only JSON Lines; each record captures `sha256`, `path`, `filename`, `fuzzer` (`afl`/`afl-ijon`), `worker`, `queue`, `size_bytes`, `mtime`, and (when present in the AFL++ filename) `time_ms`. Readers deduplicate by `sha256`.
 - **`meta.json`** (`schema_version: 1`):
   - `bucket_id`, `reason`, `signature`, `reproducible`, `timed_out`, `reproduced_by`, `verify_profile`
-  - `occurrences`: `count`, `by_fuzzer`, `by_worker`, `by_queue`, `first_seen`, `last_seen`, up to 5 `sample_crashes`
+  - `occurrences`: `count`, `by_fuzzer`, `by_worker`, `by_queue`, `first_seen`, `first_elapsed_ms`, `last_seen`, up to 5 `sample_crashes`
   - `archive`: `{"file": "inputs.tar.gz", "count": N, "total_bytes": ..., "archive_bytes": ...}`
   - `input`: `raw_size_bytes`, `raw_sha256`, `min_size_bytes`, `min_sha256`, `payload_size_bytes`, `header_bytes`, `header_hex`, `valid_header`, `has_shebang_prefix`, `minimized_matches_signature`, `loupe_url`
   - `options`: decoded fields (`ruby_version`, `start_line`, `start_line_expr`, `encoding`, `encoding_locked`, `freeze`, `partial_script`, `attach_comments`, `main_script`, `stream_mode`, `frozen_string_literal`, `command_line_flags`, `filepath`, `shebang_callback`, `stack_budget`, `scopes_count`, `forwarding_scope`, `forwarding_flags`)
