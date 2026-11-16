@@ -121,6 +121,35 @@ module FuzzClustering
     SyntaxError:other
   ].freeze
 
+  # Signal handlers, libc abort wrappers, and CRuby VM entry trampolines carry
+  # no root-cause signal when comparing external CRuby parse.y crash traces.
+  EXTERNAL_FRAME_BOILERPLATE = %w[
+    rb_print_backtrace
+    rb_vm_bugreport
+    rb_bug_for_fatal_signal
+    rb_bug
+    sigsegv
+    sigbus
+    sigill
+    sigfpe
+    diff_fatal_signal_handler
+    __kernel_rt_sigreturn
+    __pthread_kill_implementation
+    raise
+    abort
+    invoke_bf
+    vm_invoke_builtin_delegate
+    vm_exec_core
+    rb_vm_exec
+    vm_call0_cc
+    rb_funcallv_scope
+    rb_funcallv
+    rb_funcall
+    rb_protect
+    __libc_start_main
+    _start
+  ].freeze
+
   module_function
 
   def write_json_atomic(path, payload)
@@ -137,6 +166,21 @@ module FuzzClustering
     name = func_name.to_s
     BOILERPLATE_FUNCTIONS.include?(name) ||
       BOILERPLATE_PREFIXES.any? { |prefix| name.start_with?(prefix) }
+  end
+
+  def prism_frame?(frame)
+    frame.is_a?(Hash) &&
+      frame["scope"] == "prism" &&
+      !frame["func"].to_s.empty? &&
+      !boilerplate_function?(frame["func"])
+  end
+
+  def external_crash_frame?(frame)
+    frame.is_a?(Hash) &&
+      frame["scope"] == "external" &&
+      !frame["func"].to_s.empty? &&
+      !boilerplate_function?(frame["func"]) &&
+      !EXTERNAL_FRAME_BOILERPLATE.include?(frame["func"])
   end
 
   def function_weight_multiplier(
@@ -229,17 +273,22 @@ module FuzzClustering
     }
   end
 
-  def extract_frame_vector(frames, frame_decay: FRAME_DECAY)
-    vec = {}
-    prism_frames = Array(frames).select do |f|
-      f.is_a?(Hash) &&
-        f["scope"] == "prism" &&
-        !f["func"].to_s.empty? &&
-        !boilerplate_function?(f["func"])
-    end
+  def extract_frame_vector(frames, frame_decay: FRAME_DECAY, oracle: nil)
+    raw_frames = Array(frames)
+    prism_frames = raw_frames.select { |f| prism_frame?(f) }
+    used_frames =
+      if !prism_frames.empty?
+        prism_frames
+      elsif oracle == "cruby_crash"
+        raw_frames.select { |f| external_crash_frame?(f) }
+      else
+        []
+      end
 
-    prism_frames.each_with_index do |frame, depth|
+    vec = {}
+    used_frames.each_with_index do |frame, depth|
       file = frame["file"].to_s
+      file = "" if file == "(null)"
       key = file.empty? ? frame["func"].to_s : "#{frame['func']}@#{file}"
       vec[key] ||= frame_decay**depth
     end
@@ -284,12 +333,15 @@ module FuzzClustering
   end
 
   def oracle_family(bucket)
-    prof = bucket["verify_profile"].to_s
     ns = bucket.dig("symptom", "invariant", "namespace").to_s
-    if prof == "diff_parse_y" || ns == "diff_parse_y"
+    headline = bucket.dig("symptom", "headline").to_s
+    if ns == "diff_parse_y" || headline.start_with?("INVARIANT[diff_parse_y]:")
       "diff_parse_y"
-    elsif prof == "msan_slow" || ns == "stream_diff"
+    elsif ns == "stream_diff" || headline.start_with?("INVARIANT[stream_diff]:")
       "stream_diff"
+    elsif bucket["verify_profile"].to_s == "diff_parse_y" || headline.start_with?("CRASH[diff_parse_y]:")
+      has_prism = Array(bucket["frames"]).any? { |f| prism_frame?(f) }
+      has_prism ? "crash_or_inv" : "cruby_crash"
     else
       "crash_or_inv"
     end
@@ -304,8 +356,13 @@ module FuzzClustering
   end
 
   def build_bucket_feature(bucket, cov_model, corpus_edge_df, frame_decay: FRAME_DECAY)
+    oracle = oracle_family(bucket)
     cov_vec, cov_norm2, cov_available = extract_coverage_vector(bucket, cov_model, corpus_edge_df)
-    frame_vec, frame_norm2, top_frame = extract_frame_vector(bucket["frames"], frame_decay: frame_decay)
+    frame_vec, frame_norm2, top_frame = extract_frame_vector(
+      bucket["frames"],
+      frame_decay: frame_decay,
+      oracle: oracle
+    )
     occ = bucket.dig("occurrences", "count").to_i
     min_size = bucket.dig("input", "min_size_bytes")
 
@@ -313,7 +370,7 @@ module FuzzClustering
       id: bucket["bucket_id"].to_s,
       reason: bucket["reason"].to_s,
       signature: bucket["signature"].to_s,
-      oracle: oracle_family(bucket),
+      oracle: oracle,
       diff_fields: extract_diff_fields(bucket),
       occurrences: occ,
       min_size_bytes: min_size,
@@ -721,6 +778,7 @@ module FuzzClustering
         "corpus_count" => corpus["corpus_count"].to_i,
         "filtered_boilerplate_functions" => BOILERPLATE_FUNCTIONS,
         "filtered_boilerplate_prefixes" => BOILERPLATE_PREFIXES,
+        "filtered_external_frame_boilerplate" => EXTERNAL_FRAME_BOILERPLATE,
         "filtered_setup_functions" => SETUP_FUNCTIONS,
         "downweighted_encoding_functions" => ENCODING_HELPER_FUNCTIONS,
         "downweighted_recovery_functions" => RECOVERY_FUNCTIONS,

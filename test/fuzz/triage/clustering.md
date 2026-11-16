@@ -132,31 +132,40 @@ cosine-overlap geometric mean:
 
 ### 3.3 Call Stack Frames
 
-`extract_frame_vector` keeps only frames with `scope == "prism"`, non-empty
-`func`, and `!boilerplate_function?(func)` (excluding all `VISITOR_FUNCTIONS`,
-`pm_visit_*`, `fuzz_*`, and `check_*` frames). Frames are indexed from the
-crashing leaf ($d = 0$) as `func@file` (omitting line numbers so multi-site
-overflows in the same leaf helper, e.g., `src/line_offset_list.c:85` and `:96`,
-align at $d = 0$) with geometric decay $\text{FRAME\_DECAY}^d = 0.5^d$.
-Non-empty frame vectors are compared via cosine similarity:
+`extract_frame_vector` keeps frames via `prism_frame?` (`scope == "prism"`,
+non-empty `func`, `!boilerplate_function?(func)` — excluding `VISITOR_FUNCTIONS`,
+`pm_visit_*`, `fuzz_*`, and `check_*` frames). When `prism_frames` is empty
+and `oracle == "cruby_crash"` (`CRASH[diff_parse_y]` / non-invariant CRuby
+crashes in `parse.y`), it falls back to `external_crash_frame?` (`scope ==
+"external"`, stripping signal handlers, abort/backtrace wrappers, and CRuby VM
+entry trampolines in `EXTERNAL_FRAME_BOILERPLATE`, and normalizing `file ==
+"(null)"` to `""`), while keeping `top_prism_frame` strictly `nil`. Because
+CRuby inside `fuzz.diff` is not AFL-instrumented, CRuby stack frames are
+essential to cluster repeated `parse.y` crashes and avoid merging distinct
+`parse.y` crashes whose Prism `parse.c` coverage overlaps. Frames are indexed
+from the leaf ($d = 0$) as `func@file` (omitting line numbers so multi-site
+bugs in the same helper, e.g., `src/line_offset_list.c:85` and `:96`, align at
+$d = 0$) with geometric decay $\text{FRAME\_DECAY}^d = 0.5^d$. Non-empty frame
+vectors are compared via cosine similarity:
 
 $$S_{\text{frame}}(a, b) = \frac{f_a \cdot f_b}{\|f_a\| \, \|f_b\|}$$
 
 ## 4. Oracle Separation, Pairwise Evidence & Reason Weight
 
-Before computing pairwise similarity, `oracle_family` partitions buckets by
-verification oracle (`verify_profile` or `symptom.invariant.namespace`):
+Before computing pairwise similarity, `oracle_family` partitions buckets by what
+failed rather than build profile alone:
 
-- `"diff_parse_y"` (`diff_parse_y` parser/CRuby parity checks),
-- `"stream_diff"` (`msan_slow` / `stream_diff` streaming parity checks),
-- `"crash_or_inv"` (crash sanitizers and post-parse AST/location invariants).
+- `"diff_parse_y"` (differential syntax/AST parity invariants: `INVARIANT[diff_parse_y]:`),
+- `"stream_diff"` (streaming parity invariants: `INVARIANT[stream_diff]:`),
+- `"cruby_crash"` (`CRASH[diff_parse_y]:` or non-invariant failures inside `diff_parse_y` with no non-boilerplate Prism crash frames),
+- `"crash_or_inv"` (Prism sanitizer crashes — including `msan_slow` / `diff_parse_y` runs crashing inside Prism — and post-parse Prism AST/location invariants).
 
 Buckets from different oracle families receive `similarity = 0.0` and are never
-merged in `best_upgma_merge` regardless of `threshold`. This preserves soft
-cross-reason merging inside `"crash_or_inv"` (e.g., `SEGV` vs. MSan
-`use-of-uninitialized-value` or `ABRT`) while preventing shared `ABRT` post-parse
-exit scaffolding from mixing sanitizer/invariant bugs with `diff_parse_y` or
-`stream_diff` mismatches.
+merged in `best_upgma_merge` regardless of `threshold`. This separates
+differential assertions (`INVARIANT[diff_parse_y]`) from CRuby parser crashes
+(`CRASH[diff_parse_y]`) as well as Prism crashes/invariants, while preserving
+cross-sanitizer merging inside `"crash_or_inv"` (e.g., `SEGV` vs. `fuzz.msan`
+`use-of-uninitialized-value` or `ABRT`).
 
 Within compatible oracle families, evidence combines coverage, stack frames, and
 structured `diff_parse_y` symptoms using `FRAME_BLEND_WEIGHT` ($\alpha = 0.75$)
@@ -257,11 +266,13 @@ Evaluated directly by [`FuzzClustering.cluster_metadata`](cluster.rb):
     **275/275 (100%)** collapse cleanly to 1 cluster on Run 1, **275/275 (100%)**
     on Run 2, and **275/275 (100%)** on Run 3 (**825/825 total**).
 
-### Multi-Oracle 24-Hour Validation (`210` Buckets, `50,139` Occurrences)
+### Multi-Oracle 24-Hour Validation (`213` Buckets, `50,234` Occurrences)
 
 After adding prefix boilerplate filtering, dispatcher damping + function edge
-cap, `oracle_family` separation, and conflict-aware `diff_parse_y` symptom
-scoring at the unchanged threshold `T = 0.225`:
+cap, 4-way `oracle_family` separation (including `cruby_crash` vs.
+`diff_parse_y` invariants and external `parse.y` crash-frame clustering), and
+conflict-aware `diff_parse_y` symptom scoring at the unchanged threshold
+`T = 0.225`:
 
 - **Run 1 (`tmp/fuzz/triage.run1/metadata.json`, 58 buckets):** **6 pure
   clusters** (`V-measure = 1.000`, `ARI = 1.000`, `min_merge = 0.239372`,
@@ -269,13 +280,13 @@ scoring at the unchanged threshold `T = 0.225`:
 - **Run 2 (`tmp/fuzz/triage.run2/metadata.json`, 58 buckets):** **6 pure
   clusters** (`V-measure = 1.000`, `ARI = 1.000`, `min_merge = 0.225181`,
   `max_inter = 0.186533`).
-- **24-hour multi-oracle campaign (`tmp/fuzz/triage/metadata.json`, 210
-  buckets, 50,139 occurrences; 119 labeled buckets):**
-  - Baseline (`E0`): `21` clusters, `5` oracle-mixed clusters, `Purity = 0.6975`,
-    `Inverse Purity = 0.9412`, `V-measure = 0.8518`, `ARI = 0.7418`.
-  - Updated `cluster.rb`: **`47` clusters**, **`0` oracle-mixed clusters**,
-    `min_merge = 0.227594`, `max_inter = 0.221973`, **`Purity = 0.9580`**,
-    **`Inverse Purity = 0.9412`**, **`V-measure = 0.9659`**, **`ARI = 0.9313`**.
+- **24-hour multi-oracle campaign (`tmp/fuzz/triage/metadata.json`, 213
+  buckets, 50,234 occurrences; 119 labeled buckets):**
+  - Baseline (`E0`): `21` clusters, `5` oracle-mixed clusters, `Purity = 0.7059`,
+    `Inverse Purity = 0.9412`, `V-measure = 0.8609`, `ARI = 0.7656`.
+  - Updated `cluster.rb`: **`49` clusters**, **`0` oracle-mixed clusters**,
+    `min_merge = 0.227594`, `max_inter = 0.221973`, **`Purity = 0.9664`**,
+    **`Inverse Purity = 0.9412`**, **`V-measure = 0.9677`**, **`ARI = 0.9324`**.
 
 ## 6. CLI and Output Format
 

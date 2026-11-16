@@ -1514,15 +1514,70 @@ make_inv_bucket = lambda do |id:, profile:, ns:, fields: {}, edges: { "1" => 1, 
   b["symptom"]["invariant"] = { "namespace" => ns, "fields" => fields }
   b
 end
+ora_cruby = make_bucket.call(
+  id: "SEGV/ora_cruby_crash",
+  reason: "SEGV",
+  occ: 3,
+  frames: [
+    { "scope" => "external", "func" => "rb_print_backtrace", "file" => "/opt/ruby/vm_dump.c", "line" => 1108 },
+    { "scope" => "harness", "func" => "diff_fatal_signal_handler", "file" => "test/fuzz/harness/diff.c", "line" => 1496 },
+    { "scope" => "external", "func" => "parser_yylex", "file" => "parse.y", "line" => 7707 }
+  ],
+  edges: { "1" => 1, "83" => 1 }
+)
+ora_cruby["verify_profile"] = "diff_parse_y"
+ora_cruby["symptom"]["headline"] = "CRASH[diff_parse_y]: signal=SIGSEGV (11)"
 ora_buckets = [
   make_inv_bucket.call(id: "ABRT/ora_crash", profile: "ubsan", ns: "span"),
   make_inv_bucket.call(id: "ABRT/ora_diff", profile: "diff_parse_y", ns: "diff_parse_y", fields: { "kind" => "ast_mismatch", "node" => "CallNode" }),
-  make_inv_bucket.call(id: "ABRT/ora_stream", profile: "msan_slow", ns: "stream_diff")
+  make_inv_bucket.call(id: "ABRT/ora_stream", profile: "msan_slow", ns: "stream_diff"),
+  ora_cruby
 ]
 ora_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => pfx_corpus, "buckets" => ora_buckets }, threshold: 0.0)
 ora_groups = ora_rep["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] }.sort }.sort
-unless ora_groups == [["ABRT/ora_crash"], ["ABRT/ora_diff"], ["ABRT/ora_stream"]]
+unless ora_groups == [["ABRT/ora_crash"], ["ABRT/ora_diff"], ["ABRT/ora_stream"], ["SEGV/ora_cruby_crash"]]
   raise "oracle separation failed: #{ora_groups.inspect}"
+end
+msan_prism = make_bucket.call(id: "use-of-uninitialized-value/msan_prism", reason: "use-of-uninitialized-value", occ: 2, frames: f_segv)
+msan_prism["verify_profile"] = "msan_slow"
+unless FuzzClustering.oracle_family(msan_prism) == "crash_or_inv"
+  raise "non-stream_diff msan_slow crash misclassified as #{FuzzClustering.oracle_family(msan_prism)}"
+end
+
+# Regression 2b: cruby_crash uses external parse.y frames to cluster matching CRuby crashes and separate distinct ones
+cruby_st_frames = [
+  { "scope" => "external", "func" => "rb_print_backtrace", "file" => "/opt/ruby/vm_dump.c", "line" => 1108 },
+  { "scope" => "harness", "func" => "diff_fatal_signal_handler", "file" => "test/fuzz/harness/diff.c", "line" => 96 },
+  { "scope" => "external", "func" => "rb_st_free_table", "file" => "/opt/ruby/st.c", "line" => 667 },
+  { "scope" => "external", "func" => "ruby_yyparse", "file" => "parse.y", "line" => 4532 },
+  { "scope" => "external", "func" => "rb_funcall", "file" => "/opt/ruby/vm_eval.c", "line" => 1137 }
+]
+cruby_tok_frames_a = [
+  { "scope" => "external", "func" => "rb_print_backtrace", "file" => "/opt/ruby/vm_dump.c", "line" => 1108 },
+  { "scope" => "external", "func" => "parser_add_delayed_token", "file" => "parse.y", "line" => 7617 },
+  { "scope" => "external", "func" => "parser_yylex", "file" => "parse.y", "line" => 7705 },
+  { "scope" => "external", "func" => "rb_parser_enc_cr_str_buf_cat", "file" => "parse.y", "line" => 2400 },
+  { "scope" => "external", "func" => "tokadd_utf8", "file" => "parse.y", "line" => 7981 }
+]
+cruby_tok_frames_b = [
+  { "scope" => "external", "func" => "rb_print_backtrace", "file" => "/opt/ruby/vm_dump.c", "line" => 1108 },
+  { "scope" => "external", "func" => "parser_yylex", "file" => "parse.y", "line" => 7707 },
+  { "scope" => "external", "func" => "rb_parser_enc_cr_str_buf_cat", "file" => "parse.y", "line" => 2400 },
+  { "scope" => "external", "func" => "parser_yylex", "file" => "(null)", "line" => 0 },
+  { "scope" => "external", "func" => "tokadd_utf8", "file" => "parse.y", "line" => 7962 }
+]
+cruby_st = make_bucket.call(id: "SEGV/cruby_st", reason: "SEGV", occ: 2, frames: cruby_st_frames, edges: { "10" => 1, "11" => 1, "12" => 1 })
+cruby_tok_a = make_bucket.call(id: "SEGV/cruby_tok_a", reason: "SEGV", occ: 2, frames: cruby_tok_frames_a, edges: { "10" => 1, "11" => 1, "20" => 1 })
+cruby_tok_b = make_bucket.call(id: "SEGV/cruby_tok_b", reason: "SEGV", occ: 2, frames: cruby_tok_frames_b, edges: { "12" => 1, "40" => 1 })
+[cruby_st, cruby_tok_a, cruby_tok_b].each do |cb|
+  cb["verify_profile"] = "diff_parse_y"
+  cb["symptom"]["headline"] = "CRASH[diff_parse_y]: signal=SIGSEGV (11)"
+end
+cruby_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [cruby_st, cruby_tok_a, cruby_tok_b] })
+cruby_groups = cruby_rep["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] }.sort }.sort
+unless cruby_groups == [["SEGV/cruby_st"], ["SEGV/cruby_tok_a", "SEGV/cruby_tok_b"]] &&
+       cruby_rep["clusters"].all? { |c| c["representative"]["top_prism_frame"].nil? }
+  raise "cruby_crash frame clustering regression failed: #{cruby_groups.inspect}"
 end
 
 # Regression 3: dispatcher damping + function edge cap prevent monolithic dispatcher edges from merging distinct bugs
