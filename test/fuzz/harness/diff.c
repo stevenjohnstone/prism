@@ -1345,10 +1345,13 @@ static void diff_prism_emit_seq_elem(
         const pm_splat_node_t *sp = (const pm_splat_node_t *) elem;
         if (sp->expression != NULL && PM_NODE_TYPE_P(sp->expression, PM_ARRAY_NODE)) {
             const pm_array_node_t *inner = (const pm_array_node_t *) sp->expression;
-            for (size_t j = 0; j < inner->elements.size; j++) {
-                diff_prism_emit_seq_elem(inner->elements.nodes[j], idx + j, slot_name, ctx);
+            /* CRuby keeps non-initial `*[*expr]` as ARGSCAT(..., NODE_SPLAT) -> SPLAT(SPLAT). */
+            if (!(inner->elements.size == 1 && PM_NODE_TYPE_P(inner->elements.nodes[0], PM_SPLAT_NODE))) {
+                for (size_t j = 0; j < inner->elements.size; j++) {
+                    diff_prism_emit_seq_elem(inner->elements.nodes[j], idx + j, slot_name, ctx);
+                }
+                return;
             }
-            return;
         }
     }
     diff_tree_open_slot(ctx->out, slot_name);
@@ -3015,6 +3018,7 @@ static void diff_cruby_emit_seq_elems(VALUE val, const char *slot_name, diff_cru
     } else if (tid == diff_ids.argscat && len >= 2) {
         diff_cruby_ctx_t sub = ctx;
         sub.depth = ctx.depth + 1;
+        sub.in_container = false;
         VALUE head = RARRAY_AREF(ch, 0);
         VALUE body = RARRAY_AREF(ch, 1);
         ID htid = diff_cruby_node_tid(head);
@@ -3032,7 +3036,6 @@ static void diff_cruby_emit_seq_elems(VALUE val, const char *slot_name, diff_cru
         } else {
             diff_tree_open_slot(ctx.out, slot_name);
             diff_tree_open_cstr(ctx.out, DIFF_TOK_SPLAT, NULL);
-            sub.in_container = false;
             diff_cruby_visit_val_ctx(body, sub);
             diff_tree_close(ctx.out);
             diff_tree_close(ctx.out);
@@ -3040,6 +3043,7 @@ static void diff_cruby_emit_seq_elems(VALUE val, const char *slot_name, diff_cru
     } else if (tid == diff_ids.argspush && len >= 2) {
         diff_cruby_ctx_t sub = ctx;
         sub.depth = ctx.depth + 1;
+        sub.in_container = false;
         VALUE head = RARRAY_AREF(ch, 0);
         VALUE tail_item = RARRAY_AREF(ch, 1);
         ID htid = diff_cruby_node_tid(head);
