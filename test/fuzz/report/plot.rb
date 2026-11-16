@@ -261,6 +261,8 @@ def sort_fuzzer_names(names)
   names.sort_by do |name|
     if priority.key?(name)
       [0, priority[name], 0, name]
+    elsif name =~ /\Adiff-(\d+)\z/
+      [0, priority["diff"], Regexp.last_match(1).to_i, name]
     elsif name =~ /\Amain-(\d+)\z/
       [1, Regexp.last_match(1).to_i, 0, name]
     else

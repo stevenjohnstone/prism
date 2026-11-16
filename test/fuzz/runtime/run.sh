@@ -73,12 +73,27 @@ WORKER_CMDS=()
 shopt -s nullglob
 CORPUS_FILES=("$CORPUS_DIR"/*)
 shopt -u nullglob
-NUM_SHARDS=$(( FUZZ_WORKERS >= 6 ? FUZZ_WORKERS - 3 : (FUZZ_WORKERS > 2 ? FUZZ_WORKERS - 2 : 1) ))
+if [ "$FUZZ_WORKERS" -ge 8 ]; then
+    NUM_SHARDS=$(( FUZZ_WORKERS - 4 ))
+elif [ "$FUZZ_WORKERS" -ge 6 ]; then
+    NUM_SHARDS=$(( FUZZ_WORKERS - 3 ))
+elif [ "$FUZZ_WORKERS" -gt 2 ]; then
+    NUM_SHARDS=$(( FUZZ_WORKERS - 2 ))
+else
+    NUM_SHARDS=1
+fi
 
 prepare_diff_seeds() {
-    local seed_dir="/tmp/afl-tmpdir/diff/seeds"
+    local name=$1
+    local base_seed_dir="/tmp/afl-tmpdir/diff/seeds"
+    local seed_dir="/tmp/afl-tmpdir/$name/seeds"
     rm -rf "$seed_dir"
     mkdir -p "$seed_dir"
+
+    if [ "$name" != "diff" ] && [ -d "$base_seed_dir" ]; then
+        cp "$base_seed_dir"/* "$seed_dir/" 2>/dev/null || true
+        return
+    fi
 
     ruby -retc -rfileutils -e '
       corpus_dir, seed_dir = ARGV
@@ -96,6 +111,14 @@ prepare_diff_seeds() {
       end
       threads.each(&:join)
     ' "$CORPUS_DIR" "$seed_dir"
+}
+
+add_diff_worker() {
+    local name=$1
+    local extra_env=$2
+    local afl_opts=$3
+    prepare_diff_seeds "$name"
+    add_worker "$name" "${extra_env}afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- ./build/fuzz.diff"
 }
 
 prepare_seed_shard() {
@@ -173,6 +196,9 @@ if [ -d "${AFL_DIR}-diff/diff" ] && [ ! -d "$AFL_DIR/diff" ]; then
     rmdir "${AFL_DIR}-diff" 2>/dev/null || true
 fi
 
+main_extra_idx=0
+next_shard=3
+
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
@@ -194,13 +220,17 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
             add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- ./build/fuzz.slow"
             ;;
         5)
-            prepare_diff_seeds
-            add_worker "diff" "afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/diff/seeds -o $AFL_DIR -S diff -p explore -- ./build/fuzz.diff"
+            add_diff_worker "diff" "" "-p explore"
+            ;;
+        7)
+            add_diff_worker "diff-2" "AFL_DISABLE_TRIM=1 " "-p fast -L 0"
             ;;
         *)
-            idx=$(( i - 6 ))
-            name="main-$(( i - 4 ))"
-            prepare_seed_shard "$name" $(( i - 3 ))
+            idx=$main_extra_idx
+            name="main-$(( main_extra_idx + 2 ))"
+            prepare_seed_shard "$name" "$next_shard"
+            main_extra_idx=$(( main_extra_idx + 1 ))
+            next_shard=$(( next_shard + 1 ))
             sched=${SCHEDULES[$(( idx % ${#SCHEDULES[@]} ))]}
             fmt=${INPUT_FORMATS[$(( idx % ${#INPUT_FORMATS[@]} ))]}
             strat=${MUTATION_STRATEGIES[$(( idx % ${#MUTATION_STRATEGIES[@]} ))]}
