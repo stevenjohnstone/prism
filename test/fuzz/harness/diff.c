@@ -21,6 +21,10 @@
 #define FUZZ_MAX_INPUT_SIZE 1024
 #endif
 
+#ifndef FUZZ_DIFF_PERSISTENT_ITERS
+#define FUZZ_DIFF_PERSISTENT_ITERS 1000
+#endif
+
 /* CRuby internal helpers in thread.c / vm_dump.c (not exposed in public ruby.h). */
 extern void rb_thread_stop_timer_thread(void);
 extern void rb_print_backtrace(FILE *errout);
@@ -247,28 +251,38 @@ static void diff_classify_cruby_msg(const char *cls, const char *line, char *tag
     snprintf(tag_buf, tag_cap, "%s:other", cls);
 }
 
-static VALUE diff_ast_parse_cb(VALUE src_str) {
-    static VALUE rb_mAST = Qnil;
-    static ID id_parse = 0;
-    if (NIL_P(rb_mAST)) {
-        VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
-        rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
-        rb_gc_register_mark_object(rb_mAST);
-        id_parse = rb_intern("parse");
+static VALUE diff_rb_mAST = Qnil;
+static ID diff_id_parse = 0;
+static VALUE diff_rb_cISeq = Qnil;
+static ID diff_id_compile = 0;
+static ID diff_id_message = 0;
+
+/* Pre-resolve RubyVM constants and IDs so persistent worker forks avoid lazy writes. */
+static void diff_core_ids_init(void) {
+    if (!NIL_P(diff_rb_mAST)) {
+        return;
     }
-    return rb_funcall(rb_mAST, id_parse, 1, src_str);
+
+    VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
+    diff_rb_mAST = rb_const_get(rb_cRubyVM, rb_intern("AbstractSyntaxTree"));
+    rb_gc_register_mark_object(diff_rb_mAST);
+    diff_id_parse = rb_intern("parse");
+
+    diff_rb_cISeq = rb_const_get(rb_cRubyVM, rb_intern("InstructionSequence"));
+    rb_gc_register_mark_object(diff_rb_cISeq);
+    diff_id_compile = rb_intern("compile");
+
+    diff_id_message = rb_intern("message");
+}
+
+static VALUE diff_ast_parse_cb(VALUE src_str) {
+    diff_core_ids_init();
+    return rb_funcall(diff_rb_mAST, diff_id_parse, 1, src_str);
 }
 
 static VALUE diff_iseq_compile_cb(VALUE src_str) {
-    static VALUE rb_cISeq = Qnil;
-    static ID id_compile = 0;
-    if (NIL_P(rb_cISeq)) {
-        VALUE rb_cRubyVM = rb_const_get(rb_cObject, rb_intern("RubyVM"));
-        rb_cISeq = rb_const_get(rb_cRubyVM, rb_intern("InstructionSequence"));
-        rb_gc_register_mark_object(rb_cISeq);
-        id_compile = rb_intern("compile");
-    }
-    return rb_funcall(rb_cISeq, id_compile, 1, src_str);
+    diff_core_ids_init();
+    return rb_funcall(diff_rb_cISeq, diff_id_compile, 1, src_str);
 }
 
 static void diff_format_exception(
@@ -287,11 +301,8 @@ static void diff_format_exception(
     char cls_buf[48];
     diff_sanitize_ident(rb_obj_classname(err), cls_buf, sizeof(cls_buf), "Exception");
 
-    static ID id_message = 0;
-    if (id_message == 0) {
-        id_message = rb_intern("message");
-    }
-    volatile VALUE msg = rb_funcall(err, id_message, 0);
+    diff_core_ids_init();
+    volatile VALUE msg = rb_funcall(err, diff_id_message, 0);
     const char *mptr = (RB_TYPE_P(msg, T_STRING) && RSTRING_LEN(msg) > 0) ? RSTRING_PTR(msg) : "";
     long mlen = RB_TYPE_P(msg, T_STRING) ? RSTRING_LEN(msg) : 0;
 
@@ -1553,6 +1564,7 @@ static void diff_oracle_init(void) {
     VALUE warning_mod = rb_const_get(rb_cObject, rb_intern("Warning"));
     rb_define_singleton_method(warning_mod, "warn", diff_warning_warn, -1);
 
+    diff_core_ids_init();
     diff_ast_ids_init();
 
     rb_thread_stop_timer_thread();
@@ -1797,9 +1809,14 @@ int main(int argc, char **argv) {
 
 #ifdef __AFL_FUZZ_TESTCASE_BUF
     if (__afl_fuzz_ptr != NULL) {
-        const uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
-        size_t len = (size_t) __AFL_FUZZ_TESTCASE_LEN;
-        LLVMFuzzerTestOneInput(buf, len);
+#ifdef __AFL_LOOP
+        while (__AFL_LOOP(FUZZ_DIFF_PERSISTENT_ITERS))
+#endif
+        {
+            const uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
+            size_t len = (size_t) __AFL_FUZZ_TESTCASE_LEN;
+            LLVMFuzzerTestOneInput(buf, len);
+        }
         return 0;
     }
 #endif
