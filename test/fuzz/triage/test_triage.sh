@@ -2622,6 +2622,11 @@ dc3=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(o
 [ "$dc1" = "$dc2" ] || fail "expected identical diff crash signature across ASLR/paths, got $dc1 vs $dc2"
 [ "$dc1" != "$dc3" ] || fail "expected distinct diff crash signatures for distinct frames ($dc1 == $dc3)"
 
+dc4=$(printf 'CRASH[diff_parse_y]: signal=SIGTRAP (5)\n/prism/build/fuzz.diff(rb_print_backtrace+0x28) [0xaaaa0800] /opt/ruby/vm_dump.c:1108\n/prism/build/fuzz.diff(diff_fatal_signal_handler+0x4c) [0xaaaa1000] /prism/test/fuzz/harness/diff.c:1509\nlinux-vdso.so.1(__kernel_rt_sigreturn+0x0) [0xffff0000]\n/prism/build/fuzz.diff(rb_parser_enc_cr_str_buf_cat+0x3b8) [0xaaaa2000] /prism/parse.y:2400\n' | ./test/fuzz/triage/signature.sh)
+dc5=$(printf 'CRASH[diff_parse_y]: signal=SIGTRAP (5)\n/other/build/fuzz.diff(diff_fatal_signal_handler+0x99) [0xbbbb1000] /other/test/fuzz/harness/diff.c:1509\n/other/build/fuzz.diff(rb_parser_enc_cr_str_buf_cat+0x97c) [0xbbbb2000] /prism/parse.y:2400\n' | ./test/fuzz/triage/signature.sh)
+[ "$dc4" = "$dc5" ] || fail "expected identical diff SIGTRAP signature across ASLR/paths, got $dc4 vs $dc5"
+[ "$dc4" != "$dc1" ] || fail "expected distinct diff signature for SIGTRAP vs SIGSEGV ($dc4 == $dc1)"
+
 if [ -f /opt/ruby/libruby-static.a ] && [ -f /opt/ruby/parse.c ]; then
   diff_bucket="$WORKDIR/diff_triage_test/ABRT/diff_bucket"
   mkdir -p "$diff_bucket"
@@ -2656,6 +2661,29 @@ C
   diff_fail_rc=$?
   set -e
   [ "$diff_fail_rc" -eq 1 ] || fail "expected verify_bucket.sh diff_parse_y FAIL exit 1, got $diff_fail_rc"
+
+  # UNREACHABLE_RETURN in CRuby parse.c must trap deterministically (with WIFSIGNALED)
+  # rather than falling through __builtin_unreachable() into RangeError or swallowing signals.
+  ruby -e 'File.binwrite(ARGV[0], "\x00\x00\x03\x01# encoding: sjis\n\"\x82\xa0\n\x82\xa0\\u{0")' "$diff_bucket/input.min"
+  cat > "$diff_bucket/testcase.c" << 'C'
+/*
+CRASH[diff_parse_y]: signal=SIGTRAP (5)
+*/
+C
+  set +e
+  VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_trap_fail.json"
+  diff_trap_rc=$?
+  set -e
+  [ "$diff_trap_rc" -eq 1 ] || fail "expected verify_bucket.sh diff_parse_y UNREACHABLE_RETURN trap FAIL exit 1, got $diff_trap_rc"
+  ruby - "$WORKDIR/diff_trap_fail.json" << 'EOF'
+require "json"
+rep = JSON.parse(File.read(ARGV.fetch(0)))
+f = rep.dig("failures", 0)
+unless f && [4, 5].include?(f["signal"]) && f["output"].to_s.match?(/\ACRASH\[diff_parse_y\]: signal=SIG(ILL|TRAP) /)
+  raise "expected signaled SIGTRAP/SIGILL CRASH[diff_parse_y] failure, got: #{rep.inspect}"
+end
+EOF
   printf '\0\0\003\001%s' "1 + 2" > "$diff_bucket/input.min"
   VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
     --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_pass.json"
@@ -2667,6 +2695,7 @@ workdir = ARGV.fetch(0)
 
 [
   ["segv", "case;when 1;case;c;in 1;end;end", "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", "SEGV"],
+  ["trap", "# encoding: sjis\n\"\x82\xa0\n\x82\xa0\\u{0".b, "CRASH[diff_parse_y]: signal=SIGTRAP (5)\n", "TRAP"],
   ["inv", "a[b c do end]", "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block\n", "ABRT"],
   ["ast_block", "def f\n  1.times { check 1, case 1 when 1 then return b&r do end end }\nend\n", "INVARIANT[diff_parse_y]: kind=ast_block_owner_mismatch sub=operator\n", "ABRT"],
   ["zero_er", "module:A\nend\n", "INVARIANT[diff_parse_y]: kind=ast_zero_error_recovery\n", "ABRT"],
@@ -2685,6 +2714,7 @@ end
 EOF
 
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_segv/build.sh"
+  PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_trap/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_inv/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_ast_block/build.sh"
   PRISM_ROOT="$PWD" DIFF_ORACLE_DIR="$WORKDIR/diff_tc_oracle" "$WORKDIR/diff_repro_zero_er/build.sh"
@@ -2694,6 +2724,8 @@ EOF
   set +e
   timeout -k 1 5 "$WORKDIR/diff_repro_segv/testcase" > "$WORKDIR/diff_repro_segv.out" 2>&1
   segv_rc=$?
+  timeout -k 1 5 "$WORKDIR/diff_repro_trap/testcase" > "$WORKDIR/diff_repro_trap.out" 2>&1
+  trap_rc=$?
   timeout -k 1 5 "$WORKDIR/diff_repro_inv/testcase" > "$WORKDIR/diff_repro_inv.out" 2>&1
   inv_rc=$?
   timeout -k 1 5 "$WORKDIR/diff_repro_ast_block/testcase" > "$WORKDIR/diff_repro_ast_block.out" 2>&1
@@ -2703,6 +2735,7 @@ EOF
   set -e
   [ "$segv_rc" -eq 139 ] || fail "expected diff_repro_segv/testcase exit 139 (SIGSEGV), got $segv_rc: $(cat "$WORKDIR/diff_repro_segv.out")"
   grep -q "\[BUG\] Segmentation fault" "$WORKDIR/diff_repro_segv.out" || fail "expected CRuby bug report in diff_repro_segv output"
+  [ "$trap_rc" -eq 133 ] || [ "$trap_rc" -eq 132 ] || fail "expected diff_repro_trap/testcase exit 133/132 (SIGTRAP/SIGILL), got $trap_rc: $(cat "$WORKDIR/diff_repro_trap.out")"
   [ "$inv_rc" -eq 134 ] || fail "expected diff_repro_inv/testcase exit 134 (SIGABRT), got $inv_rc: $(cat "$WORKDIR/diff_repro_inv.out")"
   grep -q "INVARIANT\[diff_parse_y\]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:unexpected_do_block" "$WORKDIR/diff_repro_inv.out" || fail "expected granular diff invariant in diff_repro_inv output"
   [ "$ast_block_rc" -eq 134 ] || fail "expected diff_repro_ast_block/testcase exit 134 (SIGABRT), got $ast_block_rc: $(cat "$WORKDIR/diff_repro_ast_block.out")"

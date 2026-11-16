@@ -1477,8 +1477,9 @@ static void diff_compare_asts(diff_summary_t *prism, diff_summary_t *cruby) {
 
 static int diff_oracle_initialized = 0;
 
-static const int diff_crash_signals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGPIPE };
-static const int diff_fatal_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+static const int diff_crash_signals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGTRAP, SIGPIPE };
+static const int diff_fatal_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE };
+#define DIFF_CRASH_SIGNAL_COUNT (sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]))
 
 static void diff_write_stderr_str(const char *s, size_t len) {
     while (len > 0) {
@@ -1500,24 +1501,29 @@ static void diff_fatal_signal_handler(int sig) {
         case SIGSEGV: msg = "CRASH[diff_parse_y]: signal=SIGSEGV (11)\n"; break;
         case SIGBUS:  msg = "CRASH[diff_parse_y]: signal=SIGBUS (7)\n"; break;
         case SIGILL:  msg = "CRASH[diff_parse_y]: signal=SIGILL (4)\n"; break;
+        case SIGTRAP: msg = "CRASH[diff_parse_y]: signal=SIGTRAP (5)\n"; break;
         case SIGFPE:  msg = "CRASH[diff_parse_y]: signal=SIGFPE (8)\n"; break;
         default:      break;
     }
     diff_write_stderr_str(msg, strlen(msg));
     rb_print_backtrace(stderr);
     fflush(stderr);
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, sig);
+    sigprocmask(SIG_UNBLOCK, &unblock, NULL);
     raise(sig);
     _exit(128 + sig);
 }
 
-static void diff_snapshot_signals(struct sigaction saved[5]) {
-    for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
+static void diff_snapshot_signals(struct sigaction saved[DIFF_CRASH_SIGNAL_COUNT]) {
+    for (size_t i = 0; i < DIFF_CRASH_SIGNAL_COUNT; i++) {
         sigaction(diff_crash_signals[i], NULL, &saved[i]);
     }
 }
 
-static void diff_restore_signals(const struct sigaction saved[5]) {
-    for (size_t i = 0; i < sizeof(diff_crash_signals) / sizeof(diff_crash_signals[0]); i++) {
+static void diff_restore_signals(const struct sigaction saved[DIFF_CRASH_SIGNAL_COUNT]) {
+    for (size_t i = 0; i < DIFF_CRASH_SIGNAL_COUNT; i++) {
         sigaction(diff_crash_signals[i], &saved[i], NULL);
     }
 }
@@ -1527,8 +1533,8 @@ static void diff_install_fatal_signal_handlers(void) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = diff_fatal_signal_handler;
     sigemptyset(&sa.sa_mask);
-    /* Reset to SIG_DFL on delivery so raise(sig) kills with WTERMSIG == sig and nested faults cannot loop. */
-    sa.sa_flags = SA_RESETHAND;
+    /* Reset to SIG_DFL and unmask on delivery so raise(sig) kills with WTERMSIG == sig. */
+    sa.sa_flags = SA_RESETHAND | SA_NODEFER;
     for (size_t i = 0; i < sizeof(diff_fatal_signals) / sizeof(diff_fatal_signals[0]); i++) {
         sigaction(diff_fatal_signals[i], &sa, NULL);
     }
@@ -1539,7 +1545,7 @@ static void diff_oracle_init(void) {
         return;
     }
 
-    struct sigaction saved[5];
+    struct sigaction saved[DIFF_CRASH_SIGNAL_COUNT];
     diff_snapshot_signals(saved);
 
     RUBY_INIT_STACK;

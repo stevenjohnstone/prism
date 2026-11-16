@@ -148,6 +148,18 @@ if [ "$MODE" = "fuzz" ]; then
   ORACLE_MODE="fuzz"
 fi
 
+# Turn __builtin_unreachable() / UNREACHABLE_RETURN(...) in CRuby parse.c into
+# a deterministic trap instead of UB fallthrough across persistent/cold runs.
+PARSE_UNREACHABLE_FLAGS=()
+probe_obj="$ORACLE_DIR/.unreachable-probe.$$.o"
+rm -f "$probe_obj"
+if "${PARSE_CC[@]}" -x c -fsanitize=unreachable -fsanitize-trap=unreachable -c /dev/null -o "$probe_obj" >/dev/null 2>&1; then
+  PARSE_UNREACHABLE_FLAGS=(-fsanitize=unreachable -fsanitize-trap=unreachable)
+elif "${PARSE_CC[@]}" -x c -fsanitize=unreachable -fsanitize-undefined-trap-on-error -c /dev/null -o "$probe_obj" >/dev/null 2>&1; then
+  PARSE_UNREACHABLE_FLAGS=(-fsanitize=unreachable -fsanitize-undefined-trap-on-error)
+fi
+rm -f "$probe_obj"
+
 ORACLE_STAMP_FILE="$ORACLE_DIR/.oracle.stamp"
 ORACLE_ARCHIVE="$ORACLE_DIR/libcruby_oracle.a"
 
@@ -164,7 +176,7 @@ oracle_fp="$(ruby -rdigest -e '
     end
   end
   puts d.hexdigest
-' "$ORACLE_MODE" "$RUBY_PARSE_FLAGS" "$RUBY_DIR/libruby-static.a" "$RUBY_DIR/parse.c" "$ORACLE_DEP")"
+' "$ORACLE_MODE" "$RUBY_PARSE_FLAGS ${PARSE_UNREACHABLE_FLAGS[*]+"${PARSE_UNREACHABLE_FLAGS[*]}"}" "$RUBY_DIR/libruby-static.a" "$RUBY_DIR/parse.c" "$ORACLE_DEP")"
 
 if [ ! -f "$ORACLE_ARCHIVE" ] || [ ! -f "$ORACLE_STAMP_FILE" ] || [ "$(cat "$ORACLE_STAMP_FILE" 2>/dev/null)" != "$oracle_fp" ]; then
   tmp_parse_o="$ORACLE_DIR/parse.o.tmp.$$"
@@ -174,6 +186,7 @@ if [ ! -f "$ORACLE_ARCHIVE" ] || [ ! -f "$ORACLE_STAMP_FILE" ] || [ "$(cat "$ORA
 
   "${PARSE_CC[@]}" \
     -O3 -ggdb3 -fno-strict-overflow -fvisibility=hidden -fPIE -w \
+    ${PARSE_UNREACHABLE_FLAGS[@]+"${PARSE_UNREACHABLE_FLAGS[@]}"} \
     "${PARSE_CPP_FLAGS[@]}" \
     -c "$RUBY_DIR/parse.c" -o "$tmp_parse_o"
 
