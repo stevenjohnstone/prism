@@ -2607,6 +2607,9 @@ ds9=$(printf 'INVARIANT[diff_parse_y]: kind=locals_count_mismatch scope=def [det
 ds10=$(printf 'INVARIANT[diff_parse_y]: kind=locals_count_mismatch scope=program [detail: scope_idx=0 prism=1 cruby=0]\n' | ./test/fuzz/triage/signature.sh)
 ds11=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=SyntaxError:invalid_multibyte_utf8 [detail: \377\376]\n' | ./test/fuzz/triage/signature.sh)
 ds12=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=SyntaxError:invalid_multibyte_utf8 [detail: a]\n' | ./test/fuzz/triage/signature.sh)
+ds13=$(printf 'INVARIANT[diff_parse_y]: kind=ast_tree_mismatch sub=label prism=CALL:+ cruby=CALL:* [detail: idx=1 prism_len=46 cruby_len=46]\n' | ./test/fuzz/triage/signature.sh)
+ds14=$(printf 'INVARIANT[diff_parse_y]: kind=ast_tree_mismatch sub=label prism=CALL:+ cruby=CALL:* [detail: idx=9 prev=SCOPE:def prism_len=80 cruby_len=80]\n' | ./test/fuzz/triage/signature.sh)
+ds15=$(printf 'INVARIANT[diff_parse_y]: kind=ast_tree_mismatch sub=tag prism=INT cruby=ARRAY [detail: idx=2 prism_len=6 cruby_len=10]\n' | ./test/fuzz/triage/signature.sh)
 [ "$ds1" = "$ds2" ] || fail "expected identical diff signature across details, got $ds1 vs $ds2"
 [ "$ds1" != "$ds3" ] || fail "expected distinct diff signatures across sub kinds ($ds1 == $ds3)"
 [ "$ds1" != "$ds4" ] || fail "expected distinct diff signatures across cruby/hygiene tags ($ds1 == $ds4)"
@@ -2615,6 +2618,8 @@ ds12=$(printf 'INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_
 [ "$ds6" != "$ds8" ] || fail "expected distinct ast_block_owner_mismatch signatures across sub ($ds6 == $ds8)"
 [ "$ds9" != "$ds10" ] || fail "expected distinct locals_count_mismatch signatures across scope ($ds9 == $ds10)"
 [ "$ds11" = "$ds12" ] || fail "expected identical diff signature when [detail: ...] contains non-UTF-8 bytes ($ds11 != $ds12)"
+[ "$ds13" = "$ds14" ] || fail "expected identical ast_tree_mismatch signatures across details ($ds13 vs $ds14)"
+[ "$ds13" != "$ds15" ] || fail "expected distinct ast_tree_mismatch signatures across sub/tags ($ds13 == $ds15)"
 
 dc1=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(diff_fatal_signal_handler+0x4c) [0xaaaa1000] /prism/test/fuzz/harness/diff.c:96\nlinux-vdso.so.1(__kernel_rt_sigreturn+0x0) [0xffff0000]\n/prism/build/fuzz.diff(rb_st_free_table+0x14) [0xaaaa2000] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
 dc2=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/other/build/fuzz.diff(diff_fatal_signal_handler+0x99) [0xbbbb1000] /other/test/fuzz/harness/diff.c:96\n/other/build/fuzz.diff(rb_st_free_table+0x28) [0xbbbb2000] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
