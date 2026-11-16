@@ -93,18 +93,15 @@ cosine-overlap geometric mean:
 
 ### 3.2 Function-Role Multipliers
 
-`function_weight_multiplier` assigns $m(\text{fn})$ as follows:
+`function_weight_multiplier` assigns $m(\text{fn})$ cleanly from role membership and corpus edge count $C(\text{fn})$:
 
-- **`BOILERPLATE_FUNCTIONS` ($m = 0.0$):** Fuzz harness drivers and invariant
-  checkers (`fuzz_invariant_fail`, `fuzz_loc_in_bounds`,
-  `fuzz_span_violation_kind`, `fuzz_heredoc_span_contains`,
-  `fuzz_line_offset_context`, `fuzz_line_offset_visit`, `fuzz_shebang_cb`,
-  `fuzz_stream_fgets`, `fuzz_stream_feof`, `check_node_location`,
-  `check_diagnostic_locations`, `check_comment_locations`, `harness_parse`,
-  `harness`, `LLVMFuzzerTestOneInput`), string/context tables (`pm_token_str`,
-  `context_human`), and generated AST/diagnostic tables (`VISITOR_FUNCTIONS`:
-  `pm_visit_node`, `pm_visit_child_nodes`, `pm_node_type`, `pm_diagnostic_type`,
-  `pm_diagnostic_error_level`, `pm_diagnostic_warning_level`).
+- **`BOILERPLATE_FUNCTIONS` and `BOILERPLATE_PREFIXES` ($m = 0.0$):** Fuzz harness
+  drivers, invariant checkers, and generated visitors (`fuzz_*`, `check_*`,
+  `pm_visit_*`, plus explicit harness/string helpers such as `harness_parse`,
+  `harness`, `LLVMFuzzerTestOneInput`, `pm_token_str`, `context_human`, and
+  `VISITOR_FUNCTIONS`). Prefix matching ensures newer harness checks such as
+  `fuzz_check_error_diag` or `fuzz_span_violation_kind` are filtered
+  automatically without stale allowlists.
 - **`SETUP_FUNCTIONS` ($m = 0.0$):** Pre-parse option initialization and
   encoding-name lookup (`pm_parser_init`, `pm_parser_init_shebang`,
   `pm_encoding_find`, `pm_strncasecmp`). The 4-byte fuzzer option header selects
@@ -123,30 +120,69 @@ cosine-overlap geometric mean:
   `pm_error_recovery_node_new`, `pm_error_recovery_node_create`,
   `pm_error_recovery_node_create_unexpected`, `pm_parse_err_is_fatal`,
   `pm_diagnostic_list_append`).
-- **All other Prism functions:** $m = 1.0$.
+- **Base weight for all other Prism functions:** $m_{\text{base}} = 1.0$.
+- **Dispatcher damping & function edge cap:** High-fanout parser/lexer dispatch
+  loops (`DISPATCHER_FUNCTIONS`: `parser_lex`, `parse_expression`, `pm_parse`)
+  are further scaled by `DISPATCHER_WEIGHT = 0.5`, and any function with
+  $C(\text{fn}) > \text{FUNCTION\_EDGE\_CAP} = 150.0$ mapped corpus edges is
+  scaled by $\sqrt{150.0 / C(\text{fn})}$. Unlike per-bucket $1/\sqrt{k_f}$
+  normalization, corpus-level square-root scaling prevents monolithic dispatch
+  loops from overwhelming small targeted bug functions while keeping bucket
+  feature weights corpus-consistent.
 
 ### 3.3 Call Stack Frames
 
 `extract_frame_vector` keeps only frames with `scope == "prism"`, non-empty
-`func`, and not in `VISITOR_FUNCTIONS`. Frames are indexed from the crashing
-leaf ($d = 0$) as `func@file` (omitting line numbers so multi-site overflows in
-the same leaf helper, e.g., `src/line_offset_list.c:85` and `:96`, align at
-$d = 0$) with geometric decay $\text{FRAME\_DECAY}^d = 0.5^d$. Non-empty frame
-vectors are compared via cosine similarity:
+`func`, and `!boilerplate_function?(func)` (excluding all `VISITOR_FUNCTIONS`,
+`pm_visit_*`, `fuzz_*`, and `check_*` frames). Frames are indexed from the
+crashing leaf ($d = 0$) as `func@file` (omitting line numbers so multi-site
+overflows in the same leaf helper, e.g., `src/line_offset_list.c:85` and `:96`,
+align at $d = 0$) with geometric decay $\text{FRAME\_DECAY}^d = 0.5^d$.
+Non-empty frame vectors are compared via cosine similarity:
 
 $$S_{\text{frame}}(a, b) = \frac{f_a \cdot f_b}{\|f_a\| \, \|f_b\|}$$
 
-## 4. Pairwise Evidence & Reason Weight Derivation
+## 4. Oracle Separation, Pairwise Evidence & Reason Weight
 
-Evidence combines coverage and frame similarity using `FRAME_BLEND_WEIGHT`
-($\alpha = 0.75$) and `FRAME_MISMATCH_PENALTY` ($\rho = 0.50$):
+Before computing pairwise similarity, `oracle_family` partitions buckets by
+verification oracle (`verify_profile` or `symptom.invariant.namespace`):
+
+- `"diff_parse_y"` (`diff_parse_y` parser/CRuby parity checks),
+- `"stream_diff"` (`msan_slow` / `stream_diff` streaming parity checks),
+- `"crash_or_inv"` (crash sanitizers and post-parse AST/location invariants).
+
+Buckets from different oracle families receive `similarity = 0.0` and are never
+merged in `best_upgma_merge` regardless of `threshold`. This preserves soft
+cross-reason merging inside `"crash_or_inv"` (e.g., `SEGV` vs. MSan
+`use-of-uninitialized-value` or `ABRT`) while preventing shared `ABRT` post-parse
+exit scaffolding from mixing sanitizer/invariant bugs with `diff_parse_y` or
+`stream_diff` mismatches.
+
+Within compatible oracle families, evidence combines coverage, stack frames, and
+structured `diff_parse_y` symptoms using `FRAME_BLEND_WEIGHT` ($\alpha = 0.75$)
+and `FRAME_MISMATCH_PENALTY` ($\rho = 0.50$):
 
 $$\text{evidence}(a, b) = \begin{cases}
 \alpha\, S_{\text{frame}}(a, b) + (1 - \alpha)\, S_{\text{cov}}(a, b) & \text{if both have Prism frames and coverage} \\
 S_{\text{frame}}(a, b) & \text{if both have Prism frames and either lacks coverage} \\
-S_{\text{cov}}(a, b) & \text{if neither has Prism frames} \\
+S_{\text{diff}}(S_{\text{cov}}(a, b), a, b) & \text{if neither has Prism frames} \\
 \rho\, S_{\text{cov}}(a, b) & \text{if exactly one has Prism frames}
 \end{cases}$$
+
+When neither bucket has Prism frames and both carry `diff_parse_y` structured
+fields (`symptom.invariant.fields`), `diff_symptom_similarity` applies a
+conflict-aware adjustment:
+
+- If non-empty `sub` (`prism_ok_cruby_err`, `prism_err_cruby_ok`, `operator`) or
+  `kind` conflicts, evidence is damped by `DIFF_CONFLICT_SCALE = 0.35`.
+- Otherwise, across `{prism, cruby, node, scope}` (ignoring `"ok"` diagnostics):
+  - if all populated fields agree and at least one agreed value is non-generic
+    (i.e., not in `GENERIC_DIFF_ERRORS`: `expect_eol_after_statement`,
+    `unexpected_token_ignore`, `unexpected_token_close_context`,
+    `regexp_parse_error`, `SyntaxError:other`), evidence is boosted via
+    $\min(1.0, (1 - 0.15)\,\text{ev} + 0.15)$ (`DIFF_MATCH_BOOST = 0.15`);
+  - if any populated field disagrees, evidence is damped by `0.35`;
+  - otherwise `evidence` stays unchanged at $S_{\text{cov}}(a, b)$.
 
 Total similarity adds the soft `reason` indicator $r(a, b) \in \{0, 1\}$ with
 `DEFAULT_REASON_WEIGHT` ($w_r = 0.10$):
@@ -220,6 +256,26 @@ Evaluated directly by [`FuzzClustering.cluster_metadata`](cluster.rb):
   - Random single-bug subsamples (2–12 buckets drawn from multi-bucket bugs):
     **275/275 (100%)** collapse cleanly to 1 cluster on Run 1, **275/275 (100%)**
     on Run 2, and **275/275 (100%)** on Run 3 (**825/825 total**).
+
+### Multi-Oracle 24-Hour Validation (`210` Buckets, `50,139` Occurrences)
+
+After adding prefix boilerplate filtering, dispatcher damping + function edge
+cap, `oracle_family` separation, and conflict-aware `diff_parse_y` symptom
+scoring at the unchanged threshold `T = 0.225`:
+
+- **Run 1 (`tmp/fuzz/triage.run1/metadata.json`, 58 buckets):** **6 pure
+  clusters** (`V-measure = 1.000`, `ARI = 1.000`, `min_merge = 0.239372`,
+  `max_inter = 0.186246`).
+- **Run 2 (`tmp/fuzz/triage.run2/metadata.json`, 58 buckets):** **6 pure
+  clusters** (`V-measure = 1.000`, `ARI = 1.000`, `min_merge = 0.225181`,
+  `max_inter = 0.186533`).
+- **24-hour multi-oracle campaign (`tmp/fuzz/triage/metadata.json`, 210
+  buckets, 50,139 occurrences; 119 labeled buckets):**
+  - Baseline (`E0`): `21` clusters, `5` oracle-mixed clusters, `Purity = 0.6975`,
+    `Inverse Purity = 0.9412`, `V-measure = 0.8518`, `ARI = 0.7418`.
+  - Updated `cluster.rb`: **`47` clusters**, **`0` oracle-mixed clusters**,
+    `min_merge = 0.227594`, `max_inter = 0.221973`, **`Purity = 0.9580`**,
+    **`Inverse Purity = 0.9412`**, **`V-measure = 0.9659`**, **`ARI = 0.9313`**.
 
 ## 6. CLI and Output Format
 

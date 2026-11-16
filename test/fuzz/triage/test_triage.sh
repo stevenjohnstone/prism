@@ -1486,6 +1486,93 @@ unless no_cov_groups == [["ABRT/u1"], ["ABRT/u2"], ["SEGV/s1", "use-of-uninitial
   raise "unexpected no-coverage fallback clusters: #{no_cov_groups.inspect}"
 end
 
+# Regression 1: prefix boilerplate filtering (fuzz_*, check_*, pm_visit_*) applies in both IDF and frames
+pfx_ef = edge_functions.merge(
+  "80" => "fuzz_check_error_diag", "81" => "check_custom_location", "82" => "pm_visit_program_node",
+  "83" => "parse_heredoc", "84" => "parse_case"
+)
+pfx_df = edge_df.merge("80" => 0, "81" => 0, "82" => 0, "83" => 0, "84" => 0)
+pfx_corpus = { "available" => true, "corpus_count" => 100, "edge_df" => pfx_df, "edge_functions" => pfx_ef }
+pfx_a = make_bucket.call(
+  id: "ABRT/pfx_a", reason: "ABRT", occ: 2,
+  frames: [{ "scope" => "prism", "func" => "pm_visit_program_node", "file" => "node.c", "line" => 1 }],
+  edges: { "1" => 1, "80" => 1, "81" => 1, "82" => 1, "83" => 1 }
+)
+pfx_b = make_bucket.call(
+  id: "ABRT/pfx_b", reason: "ABRT", occ: 2,
+  edges: { "1" => 1, "80" => 1, "81" => 1, "82" => 1, "84" => 1 }
+)
+pfx_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => pfx_corpus, "buckets" => [pfx_a, pfx_b] })
+unless pfx_rep.dig("summary", "cluster_count") == 2 && pfx_rep["clusters"].all? { |c| c["representative"]["top_prism_frame"].nil? }
+  raise "prefix boilerplate filtering regression failed: #{pfx_rep.inspect}"
+end
+
+# Regression 2: distinct oracle families never merge even with identical edges and threshold=0.0
+make_inv_bucket = lambda do |id:, profile:, ns:, fields: {}, edges: { "1" => 1, "83" => 1 }|
+  b = make_bucket.call(id: id, reason: "ABRT", occ: 3, edges: edges)
+  b["verify_profile"] = profile
+  b["symptom"]["invariant"] = { "namespace" => ns, "fields" => fields }
+  b
+end
+ora_buckets = [
+  make_inv_bucket.call(id: "ABRT/ora_crash", profile: "ubsan", ns: "span"),
+  make_inv_bucket.call(id: "ABRT/ora_diff", profile: "diff_parse_y", ns: "diff_parse_y", fields: { "kind" => "ast_mismatch", "node" => "CallNode" }),
+  make_inv_bucket.call(id: "ABRT/ora_stream", profile: "msan_slow", ns: "stream_diff")
+]
+ora_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => pfx_corpus, "buckets" => ora_buckets }, threshold: 0.0)
+ora_groups = ora_rep["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] }.sort }.sort
+unless ora_groups == [["ABRT/ora_crash"], ["ABRT/ora_diff"], ["ABRT/ora_stream"]]
+  raise "oracle separation failed: #{ora_groups.inspect}"
+end
+
+# Regression 3: dispatcher damping + function edge cap prevent monolithic dispatcher edges from merging distinct bugs
+disp_ef = edge_functions.dup
+disp_df = edge_df.dup
+(200...400).each { |eid| disp_ef[eid.to_s] = "parser_lex"; disp_df[eid.to_s] = 0 }
+(401..402).each { |eid| disp_ef[eid.to_s] = "parse_array"; disp_df[eid.to_s] = 0 }
+(403..404).each { |eid| disp_ef[eid.to_s] = "parse_heredoc"; disp_df[eid.to_s] = 0 }
+disp_corpus = { "available" => true, "corpus_count" => 100, "edge_df" => disp_df, "edge_functions" => disp_ef }
+disp_a = make_bucket.call(id: "ABRT/disp_a", reason: "ABRT", occ: 2, edges: { "200" => 1, "401" => 1, "402" => 1 })
+disp_b = make_bucket.call(id: "ABRT/disp_b", reason: "ABRT", occ: 2, edges: { "200" => 1, "403" => 1, "404" => 1 })
+disp_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => disp_corpus, "buckets" => [disp_a, disp_b] })
+unless disp_rep.dig("summary", "cluster_count") == 2
+  raise "dispatcher + function_edge_cap regression failed: #{disp_rep.inspect}"
+end
+
+# Regression 4: conflict-aware diff_parse_y symptom similarity + generic catch-all error exclusion
+diff_ef = edge_functions.dup
+diff_df = edge_df.dup
+(500..520).each { |eid| diff_ef[eid.to_s] = "parse_for"; diff_df[eid.to_s] = 0 }
+diff_corpus = { "available" => true, "corpus_count" => 100, "edge_df" => diff_df, "edge_functions" => diff_ef }
+low_a = { "500" => 1, "501" => 1, "502" => 1, "503" => 1, "504" => 1 }
+low_b = { "500" => 1, "505" => 1, "506" => 1, "507" => 1, "508" => 1 }
+# Specific non-generic match boosts low coverage into merging
+d_spec = [
+  make_inv_bucket.call(id: "ABRT/d_spec_a", profile: "diff_parse_y", ns: "diff_parse_y", edges: low_a,
+    fields: { "kind" => "ast_mismatch", "sub" => "node_kind", "node" => "YieldNode", "scope" => "program" }),
+  make_inv_bucket.call(id: "ABRT/d_spec_b", profile: "diff_parse_y", ns: "diff_parse_y", edges: low_b,
+    fields: { "kind" => "ast_mismatch", "sub" => "node_kind", "node" => "YieldNode", "scope" => "program" })
+]
+raise "specific diff_parse_y match failed to merge" unless FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => diff_corpus, "buckets" => d_spec }).dig("summary", "cluster_count") == 1
+# Generic catch-all error alone does NOT boost low coverage into false merging
+d_gen = [
+  make_inv_bucket.call(id: "ABRT/d_gen_a", profile: "diff_parse_y", ns: "diff_parse_y", edges: low_a,
+    fields: { "kind" => "syntax_mismatch", "sub" => "prism_err_cruby_ok", "prism" => "expect_eol_after_statement", "cruby" => "ok" }),
+  make_inv_bucket.call(id: "ABRT/d_gen_b", profile: "diff_parse_y", ns: "diff_parse_y", edges: low_b,
+    fields: { "kind" => "syntax_mismatch", "sub" => "prism_err_cruby_ok", "prism" => "expect_eol_after_statement", "cruby" => "ok" })
+]
+raise "generic diff_parse_y error falsely boosted merge" unless FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => diff_corpus, "buckets" => d_gen }).dig("summary", "cluster_count") == 2
+# Conflicting scope/sub penalizes even moderate coverage similarity (scov=1/3 -> would merge without penalty)
+mod_a = { "500" => 1, "501" => 1 }
+mod_b = { "500" => 1, "502" => 1 }
+d_conf = [
+  make_inv_bucket.call(id: "ABRT/d_conf_a", profile: "diff_parse_y", ns: "diff_parse_y", edges: mod_a,
+    fields: { "kind" => "ast_mismatch", "sub" => "node_kind", "node" => "YieldNode", "scope" => "program" }),
+  make_inv_bucket.call(id: "ABRT/d_conf_b", profile: "diff_parse_y", ns: "diff_parse_y", edges: mod_b,
+    fields: { "kind" => "ast_mismatch", "sub" => "node_kind", "node" => "YieldNode", "scope" => "block" })
+]
+raise "conflicting diff_parse_y scope falsely merged" unless FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => diff_corpus, "buckets" => d_conf }).dig("summary", "cluster_count") == 2
+
 # Exercise CLI file and stdout output paths
 meta_path = File.join(workdir, "cluster_meta.json")
 out_path = File.join(workdir, "clusters_out.json")

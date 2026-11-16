@@ -27,6 +27,10 @@ module FuzzClustering
   SETUP_FUNCTION_WEIGHT = 0.0
   ENCODING_HELPER_WEIGHT = 0.25
   RECOVERY_FUNCTION_WEIGHT = 0.10
+  DISPATCHER_WEIGHT = 0.5
+  FUNCTION_EDGE_CAP = 150.0
+  DIFF_CONFLICT_SCALE = 0.35
+  DIFF_MATCH_BOOST = 0.15
   TIE_EPSILON = 1e-12
 
   # Generated AST/diagnostic reflection tables and harness wrappers carry no
@@ -38,6 +42,12 @@ module FuzzClustering
     pm_diagnostic_type
     pm_diagnostic_error_level
     pm_diagnostic_warning_level
+  ].freeze
+
+  BOILERPLATE_PREFIXES = %w[
+    fuzz_
+    check_
+    pm_visit_
   ].freeze
 
   BOILERPLATE_FUNCTIONS = (%w[
@@ -93,6 +103,24 @@ module FuzzClustering
     pm_diagnostic_list_append
   ].freeze
 
+  # Monolithic parser/lexer dispatch loops account for a disproportionate share of
+  # uncovered edges across distinct syntax bugs entering or exiting parsing.
+  DISPATCHER_FUNCTIONS = %w[
+    parser_lex
+    parse_expression
+    pm_parse
+  ].freeze
+
+  # Generic catch-all diagnostics shared by unrelated syntax discrepancies should
+  # not boost similarity when comparing diff_parse_y symptoms.
+  GENERIC_DIFF_ERRORS = %w[
+    expect_eol_after_statement
+    unexpected_token_ignore
+    unexpected_token_close_context
+    regexp_parse_error
+    SyntaxError:other
+  ].freeze
+
   module_function
 
   def write_json_atomic(path, payload)
@@ -105,23 +133,41 @@ module FuzzClustering
     File.delete(tmp) if tmp && File.exist?(tmp)
   end
 
+  def boilerplate_function?(func_name)
+    name = func_name.to_s
+    BOILERPLATE_FUNCTIONS.include?(name) ||
+      BOILERPLATE_PREFIXES.any? { |prefix| name.start_with?(prefix) }
+  end
+
   def function_weight_multiplier(
     func_name,
     setup_weight: SETUP_FUNCTION_WEIGHT,
     encoding_weight: ENCODING_HELPER_WEIGHT,
-    recovery_weight: RECOVERY_FUNCTION_WEIGHT
+    recovery_weight: RECOVERY_FUNCTION_WEIGHT,
+    dispatcher_weight: DISPATCHER_WEIGHT,
+    fn_edge_count: 0,
+    function_edge_cap: FUNCTION_EDGE_CAP
   )
-    if BOILERPLATE_FUNCTIONS.include?(func_name)
-      0.0
-    elsif SETUP_FUNCTIONS.include?(func_name)
-      setup_weight
-    elsif ENCODING_HELPER_FUNCTIONS.include?(func_name)
-      encoding_weight
-    elsif RECOVERY_FUNCTIONS.include?(func_name)
-      recovery_weight
-    else
-      1.0
+    base =
+      if boilerplate_function?(func_name)
+        0.0
+      elsif SETUP_FUNCTIONS.include?(func_name)
+        setup_weight
+      elsif ENCODING_HELPER_FUNCTIONS.include?(func_name)
+        encoding_weight
+      elsif RECOVERY_FUNCTIONS.include?(func_name)
+        recovery_weight
+      else
+        1.0
+      end
+    return 0.0 if base <= 0.0
+
+    mult = base
+    mult *= dispatcher_weight if DISPATCHER_FUNCTIONS.include?(func_name)
+    if function_edge_cap && function_edge_cap > 0.0 && fn_edge_count > function_edge_cap
+      mult *= Math.sqrt(function_edge_cap / fn_edge_count.to_f)
     end
+    mult
   end
 
   def build_edge_idf(
@@ -129,7 +175,9 @@ module FuzzClustering
     smoothing: IDF_SMOOTHING,
     setup_weight: SETUP_FUNCTION_WEIGHT,
     encoding_weight: ENCODING_HELPER_WEIGHT,
-    recovery_weight: RECOVERY_FUNCTION_WEIGHT
+    recovery_weight: RECOVERY_FUNCTION_WEIGHT,
+    dispatcher_weight: DISPATCHER_WEIGHT,
+    function_edge_cap: FUNCTION_EDGE_CAP
   )
     return { enabled: false, idf: {}, edge_functions: {} } unless corpus.is_a?(Hash) && corpus["available"] == true
 
@@ -151,12 +199,18 @@ module FuzzClustering
       }
     end
 
+    fn_counts = Hash.new(0)
+    edge_functions.each_value { |fn| fn_counts[fn] += 1 }
+
     edge_functions.each do |edge_id, func_name|
       mult = function_weight_multiplier(
         func_name,
         setup_weight: setup_weight,
         encoding_weight: encoding_weight,
-        recovery_weight: recovery_weight
+        recovery_weight: recovery_weight,
+        dispatcher_weight: dispatcher_weight,
+        fn_edge_count: fn_counts[func_name],
+        function_edge_cap: function_edge_cap
       )
       next if mult <= 0.0
 
@@ -181,7 +235,7 @@ module FuzzClustering
       f.is_a?(Hash) &&
         f["scope"] == "prism" &&
         !f["func"].to_s.empty? &&
-        !VISITOR_FUNCTIONS.include?(f["func"])
+        !boilerplate_function?(f["func"])
     end
 
     prism_frames.each_with_index do |frame, depth|
@@ -229,6 +283,26 @@ module FuzzClustering
     [vec, vec.values.sum { |w| w * w }, true]
   end
 
+  def oracle_family(bucket)
+    prof = bucket["verify_profile"].to_s
+    ns = bucket.dig("symptom", "invariant", "namespace").to_s
+    if prof == "diff_parse_y" || ns == "diff_parse_y"
+      "diff_parse_y"
+    elsif prof == "msan_slow" || ns == "stream_diff"
+      "stream_diff"
+    else
+      "crash_or_inv"
+    end
+  end
+
+  def extract_diff_fields(bucket)
+    inv = bucket.dig("symptom", "invariant")
+    return nil unless inv.is_a?(Hash) && inv["namespace"] == "diff_parse_y"
+
+    fields = inv["fields"]
+    fields.is_a?(Hash) ? fields : nil
+  end
+
   def build_bucket_feature(bucket, cov_model, corpus_edge_df, frame_decay: FRAME_DECAY)
     cov_vec, cov_norm2, cov_available = extract_coverage_vector(bucket, cov_model, corpus_edge_df)
     frame_vec, frame_norm2, top_frame = extract_frame_vector(bucket["frames"], frame_decay: frame_decay)
@@ -239,6 +313,8 @@ module FuzzClustering
       id: bucket["bucket_id"].to_s,
       reason: bucket["reason"].to_s,
       signature: bucket["signature"].to_s,
+      oracle: oracle_family(bucket),
+      diff_fields: extract_diff_fields(bucket),
       occurrences: occ,
       min_size_bytes: min_size,
       headline: bucket.dig("symptom", "headline").to_s,
@@ -293,13 +369,75 @@ module FuzzClustering
     val > 1.0 ? 1.0 : val
   end
 
+  def conflict_field?(val_a, val_b)
+    sa = val_a.to_s
+    sb = val_b.to_s
+    !sa.empty? && !sb.empty? && sa != sb
+  end
+
+  def normalize_diff_field(key, value)
+    return nil if value.nil?
+
+    str = value.to_s
+    return nil if str.empty?
+    return nil if %w[prism cruby].include?(key) && str == "ok"
+
+    str
+  end
+
+  def generic_diff_error?(key, value)
+    %w[prism cruby].include?(key) && GENERIC_DIFF_ERRORS.include?(value)
+  end
+
+  def diff_symptom_similarity(
+    evidence,
+    fields_a,
+    fields_b,
+    conflict_scale: DIFF_CONFLICT_SCALE,
+    match_boost: DIFF_MATCH_BOOST
+  )
+    return evidence unless fields_a.is_a?(Hash) && fields_b.is_a?(Hash)
+
+    if conflict_field?(fields_a["sub"], fields_b["sub"]) ||
+       conflict_field?(fields_a["kind"], fields_b["kind"])
+      return evidence * conflict_scale
+    end
+
+    mismatch = false
+    specific_match = false
+    %w[prism cruby node scope].each do |key|
+      va = normalize_diff_field(key, fields_a[key])
+      vb = normalize_diff_field(key, fields_b[key])
+      next unless va && vb
+
+      if va != vb
+        mismatch = true
+      elsif !generic_diff_error?(key, va)
+        specific_match = true
+      end
+    end
+
+    if specific_match && !mismatch
+      [1.0, (1.0 - match_boost) * evidence + match_boost].min
+    elsif mismatch
+      evidence * conflict_scale
+    else
+      evidence
+    end
+  end
+
   def pair_similarity(
     a,
     b,
     reason_weight: DEFAULT_REASON_WEIGHT,
     frame_blend: FRAME_BLEND_WEIGHT,
-    mismatch_penalty: FRAME_MISMATCH_PENALTY
+    mismatch_penalty: FRAME_MISMATCH_PENALTY,
+    diff_conflict_scale: DIFF_CONFLICT_SCALE,
+    diff_match_boost: DIFF_MATCH_BOOST
   )
+    # Never mix buckets from distinct verification oracles (crash/invariant vs diff_parse_y vs stream_diff).
+    return 0.0 if a[:oracle] && b[:oracle] && a[:oracle] != b[:oracle]
+
     has_fa = a[:frame_norm2] > 0.0
     has_fb = b[:frame_norm2] > 0.0
     cov_both = a[:cov_available] && b[:cov_available]
@@ -310,7 +448,13 @@ module FuzzClustering
         sfrm = frame_similarity(a, b)
         cov_both ? (frame_blend * sfrm + (1.0 - frame_blend) * scov) : sfrm
       elsif !has_fa && !has_fb
-        scov
+        diff_symptom_similarity(
+          scov,
+          a[:diff_fields],
+          b[:diff_fields],
+          conflict_scale: diff_conflict_scale,
+          match_boost: diff_match_boost
+        )
       else
         mismatch_penalty * scov
       end
@@ -344,6 +488,8 @@ module FuzzClustering
 
       (i + 1...active.size).each do |j|
         cj = active[j]
+        next if ci[:oracle] && cj[:oracle] && ci[:oracle] != cj[:oracle]
+
         avg_sim = row_i[cj[:uid]] / (size_i * cj[:members].size).to_f
         pair_key = ci[:canon] <= cj[:canon] ? [ci[:canon], cj[:canon]] : [cj[:canon], ci[:canon]]
 
@@ -403,6 +549,10 @@ module FuzzClustering
     setup_weight: SETUP_FUNCTION_WEIGHT,
     encoding_weight: ENCODING_HELPER_WEIGHT,
     recovery_weight: RECOVERY_FUNCTION_WEIGHT,
+    dispatcher_weight: DISPATCHER_WEIGHT,
+    function_edge_cap: FUNCTION_EDGE_CAP,
+    diff_conflict_scale: DIFF_CONFLICT_SCALE,
+    diff_match_boost: DIFF_MATCH_BOOST,
     include_unreproducible: false,
     metadata_path: DEFAULT_METADATA_PATH
   )
@@ -433,7 +583,9 @@ module FuzzClustering
       smoothing: idf_smoothing,
       setup_weight: setup_weight,
       encoding_weight: encoding_weight,
-      recovery_weight: recovery_weight
+      recovery_weight: recovery_weight,
+      dispatcher_weight: dispatcher_weight,
+      function_edge_cap: function_edge_cap
     )
 
     features = filtered.map { |b| build_bucket_feature(b, cov_model, corpus_edge_df, frame_decay: frame_decay) }
@@ -441,12 +593,20 @@ module FuzzClustering
       features,
       reason_weight: reason_weight,
       frame_blend: frame_blend,
-      mismatch_penalty: mismatch_penalty
+      mismatch_penalty: mismatch_penalty,
+      diff_conflict_scale: diff_conflict_scale,
+      diff_match_boost: diff_match_boost
     )
 
     n = features.size
     active = Array.new(n) do |idx|
-      { uid: idx, members: [idx], min_merge_sim: 1.0, canon: features[idx][:id] }
+      {
+        uid: idx,
+        members: [idx],
+        min_merge_sim: 1.0,
+        canon: features[idx][:id],
+        oracle: features[idx][:oracle]
+      }
     end
     pair_sum = Array.new(n) { |i| sim_matrix[i].dup }
 
@@ -554,11 +714,17 @@ module FuzzClustering
         "setup_function_weight" => setup_weight,
         "encoding_helper_weight" => encoding_weight,
         "recovery_function_weight" => recovery_weight,
+        "dispatcher_weight" => dispatcher_weight,
+        "function_edge_cap" => function_edge_cap,
+        "diff_conflict_scale" => diff_conflict_scale,
+        "diff_match_boost" => diff_match_boost,
         "corpus_count" => corpus["corpus_count"].to_i,
         "filtered_boilerplate_functions" => BOILERPLATE_FUNCTIONS,
+        "filtered_boilerplate_prefixes" => BOILERPLATE_PREFIXES,
         "filtered_setup_functions" => SETUP_FUNCTIONS,
         "downweighted_encoding_functions" => ENCODING_HELPER_FUNCTIONS,
-        "downweighted_recovery_functions" => RECOVERY_FUNCTIONS
+        "downweighted_recovery_functions" => RECOVERY_FUNCTIONS,
+        "downweighted_dispatcher_functions" => DISPATCHER_FUNCTIONS
       },
       "summary" => {
         "bucket_count" => features.size,
