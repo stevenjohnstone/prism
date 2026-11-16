@@ -370,6 +370,27 @@ module FuzzClustering
     [0, Float::INFINITY, iso_str]
   end
 
+  # Returns non-negative elapsed milliseconds between two ISO-8601 timestamps,
+  # or nil when either timestamp is missing or unparseable.
+  def elapsed_ms_between(first_seen, baseline_seen)
+    return nil if first_seen.to_s.empty? || baseline_seen.to_s.empty?
+
+    [((Time.iso8601(first_seen) - Time.iso8601(baseline_seen)) * 1000.0).round, 0].max
+  rescue ArgumentError
+    nil
+  end
+
+  # Populates first_elapsed_ms from first_seen - baseline_seen when ,time:<ms>
+  # is absent (e.g. crashes imported via AFL++ sync:main).
+  def with_fallback_elapsed_ms(entry, baseline_seen)
+    return entry unless entry["first_elapsed_ms"].nil?
+
+    fallback_ms = elapsed_ms_between(entry["first_seen"], baseline_seen)
+    return entry if fallback_ms.nil?
+
+    entry.merge("first_elapsed_ms" => fallback_ms)
+  end
+
   def extract_bucket_timestamps(bucket)
     occ = bucket["occurrences"].is_a?(Hash) ? bucket["occurrences"] : {}
     first_seen_str = occ["first_seen"].to_s.strip
@@ -777,23 +798,34 @@ module FuzzClustering
       [-entry[:occurrences], -entry[:bucket_count], entry[:representative][:id]]
     end
 
+    campaign_first_seen = features
+      .filter_map { |f| f[:first_seen] }
+      .min_by { |ts| timestamp_sort_key(ts) }
+    campaign_last_seen = features
+      .filter_map { |f| f[:last_seen] }
+      .max_by { |ts| timestamp_sort_key(ts) }
+
     id_width = [2, built_clusters.size.to_s.length].max
     clusters_json = built_clusters.each_with_index.map do |entry, idx|
       cid = format("cluster-%0*d", id_width, idx + 1)
       entry[:cluster_id] = cid
+      buckets_out = entry[:buckets].map { |b| with_fallback_elapsed_ms(b, campaign_first_seen) }
+      rep_out = with_fallback_elapsed_ms(format_bucket_entry(entry[:representative]), campaign_first_seen)
+      cluster_elapsed_ms = entry[:first_elapsed_ms] || elapsed_ms_between(entry[:first_seen], campaign_first_seen)
+
       {
         "cluster_id" => cid,
         "bucket_count" => entry[:bucket_count],
         "occurrences" => entry[:occurrences],
         "first_seen" => entry[:first_seen],
-        "first_elapsed_ms" => entry[:first_elapsed_ms],
+        "first_elapsed_ms" => cluster_elapsed_ms,
         "first_seen_bucket" => entry[:first_seen_bucket],
         "last_seen" => entry[:last_seen],
         "reasons" => entry[:reasons],
-        "representative" => format_bucket_entry(entry[:representative]),
+        "representative" => rep_out,
         "min_merge_similarity" => entry[:min_merge_similarity].round(6),
         "mean_pairwise_similarity" => entry[:mean_pairwise_similarity].round(6),
-        "buckets" => entry[:buckets]
+        "buckets" => buckets_out
       }
     end
 
@@ -817,12 +849,6 @@ module FuzzClustering
     max_inter = inter_pairs.empty? ? nil : inter_pairs.first["similarity"]
     min_intra = merge_similarities.empty? ? nil : merge_similarities.min.round(6)
     total_occurrences = features.sum { |f| f[:occurrences] }
-    campaign_first_seen = features
-      .filter_map { |f| f[:first_seen] }
-      .min_by { |ts| timestamp_sort_key(ts) }
-    campaign_last_seen = features
-      .filter_map { |f| f[:last_seen] }
-      .max_by { |ts| timestamp_sort_key(ts) }
 
     {
       "schema_version" => SCHEMA_VERSION,
@@ -870,14 +896,7 @@ module FuzzClustering
   end
 
   def format_first_seen_cell(cluster, campaign_first_seen = nil)
-    ms = cluster["first_elapsed_ms"]
-    if ms.nil? && !cluster["first_seen"].to_s.empty? && !campaign_first_seen.to_s.empty?
-      begin
-        ms = ((Time.iso8601(cluster["first_seen"]) - Time.iso8601(campaign_first_seen)) * 1000.0).round
-      rescue ArgumentError
-        ms = nil
-      end
-    end
+    ms = cluster["first_elapsed_ms"] || elapsed_ms_between(cluster["first_seen"], campaign_first_seen)
 
     unless ms.nil?
       sec = [(ms.to_f / 1000.0).round, 0].max

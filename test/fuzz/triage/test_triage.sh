@@ -1666,14 +1666,22 @@ ts_sync_b = make_bucket.call(id: "ABRT/ts_sync", reason: "ABRT", occ: 1, edges: 
     ]
   }
 )
-ts_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [ts_rep_b, ts_early_b, ts_sync_b] })
+ts_notime_b = make_bucket.call(id: "ABRT/ts_notime", reason: "ABRT", occ: 1, edges: { "41" => 1 }).merge(
+  "occurrences" => { "count" => 1, "sample_crashes" => [] }
+)
+ts_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "buckets" => [ts_rep_b, ts_early_b, ts_sync_b, ts_notime_b] })
 ts_c1 = ts_rep["clusters"].find { |c| c.dig("representative", "bucket_id") == "ABRT/ts_rep" }
 ts_c2 = ts_rep["clusters"].find { |c| c.dig("representative", "bucket_id") == "ABRT/ts_sync" }
+ts_c3 = ts_rep["clusters"].find { |c| c.dig("representative", "bucket_id") == "ABRT/ts_notime" }
 unless ts_c1 && ts_c1["first_seen"] == "2026-11-15T13:45:00Z" &&
        ts_c1["first_elapsed_ms"] == 300_000 &&
        ts_c1["first_seen_bucket"] == "ABRT/ts_early" &&
        ts_c1["last_seen"] == "2026-11-15T17:00:00Z" &&
-       ts_c2 && ts_c2["first_seen"] == "2026-11-15T13:48:10Z" && ts_c2["first_elapsed_ms"].nil? &&
+       ts_c2 && ts_c2["first_seen"] == "2026-11-15T13:48:10Z" &&
+       ts_c2["first_elapsed_ms"] == 190_000 &&
+       ts_c2.dig("representative", "first_elapsed_ms") == 190_000 &&
+       ts_c2["buckets"].first["first_elapsed_ms"] == 190_000 &&
+       ts_c3 && ts_c3["first_seen"].nil? && ts_c3["first_elapsed_ms"].nil? &&
        ts_rep.dig("summary", "first_seen") == "2026-11-15T13:45:00Z" &&
        ts_rep.dig("summary", "last_seen") == "2026-11-15T17:00:00Z"
   raise "cluster timestamp aggregation failed: #{ts_rep.inspect}"
