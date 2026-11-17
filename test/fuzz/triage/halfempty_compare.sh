@@ -1,5 +1,7 @@
 #!/bin/sh
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 # FUZZ_SIG, FUZZ_EXE, FUZZ_HEADER_FILE, and FUZZ_WORKDIR are passed via environment variables.
 tmpfile="${FUZZ_WORKDIR:-${TMPDIR:-/tmp}}/he_cand.$$"
 cleanup() {
@@ -17,5 +19,5 @@ if [ "$rc" -eq 0 ]; then
   exit 1
 fi
 
-sig=$(printf '%s\n' "$out" | ./test/fuzz/triage/signature.sh)
+sig=$(printf '%s\n' "$out" | "$SCRIPT_DIR/signature.sh")
 [ "$sig" = "$FUZZ_SIG" ]

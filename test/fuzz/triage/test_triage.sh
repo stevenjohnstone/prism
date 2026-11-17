@@ -2955,11 +2955,11 @@ if printf '%s\n' "$triage_plan" | grep -q 'fuzz-build'; then
   fail "fuzz-triage must not rebuild fuzz binaries (found fuzz-build in plan: $triage_plan)"
 fi
 
-mkdir -p "$WORKDIR/clean_test/afl/w" "$WORKDIR/clean_test/afl-ijon/ijon" "$WORKDIR/clean_test/bin" "$WORKDIR/clean_test/corpus" "$WORKDIR/clean_test/triage/ABRT/sig1"
-touch "$WORKDIR/clean_test/.dotfile" "$WORKDIR/clean_test/bin/fuzz" "$WORKDIR/clean_test/triage/ABRT/sig1/meta.json"
+mkdir -p "$WORKDIR/clean_test/afl/w" "$WORKDIR/clean_test/afl-ijon/ijon" "$WORKDIR/clean_test/bin" "$WORKDIR/clean_test/snapshot/test/fuzz" "$WORKDIR/clean_test/corpus" "$WORKDIR/clean_test/triage/ABRT/sig1"
+touch "$WORKDIR/clean_test/.dotfile" "$WORKDIR/clean_test/bin/fuzz" "$WORKDIR/clean_test/snapshot/test/fuzz/dict" "$WORKDIR/clean_test/triage/ABRT/sig1/meta.json"
 make fuzz-clean FUZZ_DIR="$WORKDIR/clean_test" < /dev/null | cat >/dev/null
 [ -f "$WORKDIR/clean_test/triage/ABRT/sig1/meta.json" ] || fail "fuzz-clean must preserve tmp/fuzz/triage"
-for deleted in "$WORKDIR/clean_test/afl" "$WORKDIR/clean_test/afl-ijon" "$WORKDIR/clean_test/bin" "$WORKDIR/clean_test/corpus" "$WORKDIR/clean_test/.dotfile"; do
+for deleted in "$WORKDIR/clean_test/afl" "$WORKDIR/clean_test/afl-ijon" "$WORKDIR/clean_test/bin" "$WORKDIR/clean_test/snapshot" "$WORKDIR/clean_test/corpus" "$WORKDIR/clean_test/.dotfile"; do
   [ ! -e "$deleted" ] || fail "fuzz-clean failed to remove $deleted"
 done
 
@@ -3087,5 +3087,76 @@ if cc
 end
 EOF
 echo "  snapshot isolation, embedded provenance, container metadata, and fuzz/triage split verified"
+
+# Script/harness/lib snapshot isolation verification
+triage_snap_plan=$(make -n -o ./build/.fuzz.docker.stamp -o ./build/.fuzz.gen_templates.stamp fuzz-triage)
+printf '%s\n' "$triage_snap_plan" | grep -q './tmp/fuzz/snapshot/test/fuzz/triage/triage.rb' || fail "expected fuzz-triage plan to check ./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb: $triage_snap_plan"
+printf '%s\n' "$triage_snap_plan" | grep -q 'TRIAGE_LIVE_SCRIPTS' || fail "expected fuzz-triage plan to support TRIAGE_LIVE_SCRIPTS: $triage_snap_plan"
+
+ruby - "$WORKDIR" << 'EOF'
+require "fileutils"
+require "json"
+require "open3"
+
+workdir = ARGV.fetch(0)
+load "./test/fuzz/runtime/provenance.rb"
+
+snap_src = File.join(workdir, "script_snap_src")
+snap_bin = File.join(workdir, "script_snap_camp", "bin")
+snap_dir = File.join(workdir, "script_snap_camp", "snapshot")
+FileUtils.mkdir_p(snap_src)
+dummy_fuzz = File.join(snap_src, "fuzz")
+File.write(dummy_fuzz, "#!/bin/sh\necho 'Assertion `boom'\'' failed.' >&2\nexit 134\n")
+File.chmod(0o755, dummy_fuzz)
+
+ver_path = FuzzProvenance.snapshot_build_to_bin(snap_src, snap_bin, dst_snapshot_dir: snap_dir, repo_root: Dir.pwd)
+manifest = JSON.parse(File.read(ver_path))
+unless manifest["snapshot_paths"] == FuzzProvenance::SNAPSHOT_PATHS
+  raise "expected snapshot_paths #{FuzzProvenance::SNAPSHOT_PATHS.inspect}, got: #{manifest.inspect}"
+end
+
+%w[
+  lib/prism.rb
+  test/fuzz/dict
+  test/fuzz/harness/parse.c
+  test/fuzz/harness/diff.c
+  test/fuzz/runtime/grammar.rb
+  test/fuzz/runtime/kill.sh
+  test/fuzz/triage/triage.rb
+  test/fuzz/triage/signature.sh
+  test/fuzz/triage/halfempty.sh
+  test/fuzz/triage/halfempty_compare.sh
+].each do |rel|
+  p = File.join(snap_dir, rel)
+  raise "expected #{p} in snapshot" unless File.file?(p)
+  raise "expected #{p} to remain executable" if rel.end_with?(".sh") && !File.executable?(p)
+end
+
+marker_file = File.join(workdir, "snap_signature_marker")
+snap_sig_sh = File.join(snap_dir, "test/fuzz/triage/signature.sh")
+orig_sig_src = File.read(snap_sig_sh)
+File.write(snap_sig_sh, orig_sig_src.sub("set -euo pipefail\n", "set -euo pipefail\n: > #{marker_file.dump}\n"))
+File.chmod(0o755, snap_sig_sh)
+
+snap_triage_rb = File.join(snap_dir, "test/fuzz/triage/triage.rb")
+snap_crash = File.join(workdir, "snap_crash.bin")
+File.binwrite(snap_crash, "\x00\x00\x03\x011 + 2")
+snap_min = File.join(workdir, "snap_min.bin")
+
+child_script = <<~RUBY
+  ENV["TRIAGE_LIB_ONLY"] = "1"
+  load #{snap_triage_rb.dump}
+  raise "expected TRIAGE_FILE_DIR to resolve to snapshot triage dir" unless TRIAGE_FILE_DIR == #{File.dirname(snap_triage_rb).dump}
+  harness_p = find_fuzz_harness_file("parse.c")
+  raise "expected snapshotted parse.c, got \#{harness_p}" unless harness_p == #{File.join(snap_dir, "test/fuzz/harness/parse.c").dump}
+  sig = testcase_output_signature("Assertion `boom' failed.\\n", 10)
+  raise "expected non-empty signature" if sig.empty?
+  minimize(#{snap_crash.dump}, "ABRT", #{snap_min.dump}, #{File.join(snap_bin, "fuzz").dump}, 10)
+RUBY
+out, st = Open3.capture2e(RbConfig.ruby, "-e", child_script)
+raise "snapshotted triage.rb child check failed:\n#{out}" unless st.success?
+raise "expected snapshotted signature.sh to execute via snapshot triage.rb/halfempty.sh" unless File.file?(marker_file)
+EOF
+echo "  snapshot script/harness/lib isolation verified"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."

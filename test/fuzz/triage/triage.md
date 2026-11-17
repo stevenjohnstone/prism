@@ -45,7 +45,7 @@ tmp/fuzz/triage/
 
 ## Triage Pipeline (`triage.rb`)
 
-`make fuzz-triage` executes `test/fuzz/triage/triage.rb` inside the `prism/fuzz` Docker container.
+`make fuzz-triage` executes `./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb` inside the `prism/fuzz` Docker container when a campaign snapshot exists (so mid-campaign or post-campaign edits to `test/fuzz/` do not affect a running fuzz campaign or its initial triage; set `TRIAGE_LIVE_SCRIPTS=1` to force running `./test/fuzz/triage/triage.rb` instead), and does not rebuild `./build/`.
 
 ### 1. Discovery and Worker Thread Pool
 

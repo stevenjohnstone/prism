@@ -72,7 +72,7 @@ Everything needed to build the fuzzers, run a campaign, and triage crashes is se
    ```bash
    make fuzz-triage
    ```
-   When a fuzzing run starts, `test/fuzz/runtime/run.sh` snapshots the compiled `./build/fuzz*` binaries, `fuzz.ids`, `fuzz-ruby-ext`, and a `versions.json` provenance manifest (Prism git commit/dirty state, embedded CRuby `parse.y` version for `fuzz.diff`, and container/toolchain versions) into `tmp/fuzz/bin/`. `make fuzz-triage` does not rebuild `./build/`; instead, it runs every crash and hang from `tmp/fuzz/afl/` and `tmp/fuzz/afl-ijon/` against those frozen `tmp/fuzz/bin/` binaries, deduplicates them by backtrace/invariant signature, minimizes a representative triggering input, archives **all** unique raw crash inputs for each bucket, and writes standalone C reproducers and verification scripts into `tmp/fuzz/triage/`.
+   When a fuzzing run starts, `test/fuzz/runtime/run.sh` snapshots the compiled `./build/fuzz*` binaries, `fuzz.ids`, `fuzz-ruby-ext`, and a `versions.json` provenance manifest (Prism git commit/dirty state, embedded CRuby `parse.y` version for `fuzz.diff`, and container/toolchain versions) into `tmp/fuzz/bin/`, and snapshots `lib/`, `test/fuzz/dict`, `test/fuzz/harness/`, `test/fuzz/runtime/`, and `test/fuzz/triage/` into `tmp/fuzz/snapshot/`. Because running workers, `grammar.rb`, shutdown scripts, and default `make fuzz-triage` use those frozen copies, **subsequent edits to `test/fuzz/` (or `src/` / `lib/`) will not affect a currently running fuzz campaign or its initial triage** (set `TRIAGE_LIVE_SCRIPTS=1` to run the live workspace triage scripts instead). `make fuzz-triage` does not rebuild `./build/`; it runs every crash and hang from `tmp/fuzz/afl/` and `tmp/fuzz/afl-ijon/` against `tmp/fuzz/bin/` and `tmp/fuzz/snapshot/`, deduplicates them by backtrace/invariant signature, minimizes a representative triggering input, archives **all** unique raw crash inputs for each bucket, and writes standalone C reproducers and verification scripts into `tmp/fuzz/triage/`.
 
 ### Where to Find Crashes and How to Reproduce
 
@@ -339,7 +339,7 @@ Inside the `tmux` session:
 
 ### Cleaning Up
 
-To delete everything under `tmp/fuzz/` (including `tmp/fuzz/afl`, `tmp/fuzz/afl-ijon`, `tmp/fuzz/bin`, `tmp/fuzz/corpus`, `tmp/fuzz/seeds`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs and their `inputs.tar.gz` archives in `tmp/fuzz/triage`:
+To delete everything under `tmp/fuzz/` (including `tmp/fuzz/afl`, `tmp/fuzz/afl-ijon`, `tmp/fuzz/bin`, `tmp/fuzz/snapshot`, `tmp/fuzz/corpus`, `tmp/fuzz/seeds`, `tmp/fuzz/coverage`, and `tmp/fuzz/plots`) while keeping already-triaged bugs and their `inputs.tar.gz` archives in `tmp/fuzz/triage`:
 
 ```bash
 make fuzz-clean

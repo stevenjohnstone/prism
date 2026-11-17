@@ -1314,8 +1314,13 @@ def build_script(input_file, crash_output: "", reason: "unknown", executable: ""
   SH
 end
 
+def triage_script_path(filename)
+  dir = (TRIAGE_FILE_DIR && File.directory?(TRIAGE_FILE_DIR)) ? TRIAGE_FILE_DIR : File.expand_path("test/fuzz/triage")
+  File.join(dir, filename)
+end
+
 def testcase_output_signature(testcase_output, siglines = 10)
-  o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, "./test/fuzz/triage/signature.sh", stdin_data: testcase_output.to_s.b)
+  o, = Open3.capture2({ "SIGLINES" => siglines.to_s }, triage_script_path("signature.sh"), stdin_data: testcase_output.to_s.b)
   o.strip
 end
 
@@ -1461,7 +1466,7 @@ def minimize(crash, reason, minimized_input, executable, sig_lines)
         "SIGLINES" => sig_lines.to_s,
         "HALFEMPTY_THREADS" => HALFEMPTY_THREADS.to_s
       }),
-      "./test/fuzz/triage/halfempty.sh", executable, crash, minimized_input
+      triage_script_path("halfempty.sh"), executable, crash, minimized_input
     )
   end
   FileUtils.cp(crash, minimized_input) unless File.exist?(minimized_input) && File.size(minimized_input) >= 4

@@ -139,7 +139,7 @@ fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e TRIAGE_LIVE_SCRIPTS -e FUZZ_HARNESS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz /bin/bash -c 'if [ "$${TRIAGE_LIVE_SCRIPTS:-0}" != "1" ] && [ -f "./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb" ]; then exec ruby ./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb; else exec ruby ./test/fuzz/triage/triage.rb; fi'
 
 FUZZ_VERIFY_ENV_FLAGS := -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BY_CLUSTER -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_MAX_FAILURES -e VERIFY_EXTRACT_SURVIVORS -e VERIFY_INPUT_MIN_ONLY -e VERIFY_SKIP_MIN -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_SYMBOLIZE -e VERIFY_FAIL_FAST -e VERIFY_INVERT -e VERIFY_BISECT -e VERIFY_VERBOSE -e VERIFY_QUIET -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED)
 
@@ -257,6 +257,7 @@ define FUZZ_CLEAN_CONFIRM
 	echo "  - tmp/fuzz/afl      ($(FUZZ_FINDINGS) crash/hang findings)"; \
 	echo "  - tmp/fuzz/afl-ijon"; \
 	echo "  - tmp/fuzz/bin"; \
+	echo "  - tmp/fuzz/snapshot"; \
 	echo "  - tmp/fuzz/corpus"; \
 	echo "  - tmp/fuzz/seeds"; \
 	echo "  - tmp/fuzz/coverage"; \

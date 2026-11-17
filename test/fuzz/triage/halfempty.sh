@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:-abort_on_error=1:print_stacktrace=1}"
 : "${SIGLINES:=10}"
 : "${HALFEMPTY_THREADS:=2}"
@@ -23,7 +25,7 @@ if [ "$initial_rc" -eq 0 ] || [ "$initial_rc" -eq 124 ] || [ "$initial_rc" -eq 1
   exit 1
 fi
 
-FUZZ_SIG=$(printf '%s\n' "$initial_out" | ./test/fuzz/triage/signature.sh)
+FUZZ_SIG=$(printf '%s\n' "$initial_out" | "$SCRIPT_DIR/signature.sh")
 if [ -z "$FUZZ_SIG" ]; then
   exit 1
 fi
@@ -46,7 +48,7 @@ if [ -s "$workdir/body.bin" ]; then
         --zero-skip-multiplier=0.0005 \
         --bisect-skip-multiplier=0.0005 \
         --zero-char=32 \
-        ./test/fuzz/triage/halfempty_compare.sh "$workdir/body.bin" \
+        "$SCRIPT_DIR/halfempty_compare.sh" "$workdir/body.bin" \
         -o "$workdir/body.min"; then
     :
   else

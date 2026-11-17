@@ -5,8 +5,13 @@ AFL_IJON_DIR="${AFL_DIR}-ijon"
 CORPUS_DIR=${2:-./tmp/fuzz/corpus}
 SEEDS_BACKUP_DIR="$(dirname "$AFL_DIR")/seeds"
 BIN_DIR="$(dirname "$AFL_DIR")/bin"
+SNAPSHOT_DIR="$(dirname "$AFL_DIR")/snapshot"
 MAX_INPUT_SIZE=${FUZZ_MAX_INPUT_SIZE:-1024}
 SESSION="fuzzer"
+KILL_SH="./test/fuzz/runtime/kill.sh"
+STATUS_RB="./test/fuzz/runtime/status.rb"
+GRAMMAR_RB="./test/fuzz/runtime/grammar.rb"
+DICT_FILE="./test/fuzz/dict"
 
 DEFAULT_WORKERS=$(( $(nproc) / 2 ))
 if [ "$DEFAULT_WORKERS" -lt 6 ]; then
@@ -32,7 +37,7 @@ cleanup() {
     trap '' TERM INT
     trap - EXIT
     if tmux has-session -t "$SESSION" 2>/dev/null; then
-        bash ./test/fuzz/runtime/kill.sh "$SESSION"
+        bash "$KILL_SH" "$SESSION"
     fi
     rm -rf "$SEEDS_BACKUP_DIR"
     if [ -d "/tmp/afl-tmpdir/grammar/seeds" ]; then
@@ -61,9 +66,14 @@ fi
 
 mkdir -p "$AFL_DIR"
 
-# Snapshot compiled fuzzer binaries and provenance into $BIN_DIR so later edits
-# or rebuilds in ./build do not mutate the campaign binaries used by triage.
-ruby ./test/fuzz/runtime/provenance.rb snapshot "./build" "$BIN_DIR" || exit 1
+# Snapshot compiled fuzzer binaries and script/lib/harness dependencies into
+# $BIN_DIR and $SNAPSHOT_DIR so later edits to test/fuzz/, lib/, or ./build
+# do not impact a currently running fuzz campaign or its initial triage.
+ruby ./test/fuzz/runtime/provenance.rb snapshot "./build" "$BIN_DIR" "$SNAPSHOT_DIR" || exit 1
+[ -e "$SNAPSHOT_DIR/test/fuzz/runtime/kill.sh" ] && KILL_SH="$SNAPSHOT_DIR/test/fuzz/runtime/kill.sh"
+[ -f "$SNAPSHOT_DIR/test/fuzz/runtime/status.rb" ] && STATUS_RB="$SNAPSHOT_DIR/test/fuzz/runtime/status.rb"
+[ -f "$SNAPSHOT_DIR/test/fuzz/runtime/grammar.rb" ] && GRAMMAR_RB="$SNAPSHOT_DIR/test/fuzz/runtime/grammar.rb"
+[ -f "$SNAPSHOT_DIR/test/fuzz/dict" ] && DICT_FILE="$SNAPSHOT_DIR/test/fuzz/dict"
 
 # --- Trap Signals ---
 # Trap SIGINT (Ctrl+C) and SIGTERM (docker stop)
@@ -123,7 +133,7 @@ add_diff_worker() {
     local extra_env=$2
     local afl_opts=$3
     prepare_diff_seeds "$name"
-    add_worker "$name" "${extra_env}afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- $BIN_DIR/fuzz.diff"
+    add_worker "$name" "${extra_env}afl-fuzz -t 250+ -m none -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- $BIN_DIR/fuzz.diff"
 }
 
 prepare_seed_shard() {
@@ -206,29 +216,29 @@ diff_extra_idx=0
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
-            add_worker "main" "AFL_FUZZER_LOOPCOUNT=2000 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c $BIN_DIR/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR $BIN_DIR/fuzz || read -r -n 1"
+            add_worker "main" "AFL_FUZZER_LOOPCOUNT=2000 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x $DICT_FILE -G $MAX_INPUT_SIZE -c $BIN_DIR/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR $BIN_DIR/fuzz || read -r -n 1"
             ;;
         1)
-            add_worker "grammar" "ulimit -v 4194304 && FUZZ_BIN_DIR=$BIN_DIR FUZZ_RUBY_EXT_DIR=$BIN_DIR/fuzz-ruby-ext ruby ./test/fuzz/runtime/grammar.rb '$AFL_DIR' '/tmp/afl-tmpdir/grammar/seeds'"
+            add_worker "grammar" "ulimit -v 4194304 && FUZZ_BIN_DIR=$BIN_DIR FUZZ_RUBY_EXT_DIR=$BIN_DIR/fuzz-ruby-ext FUZZ_RUBY_LIB_DIR=$SNAPSHOT_DIR/lib ruby $GRAMMAR_RB '$AFL_DIR' '/tmp/afl-tmpdir/grammar/seeds'"
             ;;
         2)
             prepare_seed_shard "msan" 0
-            add_worker "msan" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- $BIN_DIR/fuzz.msan"
+            add_worker "msan" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- $BIN_DIR/fuzz.msan"
             ;;
         3)
             prepare_seed_shard "ijon" 1
-            add_worker "ijon" "ulimit -v 4194304 && AFL_SYNC_TIME=1 AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ijon/seeds -o $IJON_OUT_DIR $IJON_SYNC_FLAGS -p explore -- $BIN_DIR/fuzz.ijon"
+            add_worker "ijon" "ulimit -v 4194304 && AFL_SYNC_TIME=1 AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ijon/seeds -o $IJON_OUT_DIR $IJON_SYNC_FLAGS -p explore -- $BIN_DIR/fuzz.ijon"
             ;;
         4)
             prepare_seed_shard "slow" 2
-            add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- $BIN_DIR/fuzz.slow"
+            add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- $BIN_DIR/fuzz.slow"
             ;;
         5)
             add_diff_worker "diff" "" "-p explore"
             ;;
         6)
             prepare_seed_shard "main-2" 3
-            add_worker "main-2" "AFL_DISABLE_TRIM=1 AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/main-2/seeds -o $AFL_DIR -S main-2 -p explore -P explore -L 0 -w $BIN_DIR/fuzz.sand -- $BIN_DIR/fuzz.native"
+            add_worker "main-2" "AFL_DISABLE_TRIM=1 AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/main-2/seeds -o $AFL_DIR -S main-2 -p explore -P explore -L 0 -w $BIN_DIR/fuzz.sand -- $BIN_DIR/fuzz.native"
             ;;
         *)
             idx=$diff_extra_idx
@@ -266,7 +276,7 @@ if [[ -n $TERM ]]; then
 fi
 
 # Window 0: Fleet status dashboard
-tmux -2 new-session -d -s "$SESSION" -n "dashboard" "ruby ./test/fuzz/runtime/status.rb '$AFL_DIR' ${WORKER_NAMES[*]}"
+tmux -2 new-session -d -s "$SESSION" -n "dashboard" "ruby $STATUS_RB '$AFL_DIR' ${WORKER_NAMES[*]}"
 tmux set-option -g default-terminal "tmux-256color"
 tmux set-option -g remain-on-exit on
 
@@ -276,7 +286,7 @@ for (( i = 0; i < ${#WORKER_NAMES[@]}; i++ )); do
 done
 
 tmux select-window -t "$SESSION:0"
-tmux bind-key -n C-c confirm-before -p "Stop all fuzzers and exit? (y/n) [Tip: press Ctrl+B then d to detach]" "run-shell 'bash ./test/fuzz/runtime/kill.sh'"
+tmux bind-key -n C-c confirm-before -p "Stop all fuzzers and exit? (y/n) [Tip: press Ctrl+B then d to detach]" "run-shell 'bash $KILL_SH'"
 
 echo "Fuzzers started."
 

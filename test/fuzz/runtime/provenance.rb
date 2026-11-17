@@ -23,6 +23,13 @@ module FuzzProvenance
 
   AUX_FILES = %w[fuzz.ids].freeze
   REPRO_DIR_ENTRIES = %w[fuzz-ruby-ext].freeze
+  SNAPSHOT_PATHS = %w[
+    lib
+    test/fuzz/dict
+    test/fuzz/harness
+    test/fuzz/runtime
+    test/fuzz/triage
+  ].freeze
   GIT_DIRTY_PATHS = %w[src include templates test/fuzz/harness].freeze
   MARKER_REGEX = /@\(#\)PRISM_FUZZ_PROVENANCE\t([^\n\0]+)/
 
@@ -484,7 +491,37 @@ module FuzzProvenance
     out_path
   end
 
-  def snapshot_build_to_bin(src_build_dir, dst_bin_dir, repo_root: locate_repo_root)
+  def snapshot_scripts_to_dir(repo_root, dst_snapshot_dir)
+    return nil unless repo_root && dst_snapshot_dir && !dst_snapshot_dir.empty?
+
+    FileUtils.mkdir_p(File.dirname(dst_snapshot_dir))
+    staging_dir = File.join(File.dirname(dst_snapshot_dir), ".snapshot.staging.#{Process.pid}")
+    old_dir = File.join(File.dirname(dst_snapshot_dir), ".snapshot.old.#{Process.pid}")
+    FileUtils.rm_rf(staging_dir)
+    FileUtils.rm_rf(old_dir)
+    FileUtils.mkdir_p(staging_dir)
+
+    copied = []
+    SNAPSHOT_PATHS.each do |rel|
+      src = File.join(repo_root, rel)
+      next unless File.exist?(src)
+
+      dst = File.join(staging_dir, rel)
+      FileUtils.mkdir_p(File.dirname(dst))
+      FileUtils.cp_r(src, dst)
+      copied << rel
+    end
+
+    File.rename(dst_snapshot_dir, old_dir) if File.exist?(dst_snapshot_dir)
+    File.rename(staging_dir, dst_snapshot_dir)
+    FileUtils.rm_rf(old_dir) if File.exist?(old_dir)
+    copied
+  ensure
+    FileUtils.rm_rf(staging_dir) if staging_dir && File.exist?(staging_dir)
+    FileUtils.rm_rf(old_dir) if old_dir && File.exist?(old_dir) && !File.exist?(dst_snapshot_dir)
+  end
+
+  def snapshot_build_to_bin(src_build_dir, dst_bin_dir, dst_snapshot_dir: nil, repo_root: locate_repo_root)
     FileUtils.mkdir_p(File.dirname(dst_bin_dir))
     staging_dir = File.join(File.dirname(dst_bin_dir), ".bin.staging.#{Process.pid}")
     old_dir = File.join(File.dirname(dst_bin_dir), ".bin.old.#{Process.pid}")
@@ -520,12 +557,18 @@ module FuzzProvenance
     provenance = if manifest_matches
                    src_m_data.dup
                  else
-                   resolve_dir_provenance(staging_dir, repo_root: repo_root)
+                   resolve_dir_provenance(staging_dir, repo_root: repo_root, use_manifest: false)
                  end
+
+    copied_scripts = snapshot_scripts_to_dir(repo_root, dst_snapshot_dir) if dst_snapshot_dir
 
     provenance["started_at"] = Time.now.utc.iso8601
     provenance["source_build_dir"] = normalize_path(src_build_dir, repo_root)
     provenance["snapshot_bin_dir"] = normalize_path(dst_bin_dir, repo_root)
+    if copied_scripts && !copied_scripts.empty?
+      provenance["snapshot_dir"] = normalize_path(dst_snapshot_dir, repo_root)
+      provenance["snapshot_paths"] = copied_scripts
+    end
     provenance["fuzz_workers"] = ENV["FUZZ_WORKERS"] if ENV["FUZZ_WORKERS"] && !ENV["FUZZ_WORKERS"].empty?
     provenance["max_input_size"] = ENV["FUZZ_MAX_INPUT_SIZE"] if ENV["FUZZ_MAX_INPUT_SIZE"] && !ENV["FUZZ_MAX_INPUT_SIZE"].empty?
 
@@ -643,11 +686,12 @@ if __FILE__ == $PROGRAM_NAME
   when "snapshot"
     src_dir = ARGV[0] || "./build"
     dst_dir = ARGV[1] || "./tmp/fuzz/bin"
-    puts FuzzProvenance.snapshot_build_to_bin(src_dir, dst_dir)
+    snap_dir = ARGV[2]
+    puts FuzzProvenance.snapshot_build_to_bin(src_dir, dst_dir, dst_snapshot_dir: snap_dir)
   when "show-container"
     puts JSON.pretty_generate(FuzzProvenance.collect_container_provenance || {})
   else
-    warn "Usage: #{$PROGRAM_NAME} {write-build [DIR]|snapshot [SRC DST]|show-container}"
+    warn "Usage: #{$PROGRAM_NAME} {write-build [DIR]|snapshot [SRC DST [SNAPSHOT_DIR]]|show-container}"
     exit 2
   end
 end

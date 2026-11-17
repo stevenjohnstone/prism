@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 
-WORKSPACE_LIB = File.expand_path("../../../lib", __dir__)
+WORKSPACE_LIB = if ENV["FUZZ_RUBY_LIB_DIR"] && !ENV["FUZZ_RUBY_LIB_DIR"].empty?
+                  File.expand_path(ENV["FUZZ_RUBY_LIB_DIR"])
+                else
+                  File.expand_path("../../../lib", __dir__)
+                end
 WORKSPACE_EXT = if ENV["FUZZ_RUBY_EXT_DIR"] && !ENV["FUZZ_RUBY_EXT_DIR"].empty?
                   File.expand_path(ENV["FUZZ_RUBY_EXT_DIR"])
                 else
