@@ -376,12 +376,27 @@ if [ "$MODE" = "fuzz" ]; then
     -c "$FUZZ_ROOT/test/fuzz/harness/diff.c" -o "$DIFF_OBJ"
 
   tmp_out="$OUTPUT.tmp.$$"
-  rm -f "$tmp_out"
+  tmp_map="$OUTPUT.map.$$"
+  tmp_ids="$OUTPUT.ids.tmp.$$"
+  rm -f "$tmp_out" "$tmp_map" "$tmp_ids"
+  MAP_FLAGS=()
+  if [ "$(uname -s)" = "Linux" ]; then
+    MAP_FLAGS=("-Wl,-Map=$tmp_map")
+  fi
   "${PRISM_CC[@]}" \
-    -g -gdwarf-4 -O2 -fPIE "${LINK_EXPORT_FLAGS[@]}" \
+    -g -gdwarf-4 -O2 -fPIE "${LINK_EXPORT_FLAGS[@]}" ${MAP_FLAGS[@]+"${MAP_FLAGS[@]}"} \
     "$DIFF_OBJ" "${PRISM_OBJS[@]}" "$ORACLE_ARCHIVE" \
     "${MAINLIBS_ARR[@]}" \
     -o "$tmp_out"
+  if [ -f "$tmp_map" ]; then
+    ruby "$FUZZ_ROOT/test/fuzz/harness/gen_diff_ids.rb" \
+      --bin "$tmp_out" \
+      --map "$tmp_map" \
+      --archive "$ORACLE_ARCHIVE" \
+      --output "$tmp_ids"
+    rm -f "$tmp_map"
+    mv -f "$tmp_ids" "$OUTPUT.ids"
+  fi
   mv -f "$tmp_out" "$OUTPUT"
 elif [ "$MODE" = "verify" ] || [ "$MODE" = "testcase" ]; then
   OBJ_DIR="$ORACLE_DIR/${MODE}_objs"

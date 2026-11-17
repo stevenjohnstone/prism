@@ -136,19 +136,22 @@ At the end of triage, `finalize_triage_metadata` updates stale `meta.json` files
   - `symptom`: structured parse of `headline`, `summary`, `preamble_lines`, plus `invariant`, `ubsan`, `sanitizer`, or `assertion` sub-objects
   - `frames`: stack frame array annotated with `scope` (`"prism"`, `"harness"`, or `"external"`)
   - `versions`: version provenance hash (`prism`: `version`, `target_ruby_version`, `git_commit`, `git_short`, `git_dirty`, `source`; `ruby_parse_y` on differential `diff_parse_y` buckets; `container`: image ID, OS, arch, clang, LLVM version, AFL++, `aflplusplus.patch` SHA-256, Ruby, `lrama-fuzz`; plus `fuzz` and `triage` objects recording exact binary/build-id/commit provenance for both the fuzzer and triage steps)
-  - `coverage`: `{ "available", "binary", "build_id", "edge_count", "edges": { "<edge_id>": <hit_count>, ... } }`
+  - `coverage`: `{ "available", "binary", "build_id", "edge_count", "edges": { "<edge_id>": <hit_count>, ... } }` (collected via the Prism reference binary)
+  - `diff_coverage`: present on `INVARIANT[diff_parse_y]` buckets when `fuzz.diff` coverage collection is enabled (`{ "available", "binary", "build_id", "edge_count", "edges": { "<edge_id>": <hit_count>, ... } }`)
 
 ### Global Index (`metadata.json` and `.corpus-coverage.json`)
 
 - `reference_binary`: `{ "available", "path", "build_id", "ids_path", "ids_available", "edge_count_total" }` — reads `AFL_LLVM_DOCUMENT_IDS` (`./tmp/fuzz/bin/fuzz.ids` when using snapshot campaign binaries, or `./build/fuzz.ids`) mapping `<edge_id> -> Function`.
+- `diff_reference_binary`: present when differential invariant buckets exist — resolves `./tmp/fuzz/bin/fuzz.diff` (or `./build/fuzz.diff`) and `fuzz.diff.ids` (generated at link time by [`gen_diff_ids.rb`](../harness/gen_diff_ids.rb) mapping every PCGUARD edge ID to `Domain={harness|prism|parse_y}` and `Function`).
 - `versions`: resolved campaign environment versions combining frozen `tmp/fuzz/bin/` snapshot provenance (`fuzz`, `container`, embedded `prism`/`ruby_parse_y`) with active `triage` provenance (`binary`, `build_id`, `coverage_binary`, container, and workspace git state).
 - `corpus`: Cached in `tmp/fuzz/triage/.corpus-coverage.json` keyed by reference binary `build_id`, corpus directory file fingerprint, and `ids_sha256`. Records `corpus_count`, `edge_df` (number of corpus files hitting each edge ID), and `edge_functions`.
+- `diff_corpus`: Cached in `tmp/fuzz/triage/.diff-corpus-coverage.json` when differential invariant buckets exist. Records `corpus_count`, `edge_df`, `edge_functions`, and `edge_domains` (`prism`, `parse_y`, `harness`).
 - `summary`: `{ "bucket_count", "total_occurrences", "by_reason", "by_worker" }`.
 - `buckets`: Full array of bucket `meta.json` objects sorted by descending `occurrences.count`, then `bucket_id`.
 
 ### `afl-showmap` Collection Details
 
-- Executed in forkserver batch mode (`afl-showmap -q -t <SHOWMAP_TIMEOUT_MS>`) against `TRIAGE_COVERAGE_BIN` (defaults to `./tmp/fuzz/bin/fuzz` when triaging a snapshot campaign, or `./build/fuzz` otherwise), keyed by `sha256(bin_path)` (`build_id`) so bucket and corpus maps are only recomputed when the binary changes.
+- Executed in forkserver batch mode (`afl-showmap -q -t <SHOWMAP_TIMEOUT_MS>`) against `TRIAGE_COVERAGE_BIN` (defaults to `./tmp/fuzz/bin/fuzz` when triaging a snapshot campaign, or `./build/fuzz` otherwise) and, when `diff_parse_y` invariant buckets exist, `TRIAGE_DIFF_COVERAGE_BIN` (defaults to `./tmp/fuzz/bin/fuzz.diff` when paired with `fuzz.diff.ids`, or `./build/fuzz.diff`), keyed by `sha256(bin_path)` (`build_id`) so bucket and corpus maps are only recomputed when the binary changes.
 - Uses `AFL_NO_IJON=1`, `AFL_CMIN_ALLOW_ANY=1`, `detect_leaks=0`, and `symbolize=0` so crashing `input.min` inputs still emit edge maps without invoking `llvm-symbolizer`.
 
 ---
@@ -212,6 +215,8 @@ When verifying by cluster (`--cluster` / `CLUSTER`) or in grouped mode (`--by-cl
 | `TRIAGE_RECOUNT` | unset (`"1"` enables) | Backfill missing `occurrences.jsonl` / `inputs.tar.gz` entries using `.processed/<sha256>` without re-running crashes. |
 | `TRIAGE_COVERAGE_BIN` | `./build/fuzz` | Reference instrumented binary for `afl-showmap` edge collection (empty disables coverage). |
 | `TRIAGE_COVERAGE_IDS` | `<TRIAGE_COVERAGE_BIN>.ids` | `AFL_LLVM_DOCUMENT_IDS` map file mapping edge IDs to function names. |
+| `TRIAGE_DIFF_COVERAGE_BIN` | `./build/fuzz.diff` | Differential instrumented binary for `diff_parse_y` dual-parser `afl-showmap` collection. |
+| `TRIAGE_DIFF_COVERAGE_IDS` | `<TRIAGE_DIFF_COVERAGE_BIN>.ids` | `fuzz.diff.ids` map file mapping PCGUARD edge IDs to `Domain` and `Function`. |
 | `TRIAGE_CORPUS_DIR` | `tmp/fuzz/corpus` | Seed corpus directory used to compute corpus edge document frequencies (`edge_df`). |
 | `TRIAGE_SHOWMAP_TIMEOUT_MS` | `1000` | Per-input `afl-showmap` timeout in milliseconds. |
 | `FUZZ_MAX_ALLOCATED` | `128` | Per-input allocation cap in MiB (`FUZZ_MAX_ALLOCATED_BYTES`, RSS limit = `16x`). |

@@ -21,7 +21,7 @@ module FuzzProvenance
     fuzz.diff
   ].freeze
 
-  AUX_FILES = %w[fuzz.ids].freeze
+  AUX_FILES = %w[fuzz.ids fuzz.diff.ids].freeze
   REPRO_DIR_ENTRIES = %w[fuzz-ruby-ext].freeze
   SNAPSHOT_PATHS = %w[
     lib

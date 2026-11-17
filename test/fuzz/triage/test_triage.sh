@@ -1691,14 +1691,104 @@ unless ts_table.include?("First") && ts_table.include?("0h05m00s") && ts_table.i
   raise "cluster summary table missing First column/elapsed formatting:\n#{ts_table}"
 end
 
-# Exercise CLI file and stdout output paths
+# Regression 6: Algorithm 2 (diff_parse_y dual-parser Prism + parse.y edges, boilerplate filtering,
+# two-population separation, and asymmetric Cosine+Jaccard merge)
+diff_dual_ef = {}
+diff_dual_dom = {}
+diff_dual_df = {}
+# Domain=harness (excluded 0.0), plus CRuby error-printer & Prism visitor boilerplate
+(1000..1030).each { |eid| diff_dual_ef[eid.to_s] = "diff_cruby_visit_node_ctx"; diff_dual_dom[eid.to_s] = "harness"; diff_dual_df[eid.to_s] = 0 }
+(1031..1050).each { |eid| diff_dual_ef[eid.to_s] = "ruby_show_error_line"; diff_dual_dom[eid.to_s] = "parse_y"; diff_dual_df[eid.to_s] = 0 }
+(1051..1070).each { |eid| diff_dual_ef[eid.to_s] = "pm_visit_child_nodes"; diff_dual_dom[eid.to_s] = "prism"; diff_dual_df[eid.to_s] = 0 }
+# Domain=prism parser edges (preexe bug + unrelated regex/def edges)
+(1100..1115).each { |eid| diff_dual_ef[eid.to_s] = "parse_preexe"; diff_dual_dom[eid.to_s] = "prism"; diff_dual_df[eid.to_s] = 0 }
+(1116..1135).each { |eid| diff_dual_ef[eid.to_s] = "parse_alias"; diff_dual_dom[eid.to_s] = "prism"; diff_dual_df[eid.to_s] = 0 }
+(1136..1150).each { |eid| diff_dual_ef[eid.to_s] = "parse_regexp"; diff_dual_dom[eid.to_s] = "prism"; diff_dual_df[eid.to_s] = 0 }
+# Domain=parse_y parser edges (kBEGIN rules + unrelated regex edges)
+(1200..1215).each { |eid| diff_dual_ef[eid.to_s] = "ruby_yyparse"; diff_dual_dom[eid.to_s] = "parse_y"; diff_dual_df[eid.to_s] = 0 }
+(1216..1235).each { |eid| diff_dual_ef[eid.to_s] = "rb_node_alias_new"; diff_dual_dom[eid.to_s] = "parse_y"; diff_dual_df[eid.to_s] = 0 }
+(1236..1250).each { |eid| diff_dual_ef[eid.to_s] = "reg_compile"; diff_dual_dom[eid.to_s] = "parse_y"; diff_dual_df[eid.to_s] = 0 }
+
+diff_dual_corpus = {
+  "available" => true,
+  "corpus_count" => 100,
+  "edge_df" => diff_dual_df,
+  "edge_functions" => diff_dual_ef,
+  "edge_domains" => diff_dual_dom
+}
+make_dual_diff_bucket = lambda do |id:, occ:, fields:, edges:, prism_edges: { "10" => 1 }|
+  b = make_inv_bucket.call(id: id, profile: "diff_parse_y", ns: "diff_parse_y", edges: prism_edges, fields: fields)
+  b["occurrences"] = { "count" => occ }
+  b["diff_coverage"] = { "available" => true, "edge_count" => edges.size, "edges" => edges }
+  b
+end
+
+preexe_small = ((1000..1015).to_a + (1051..1060).to_a + (1100..1110).to_a + (1200..1210).to_a).to_h { |e| [e.to_s, 1] }
+preexe_big   = ((1000..1015).to_a + (1051..1060).to_a + (1100..1110).to_a + (1116..1130).to_a + (1200..1210).to_a + (1216..1230).to_a).to_h { |e| [e.to_s, 1] }
+boil_only_a  = ((1000..1030).to_a + (1031..1050).to_a + (1136..1142).to_a + (1236..1240).to_a).to_h { |e| [e.to_s, 1] }
+boil_only_b  = ((1000..1030).to_a + (1031..1050).to_a + (1143..1150).to_a + (1241..1250).to_a).to_h { |e| [e.to_s, 1] }
+
+prism_flaw_b = make_bucket.call(id: "SEGV/prism_segv", reason: "SEGV", occ: 2, edges: { "10" => 1, "11" => 1 }, frames: [{ "scope" => "prism", "func" => "parse_statements", "file" => "src/prism.c", "line" => 100 }])
+# Asymmetric sizes + differing AST tags ("POSTEXE" vs "ALIAS") still merge via Cosine+Jaccard geometric mean,
+# while unrelated syntax errors sharing only harness/ruby_show_error_line boilerplate stay separate, and prism flaws sort first.
+dual_buckets = [
+  prism_flaw_b,
+  make_dual_diff_bucket.call(id: "ABRT/begin_small", occ: 100, edges: preexe_small, fields: { "kind" => "ast_tree_mismatch", "sub" => "tag", "prism" => "POSTEXE", "cruby" => "INT" }),
+  make_dual_diff_bucket.call(id: "ABRT/begin_big", occ: 20, edges: preexe_big, fields: { "kind" => "ast_tree_mismatch", "sub" => "tag", "prism" => "ALIAS", "cruby" => "MASGN" }),
+  make_dual_diff_bucket.call(id: "ABRT/syn_ok_a", occ: 5, edges: boil_only_a, fields: { "kind" => "syntax_mismatch", "sub" => "prism_ok_cruby_err", "prism" => "ok", "cruby" => "SyntaxError:foo" }),
+  make_dual_diff_bucket.call(id: "ABRT/syn_ok_b", occ: 4, edges: boil_only_b, fields: { "kind" => "syntax_mismatch", "sub" => "prism_ok_cruby_err", "prism" => "ok", "cruby" => "ArgumentError:unknown_encoding" })
+]
+dual_rep = FuzzClustering.cluster_metadata({
+  "schema_version" => 1,
+  "corpus" => corpus,
+  "diff_corpus" => diff_dual_corpus,
+  "buckets" => dual_buckets
+})
+unless dual_rep.dig("summary", "cluster_count") == 4 &&
+       dual_rep.dig("summary", "by_group", "prism_flaws", "cluster_count") == 1 &&
+       dual_rep.dig("summary", "by_group", "diff_parse_y", "cluster_count") == 3 &&
+       dual_rep.dig("algorithm", "diff_parse_y", "mode") == "dual_edge_prism_and_parse_y"
+  raise "expected dual diff_parse_y summary breakdown to yield 1 prism_flaw + 3 diff_parse_y clusters: #{dual_rep["summary"].inspect}"
+end
+c_flaw = dual_rep["clusters"][0]
+c_begin = dual_rep["clusters"][1]
+unless c_flaw["group"] == "prism_flaw" && c_flaw["algorithm"] == "prism_flaw" &&
+       c_begin["group"] == "diff_parse_y" && c_begin["algorithm"] == "diff_parse_y_dual_edge" &&
+       c_begin["buckets"].map { |b| b["bucket_id"] }.sort == %w[ABRT/begin_big ABRT/begin_small]
+  raise "expected prism_flaw first (cluster-01) and merged BEGIN dual cluster second: #{dual_rep["clusters"].inspect}"
+end
+dual_table = FuzzClustering.format_summary_table(dual_rep)
+unless dual_table.include?("Prism Flaws & Crashes") && dual_table.include?("Differential parse.y Divergences")
+  raise "expected two-section summary table for mixed campaign:\n#{dual_table}"
+end
+# Same-zero-overlap syntax_mismatch errors must NOT merge even when diagnostic codes match
+zero_diag_pair = [
+  make_dual_diff_bucket.call(id: "ABRT/zero_d1", occ: 2, edges: boil_only_a, fields: { "kind" => "syntax_mismatch", "sub" => "prism_ok_cruby_err", "prism" => "ok", "cruby" => "ArgumentError:unknown_encoding" }),
+  make_dual_diff_bucket.call(id: "ABRT/zero_d2", occ: 2, edges: boil_only_b, fields: { "kind" => "syntax_mismatch", "sub" => "prism_ok_cruby_err", "prism" => "ok", "cruby" => "ArgumentError:unknown_encoding" })
+]
+zero_diag_rep = FuzzClustering.cluster_metadata({ "schema_version" => 1, "corpus" => corpus, "diff_corpus" => diff_dual_corpus, "buckets" => zero_diag_pair })
+unless zero_diag_rep.dig("summary", "cluster_count") == 2
+  raise "expected zero edge-overlap diff_parse_y buckets not to merge on diagnostic match alone: #{zero_diag_rep.inspect}"
+end
+# Even at threshold=0.0 & diff_threshold=0.0, Prism flaws never merge with diff_parse_y
+sep_rep = FuzzClustering.cluster_metadata({
+  "schema_version" => 1, "corpus" => corpus, "diff_corpus" => diff_dual_corpus,
+  "buckets" => [prism_flaw_b, dual_buckets[1], dual_buckets[3]]
+}, threshold: 0.0, diff_threshold: 0.0)
+unless sep_rep.dig("summary", "cluster_count") == 2 && sep_rep["clusters"].map { |c| c["group"] } == %w[prism_flaw diff_parse_y]
+  raise "expected strict group separation at threshold 0.0: #{sep_rep.inspect}"
+end
+
+# Exercise CLI file and stdout output paths + --diff-threshold
 meta_path = File.join(workdir, "cluster_meta.json")
 out_path = File.join(workdir, "clusters_out.json")
 File.write(meta_path, JSON.generate(metadata))
-cli_out = `ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output #{out_path}`
+cli_out = `ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output #{out_path} --diff-threshold 0.30`
 raise "cluster.rb CLI failed" unless $?.success? && File.file?(out_path) && cli_out.include?("5 clusters")
+cli_json = JSON.parse(File.read(out_path))
+raise "expected --diff-threshold 0.30 recorded in algorithm JSON" unless (cli_json.dig("algorithm", "diff_threshold") - 0.30).abs < 1e-6
 stdout_json = JSON.parse(`ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output - --quiet`)
-raise "cluster.rb stdout JSON mismatch" unless stdout_json["clusters"] == JSON.parse(File.read(out_path))["clusters"]
+raise "cluster.rb stdout JSON mismatch" unless stdout_json["clusters"] == cli_json["clusters"]
 EOF
 
 # Exercise verify.rb cluster-based verification workflows (--cluster, --by-cluster, --list-clusters, stale auto-refresh)
@@ -3001,6 +3091,7 @@ if cc
   )
   raise "failed to compile test/fuzz/harness/fuzz.c provenance stub" unless ok
   File.write(File.join(src_dir, "fuzz.ids"), "1\tpm_parse\n")
+  File.write(File.join(src_dir, "fuzz.diff.ids"), "Domain=prism Source=prism.c Function=pm_parse edgeID=5\nDomain=parse_y Source=parse.c Function=ruby_yyparse edgeID=6\n")
 
   emb = FuzzProvenance.read_embedded_binary_provenance(snap_fuzz)
   unless emb && emb.dig("prism", "git_commit") == "a" * 40 && emb.dig("prism", "git_dirty") == false && emb.dig("prism", "version") == read_prism_header_version(Dir.pwd)
@@ -3012,7 +3103,7 @@ if cc
 
   snap_manifest = FuzzProvenance.snapshot_build_to_bin(src_dir, bin_dir, repo_root: Dir.pwd)
   raise "expected snapshot versions.json at #{snap_manifest}" unless File.file?(snap_manifest)
-  raise "expected copied fuzz and fuzz.ids in #{bin_dir}" unless File.executable?(File.join(bin_dir, "fuzz")) && File.file?(File.join(bin_dir, "fuzz.ids"))
+  raise "expected copied fuzz, fuzz.ids, and fuzz.diff.ids in #{bin_dir}" unless File.executable?(File.join(bin_dir, "fuzz")) && File.file?(File.join(bin_dir, "fuzz.ids")) && File.file?(File.join(bin_dir, "fuzz.diff.ids"))
 
   # Simulate rebuilding/wiping ./build after campaign started: snapshot remains intact & self-contained
   FileUtils.rm_rf(src_dir)
@@ -3024,6 +3115,14 @@ if cc
   raise "expected companion_executable to resolve snapshot sibling fuzz" unless companion_executable(snap_diff_bin, "fuzz") == snap_fuzz_bin
   cov_resolved, ids_resolved = resolve_coverage_target(triage_dir: triage_dir, output_dirs: [afl_dir])
   raise "expected resolve_coverage_target to pick snapshot fuzz (#{snap_fuzz_bin}), got #{cov_resolved}" unless cov_resolved == snap_fuzz_bin && ids_resolved == "#{snap_fuzz_bin}.ids"
+  diff_resolved, diff_ids_resolved = resolve_diff_coverage_target(triage_dir: triage_dir, output_dirs: [afl_dir])
+  raise "expected resolve_diff_coverage_target to pick snapshot fuzz.diff (#{snap_diff_bin}), got #{diff_resolved}" unless diff_resolved == snap_diff_bin && diff_ids_resolved == "#{snap_diff_bin}.ids"
+  loaded_diff_ids = load_coverage_ids(diff_ids_resolved)
+  unless loaded_diff_ids[:available] &&
+         loaded_diff_ids[:edge_functions] == { "5" => "pm_parse", "6" => "ruby_yyparse" } &&
+         loaded_diff_ids[:edge_domains] == { "5" => "prism", "6" => "parse_y" }
+    raise "expected Domain= metadata in load_coverage_ids: #{loaded_diff_ids.inspect}"
+  end
 
   # Simulate retriage where a rebuilt binary (commit bbbb..., dirty=1) classifies a survivor originally found by snap_fuzz
   retriage_dir = File.join(workdir, "retriage_build")

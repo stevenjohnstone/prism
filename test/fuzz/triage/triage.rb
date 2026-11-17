@@ -32,6 +32,14 @@ HALFEMPTY_THREADS = Integer(ENV.fetch("HALFEMPTY_THREADS", "2"))
 TRIAGE_THREADS = Integer(ENV.fetch("TRIAGE_THREADS", [Concurrent.processor_count / 2, 1].max.to_s))
 COVERAGE_BIN = ENV.fetch("TRIAGE_COVERAGE_BIN", "./build/fuzz")
 COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_COVERAGE_IDS", COVERAGE_BIN.empty? ? "" : "#{COVERAGE_BIN}.ids")
+DIFF_COVERAGE_BIN = ENV.fetch("TRIAGE_DIFF_COVERAGE_BIN", "./build/fuzz.diff")
+DIFF_COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_DIFF_COVERAGE_IDS", DIFF_COVERAGE_BIN.empty? ? "" : "#{DIFF_COVERAGE_BIN}.ids")
+
+def resolve_ids_path(bin_path, env_ids_key)
+  return ENV[env_ids_key] if ENV.key?(env_ids_key)
+
+  bin_path.empty? ? "" : "#{bin_path}.ids"
+end
 
 def resolve_coverage_target(triage_dir: TESTCASES_DIR, output_dirs: nil, coverage_bin: nil)
   if ENV.key?("TRIAGE_COVERAGE_BIN")
@@ -39,8 +47,7 @@ def resolve_coverage_target(triage_dir: TESTCASES_DIR, output_dirs: nil, coverag
   end
 
   if coverage_bin
-    ids = ENV.key?("TRIAGE_COVERAGE_IDS") ? ENV["TRIAGE_COVERAGE_IDS"] : (coverage_bin.empty? ? "" : "#{coverage_bin}.ids")
-    return [coverage_bin, ids]
+    return [coverage_bin, resolve_ids_path(coverage_bin, "TRIAGE_COVERAGE_IDS")]
   end
 
   if COVERAGE_BIN != "./build/fuzz"
@@ -55,8 +62,49 @@ def resolve_coverage_target(triage_dir: TESTCASES_DIR, output_dirs: nil, coverag
   snap_bin = candidates.uniq.find { |p| File.file?(p) && File.executable?(p) }
 
   bin = snap_bin || COVERAGE_BIN
-  ids = ENV.key?("TRIAGE_COVERAGE_IDS") ? ENV["TRIAGE_COVERAGE_IDS"] : (bin.empty? ? "" : "#{bin}.ids")
-  [bin, ids]
+  [bin, resolve_ids_path(bin, "TRIAGE_COVERAGE_IDS")]
+end
+
+def resolve_diff_coverage_target(triage_dir: TESTCASES_DIR, output_dirs: nil, diff_coverage_bin: nil, coverage_bin: nil)
+  return [DIFF_COVERAGE_BIN, DIFF_COVERAGE_IDS_PATH] if ENV.key?("TRIAGE_DIFF_COVERAGE_BIN")
+
+  if diff_coverage_bin
+    return [diff_coverage_bin, resolve_ids_path(diff_coverage_bin, "TRIAGE_DIFF_COVERAGE_IDS")]
+  end
+
+  if ENV.key?("TRIAGE_COVERAGE_BIN")
+    return ["", ""] if COVERAGE_BIN.empty?
+
+    if COVERAGE_BIN != "./build/fuzz"
+      sibling = File.join(File.dirname(COVERAGE_BIN), "fuzz.diff")
+      return [sibling, resolve_ids_path(sibling, "TRIAGE_DIFF_COVERAGE_IDS")]
+    end
+  elsif coverage_bin && !coverage_bin.empty? && coverage_bin != "./build/fuzz"
+    sibling = File.join(File.dirname(coverage_bin), "fuzz.diff")
+    return [sibling, resolve_ids_path(sibling, "TRIAGE_DIFF_COVERAGE_IDS")]
+  end
+
+  return [DIFF_COVERAGE_BIN, DIFF_COVERAGE_IDS_PATH] if DIFF_COVERAGE_BIN != "./build/fuzz.diff"
+
+  candidates = []
+  candidates << File.join(File.dirname(triage_dir), "bin", "fuzz.diff") if triage_dir && !triage_dir.empty?
+  Array(output_dirs).each do |d|
+    candidates << File.join(File.dirname(d), "bin", "fuzz.diff") if d && !d.empty?
+  end
+  exec_cands = candidates.uniq.select { |p| File.file?(p) && File.executable?(p) }
+  snap_with_ids = exec_cands.find { |p| File.file?("#{p}.ids") }
+  snap_bin = snap_with_ids || exec_cands.first
+
+  # If an older snapshot binary predates fuzz.diff.ids while the live build has both,
+  # prefer the snapshot if no live build .ids exists, otherwise use the live .ids binary.
+  bin = if snap_with_ids
+          snap_with_ids
+        elsif snap_bin && !(File.file?(DIFF_COVERAGE_BIN) && File.executable?(DIFF_COVERAGE_BIN) && File.file?("#{DIFF_COVERAGE_BIN}.ids"))
+          snap_bin
+        else
+          DIFF_COVERAGE_BIN
+        end
+  [bin, resolve_ids_path(bin, "TRIAGE_DIFF_COVERAGE_IDS")]
 end
 CORPUS_DIR = ENV.fetch("TRIAGE_CORPUS_DIR", "tmp/fuzz/corpus")
 AFL_SHOWMAP_BIN = ENV.fetch("AFL_SHOWMAP", "afl-showmap")
@@ -2070,22 +2118,29 @@ def collect_showmap_batch(inputs_by_key, bin_path, showmap_path)
 end
 
 def load_coverage_ids(ids_path)
-  return { available: false, path: nil, sha256: nil, edge_count_total: nil, edge_functions: {} } if ids_path.nil? || ids_path.empty? || !File.file?(ids_path)
+  if ids_path.nil? || ids_path.empty? || !File.file?(ids_path)
+    return { available: false, path: nil, sha256: nil, edge_count_total: nil, edge_functions: {}, edge_domains: {} }
+  end
 
   edge_functions = {}
+  edge_domains = {}
   File.foreach(ids_path) do |line|
     next unless line =~ /\bFunction=(\S+)\s+edgeID=(\d+)\s*\z/
 
-    edge_functions[Regexp.last_match(2).to_i] = Regexp.last_match(1)
+    eid = Regexp.last_match(2).to_i
+    edge_functions[eid] = Regexp.last_match(1)
+    edge_domains[eid] = Regexp.last_match(1) if line =~ /\bDomain=(\S+)\b/
   end
 
   sorted = edge_functions.sort.to_h { |k, v| [k.to_s, v] }
+  sorted_domains = edge_domains.sort.to_h { |k, v| [k.to_s, v] }
   {
     available: true,
     path: ids_path,
     sha256: Digest::SHA256.file(ids_path).hexdigest,
     edge_count_total: sorted.size,
-    edge_functions: sorted
+    edge_functions: sorted,
+    edge_domains: sorted_domains
   }
 end
 
@@ -2102,12 +2157,19 @@ def corpus_dir_fingerprint(corpus_dir)
   [digest.hexdigest, files]
 end
 
-def load_or_build_corpus_coverage(bin_path, build_id, ids_info, corpus_dir, showmap_path, cache_path)
+def load_or_build_corpus_coverage(bin_path, build_id, ids_info, corpus_dir, showmap_path, cache_path, label: "corpus baseline")
   fingerprint, corpus_files = corpus_dir_fingerprint(corpus_dir)
   if fingerprint.nil?
     return {
       "available" => false,
       "reason" => "corpus directory not found: #{corpus_dir}",
+      "dir" => corpus_dir
+    }
+  end
+  if corpus_files.empty?
+    return {
+      "available" => false,
+      "reason" => "corpus directory is empty: #{corpus_dir}",
       "dir" => corpus_dir
     }
   end
@@ -2126,7 +2188,7 @@ def load_or_build_corpus_coverage(bin_path, build_id, ids_info, corpus_dir, show
     end
   end
 
-  puts "Collecting afl-showmap corpus baseline (#{corpus_files.size} files)..."
+  puts "Collecting afl-showmap #{label} (#{corpus_files.size} files)..."
   inputs = {}
   corpus_files.each_with_index { |p, i| inputs[i.to_s] = p }
   batch = collect_showmap_batch(inputs, bin_path, showmap_path)
@@ -2155,6 +2217,7 @@ def load_or_build_corpus_coverage(bin_path, build_id, ids_info, corpus_dir, show
     "edge_df" => df.sort.to_h { |k, v| [k.to_s, v] },
     "edge_functions" => ids_info[:edge_functions]
   }
+  result["edge_domains"] = ids_info[:edge_domains] if ids_info[:edge_domains] && !ids_info[:edge_domains].empty?
   write_json_atomic(cache_path, result)
   result
 end
@@ -2469,8 +2532,133 @@ def backfill_bucket_meta(bucket_dir)
   )
 end
 
-def finalize_triage_metadata(triage_dir, coverage_bin: nil, output_dirs: nil)
+def diff_parse_y_invariant_meta?(meta)
+  return false unless meta.is_a?(Hash)
+
+  ns = meta.dig("symptom", "invariant", "namespace").to_s
+  headline = meta.dig("symptom", "headline").to_s
+  ns == "diff_parse_y" || headline.start_with?("INVARIANT[diff_parse_y]:")
+end
+
+def populate_coverage_stage(
+  bin_path:,
+  ids_path:,
+  empty_reason:,
+  showmap_path:,
+  metas_by_dir:,
+  target_dirs:,
+  dirty_dirs:,
+  field_key:,
+  cache_path:,
+  stage_label:
+)
+  cov_disabled_reason = if bin_path.empty?
+                          empty_reason
+                        elsif !File.executable?(bin_path)
+                          "reference binary not found or not executable: #{bin_path}"
+                        elsif showmap_path.nil?
+                          "afl-showmap not found in PATH"
+                        end
+
+  ref_binary_meta = {
+    "available" => false,
+    "path" => bin_path.empty? ? nil : normalize_repo_path(bin_path),
+    "build_id" => nil,
+    "ids_path" => nil,
+    "ids_available" => false,
+    "edge_count_total" => nil
+  }
+
+  if cov_disabled_reason
+    corpus_info = { "available" => false, "reason" => cov_disabled_reason, "dir" => CORPUS_DIR }
+    target_dirs.each do |dir|
+      meta = metas_by_dir[dir]
+      next if meta[field_key] && meta[field_key]["available"] == false && meta[field_key]["reason"] == cov_disabled_reason
+
+      meta[field_key] = { "available" => false, "reason" => cov_disabled_reason }
+      dirty_dirs.add(dir)
+    end
+    return [ref_binary_meta, corpus_info]
+  end
+
+  build_id = binary_build_id(bin_path)
+  ids_info = load_coverage_ids(ids_path)
+  ref_binary_meta = {
+    "available" => true,
+    "path" => normalize_repo_path(bin_path),
+    "build_id" => build_id,
+    "ids_path" => ids_info[:path] ? normalize_repo_path(ids_info[:path]) : nil,
+    "ids_available" => ids_info[:available],
+    "edge_count_total" => ids_info[:edge_count_total]
+  }
+
+  corpus_info = load_or_build_corpus_coverage(
+    bin_path,
+    build_id,
+    ids_info,
+    CORPUS_DIR,
+    showmap_path,
+    cache_path,
+    label: "#{stage_label} corpus baseline"
+  )
+
+  stale_inputs = {}
+  target_dirs.each do |dir|
+    meta = metas_by_dir[dir]
+    min_path = File.join(dir, "input.min")
+    next unless File.file?(min_path)
+
+    cov = meta[field_key]
+    next if cov && cov["available"] == true && cov["build_id"] == build_id
+
+    stale_inputs[dir] = min_path
+  end
+
+  unless stale_inputs.empty?
+    puts "Collecting afl-showmap #{stage_label} bucket coverage (#{stale_inputs.size} buckets)..."
+    batch = collect_showmap_batch(stale_inputs, bin_path, showmap_path)
+    if batch[:ok]
+      stale_inputs.each_key do |dir|
+        edges = batch[:maps][dir]
+        metas_by_dir[dir][field_key] = if edges
+                                          {
+                                            "available" => true,
+                                            "binary" => normalize_repo_path(bin_path),
+                                            "build_id" => build_id,
+                                            "edge_count" => edges.size,
+                                            "edges" => edges
+                                          }
+                                        else
+                                          {
+                                            "available" => false,
+                                            "binary" => normalize_repo_path(bin_path),
+                                            "build_id" => build_id,
+                                            "reason" => "no coverage map produced"
+                                          }
+                                        end
+        dirty_dirs.add(dir)
+      end
+    else
+      ref_binary_meta["available"] = false
+      ref_binary_meta["reason"] = batch[:reason]
+      stale_inputs.each_key do |dir|
+        metas_by_dir[dir][field_key] = { "available" => false, "reason" => batch[:reason] }
+        dirty_dirs.add(dir)
+      end
+    end
+  end
+
+  [ref_binary_meta, corpus_info]
+end
+
+def finalize_triage_metadata(triage_dir, coverage_bin: nil, output_dirs: nil, diff_coverage_bin: nil)
   cov_bin, cov_ids_path = resolve_coverage_target(triage_dir: triage_dir, output_dirs: output_dirs, coverage_bin: coverage_bin)
+  diff_cov_bin, diff_cov_ids_path = resolve_diff_coverage_target(
+    triage_dir: triage_dir,
+    output_dirs: output_dirs,
+    diff_coverage_bin: diff_coverage_bin,
+    coverage_bin: coverage_bin
+  )
   bucket_dirs = discover_bucket_dirs(triage_dir)
 
   metas_by_dir = {}
@@ -2535,96 +2723,35 @@ def finalize_triage_metadata(triage_dir, coverage_bin: nil, output_dirs: nil)
   end
 
   showmap_path = find_executable_in_path(AFL_SHOWMAP_BIN)
-  cov_disabled_reason = if cov_bin.empty?
-                          "TRIAGE_COVERAGE_BIN is empty"
-                        elsif !File.executable?(cov_bin)
-                          "reference binary not found or not executable: #{cov_bin}"
-                        elsif showmap_path.nil?
-                          "afl-showmap not found in PATH"
-                        end
+  ref_binary_meta, corpus_info = populate_coverage_stage(
+    bin_path: cov_bin,
+    ids_path: cov_ids_path,
+    empty_reason: "TRIAGE_COVERAGE_BIN is empty",
+    showmap_path: showmap_path,
+    metas_by_dir: metas_by_dir,
+    target_dirs: metas_by_dir.keys,
+    dirty_dirs: dirty_dirs,
+    field_key: "coverage",
+    cache_path: File.join(triage_dir, ".corpus-coverage.json"),
+    stage_label: "prism"
+  )
 
-  ref_binary_meta = {
-    "available" => false,
-    "path" => cov_bin.empty? ? nil : normalize_repo_path(cov_bin),
-    "build_id" => nil,
-    "ids_path" => nil,
-    "ids_available" => false,
-    "edge_count_total" => nil
-  }
-
-  if cov_disabled_reason
-    corpus_info = { "available" => false, "reason" => cov_disabled_reason, "dir" => CORPUS_DIR }
-    metas_by_dir.each do |dir, meta|
-      next if meta["coverage"] && meta["coverage"]["available"] == false && meta["coverage"]["reason"] == cov_disabled_reason
-
-      meta["coverage"] = { "available" => false, "reason" => cov_disabled_reason }
-      dirty_dirs.add(dir)
-    end
-  else
-    build_id = binary_build_id(cov_bin)
-    ids_info = load_coverage_ids(cov_ids_path)
-    ref_binary_meta = {
-      "available" => true,
-      "path" => normalize_repo_path(cov_bin),
-      "build_id" => build_id,
-      "ids_path" => ids_info[:path] ? normalize_repo_path(ids_info[:path]) : nil,
-      "ids_available" => ids_info[:available],
-      "edge_count_total" => ids_info[:edge_count_total]
-    }
-
-    corpus_info = load_or_build_corpus_coverage(
-      cov_bin,
-      build_id,
-      ids_info,
-      CORPUS_DIR,
-      showmap_path,
-      File.join(triage_dir, ".corpus-coverage.json")
+  diff_dirs = metas_by_dir.select { |_, meta| diff_parse_y_invariant_meta?(meta) }.keys
+  diff_ref_binary_meta = nil
+  diff_corpus_info = nil
+  if !diff_dirs.empty? || !ENV.fetch("TRIAGE_DIFF_COVERAGE_BIN", "").empty?
+    diff_ref_binary_meta, diff_corpus_info = populate_coverage_stage(
+      bin_path: diff_cov_bin,
+      ids_path: diff_cov_ids_path,
+      empty_reason: "TRIAGE_DIFF_COVERAGE_BIN is empty",
+      showmap_path: showmap_path,
+      metas_by_dir: metas_by_dir,
+      target_dirs: diff_dirs,
+      dirty_dirs: dirty_dirs,
+      field_key: "diff_coverage",
+      cache_path: File.join(triage_dir, ".diff-corpus-coverage.json"),
+      stage_label: "diff_parse_y"
     )
-
-    stale_inputs = {}
-    metas_by_dir.each do |dir, meta|
-      min_path = File.join(dir, "input.min")
-      next unless File.file?(min_path)
-
-      cov = meta["coverage"]
-      next if cov && cov["available"] == true && cov["build_id"] == build_id
-
-      stale_inputs[dir] = min_path
-    end
-
-    unless stale_inputs.empty?
-      puts "Collecting afl-showmap bucket coverage (#{stale_inputs.size} buckets)..."
-      batch = collect_showmap_batch(stale_inputs, cov_bin, showmap_path)
-      if batch[:ok]
-        stale_inputs.each_key do |dir|
-          edges = batch[:maps][dir]
-          metas_by_dir[dir]["coverage"] = if edges
-                                            {
-                                              "available" => true,
-                                              "binary" => normalize_repo_path(cov_bin),
-                                              "build_id" => build_id,
-                                              "edge_count" => edges.size,
-                                              "edges" => edges
-                                            }
-                                          else
-                                            {
-                                              "available" => false,
-                                              "binary" => normalize_repo_path(cov_bin),
-                                              "build_id" => build_id,
-                                              "reason" => "no coverage map produced"
-                                            }
-                                          end
-          dirty_dirs.add(dir)
-        end
-      else
-        ref_binary_meta["available"] = false
-        ref_binary_meta["reason"] = batch[:reason]
-        stale_inputs.each_key do |dir|
-          metas_by_dir[dir]["coverage"] = { "available" => false, "reason" => batch[:reason] }
-          dirty_dirs.add(dir)
-        end
-      end
-    end
   end
 
   dirty_dirs.each do |dir|
@@ -2656,9 +2783,13 @@ def finalize_triage_metadata(triage_dir, coverage_bin: nil, output_dirs: nil)
     "triage_dir" => normalize_repo_path(triage_dir),
     "reference_binary" => ref_binary_meta
   }
+  index_data["diff_reference_binary"] = diff_ref_binary_meta if diff_ref_binary_meta
   index_data["versions"] = versions_meta if versions_meta
+  index_data["corpus"] = corpus_payload
+  if diff_corpus_info
+    index_data["diff_corpus"] = diff_corpus_info.reject { |k, _| %w[corpus_fingerprint ids_sha256].include?(k) }
+  end
   index_data.merge!(
-    "corpus" => corpus_payload,
     "summary" => {
       "bucket_count" => buckets.size,
       "total_occurrences" => total_occurrences,

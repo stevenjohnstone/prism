@@ -48,7 +48,7 @@ FUZZ_GIT_COMMIT := $(or $(strip $(shell git rev-parse HEAD 2>/dev/null)),unknown
 FUZZ_GIT_DIRTY := $(if $(shell git rev-parse --is-inside-work-tree 2>/dev/null),$(if $(strip $(shell git status --porcelain -- src include templates test/fuzz/harness 2>/dev/null)),1,0),unknown)
 FUZZ_PROVENANCE_DEFINES := -DFUZZ_GIT_COMMIT=$(FUZZ_GIT_COMMIT) -DFUZZ_GIT_DIRTY=$(FUZZ_GIT_DIRTY)
 FUZZ_SOURCES := $(SOURCES) test/fuzz/harness/parse.c test/fuzz/harness/fuzz.c
-FUZZ_DIFF_DEPS := test/fuzz/harness/diff.c test/fuzz/harness/build_diff.sh test/fuzz/runtime/provenance.rb
+FUZZ_DIFF_DEPS := test/fuzz/harness/diff.c test/fuzz/harness/build_diff.sh test/fuzz/harness/gen_diff_ids.rb test/fuzz/runtime/provenance.rb
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
 FUZZ_AFL_STAMP := ./build/.fuzz.afl.stamp
@@ -111,7 +111,7 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(FUZZ_DIFF_DEPS) $(HEADE
 	# can instrument case-insensitive string comparisons for better coverage.
 	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
 	$(ECHO) "building differential fuzz binary (CRuby parse.y)"
-	$(Q) FUZZ_GIT_COMMIT=$(FUZZ_GIT_COMMIT) FUZZ_GIT_DIRTY=$(FUZZ_GIT_DIRTY) $(CURDIR)/test/fuzz/harness/build_diff.sh --mode fuzz --prism-root $(CURDIR) --afl-path $(CURDIR)/build/afl --max-input-size $(FUZZ_MAX_INPUT_SIZE) --output build/fuzz.diff
+	$(Q) rm -f $(CURDIR)/build/fuzz.diff.ids && FUZZ_GIT_COMMIT=$(FUZZ_GIT_COMMIT) FUZZ_GIT_DIRTY=$(FUZZ_GIT_DIRTY) $(CURDIR)/test/fuzz/harness/build_diff.sh --mode fuzz --prism-root $(CURDIR) --afl-path $(CURDIR)/build/afl --max-input-size $(FUZZ_MAX_INPUT_SIZE) --output build/fuzz.diff
 	$(ECHO) "building workspace Ruby C extension for grammar generator"
 	$(Q) $(MAKEDIRS) build/fuzz-ruby-ext/prism
 	$(Q) cd build/fuzz-ruby-ext/prism && ruby $(CURDIR)/ext/prism/extconf.rb && $(MAKE)
@@ -154,7 +154,7 @@ fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e TRIAGE_LIVE_SCRIPTS -e FUZZ_HARNESS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz /bin/bash -c 'if [ "$${TRIAGE_LIVE_SCRIPTS:-0}" != "1" ] && [ -f "./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb" ]; then exec ruby ./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb; else exec ruby ./test/fuzz/triage/triage.rb; fi'
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_COVERAGE_IDS -e TRIAGE_DIFF_COVERAGE_BIN -e TRIAGE_DIFF_COVERAGE_IDS -e TRIAGE_CORPUS_DIR -e TRIAGE_LIVE_SCRIPTS -e FUZZ_HARNESS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz /bin/bash -c 'if [ "$${TRIAGE_LIVE_SCRIPTS:-0}" != "1" ] && [ -f "./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb" ]; then exec ruby ./tmp/fuzz/snapshot/test/fuzz/triage/triage.rb; else exec ruby ./test/fuzz/triage/triage.rb; fi'
 
 FUZZ_VERIFY_ENV_FLAGS := -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BY_CLUSTER -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_MAX_FAILURES -e VERIFY_EXTRACT_SURVIVORS -e VERIFY_INPUT_MIN_ONLY -e VERIFY_SKIP_MIN -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_SYMBOLIZE -e VERIFY_FAIL_FAST -e VERIFY_INVERT -e VERIFY_BISECT -e VERIFY_VERBOSE -e VERIFY_QUIET -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED)
 
@@ -192,7 +192,7 @@ fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_COVERAGE_IDS -e TRIAGE_DIFF_COVERAGE_BIN -e TRIAGE_DIFF_COVERAGE_IDS -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
 
 fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP) test/fuzz/harness/node_locations.inc
 	$(ECHO) "Templates up to date"

@@ -295,3 +295,40 @@ ruby test/fuzz/triage/cluster.rb [--metadata PATH] [-o PATH|-] [--threshold FLOA
 ```
 
 Each cluster selects a deterministic representative by `(-occurrences, min_size_bytes, bucket_id)`, aggregates discovery timestamps across its member buckets (`first_seen`, `first_elapsed_ms`, `first_seen_bucket`, `last_seen` — falling back to `sample_crashes` `,time:<ms>` filenames and then `first_seen - summary["first_seen"]` when `,time:<ms>` is absent, e.g., AFL `sync:main` crashes), propagates `versions` provenance (`prism`, `ruby_parse_y`, `container`, `fuzz`, `triage`, plus `observed`) at the root, per-cluster, and per-bucket levels when present (printing `Versions:` and `Container:` summary lines), and emits schema v1 JSON to `tmp/fuzz/triage/clusters.json` (or stdout with `-o -`).
+
+---
+
+## 7. Dedicated Differential Algorithm (`diff_parse_y_dual_edge`)
+
+While Algorithm 1 (`prism_flaw`) remains unchanged for Prism memory-safety bugs, Prism parse invariants, CRuby crashes, and `stream_diff`, `INVARIANT[diff_parse_y]` parse divergences are clustered by a dedicated second algorithm (`diff_parse_y_dual_edge`) whenever `diff_coverage` and `diff_corpus` are present (with seamless fallback to Algorithm 1 on legacy snapshots lacking `diff_coverage`).
+
+### Top-Level Two-Population Separation
+
+`cluster.rb` explicitly partitions clusters into two ordered sections before numbering (`cluster-01..`):
+
+1. **Prism Flaws & Crashes** (`group="prism_flaw"` / `"cruby_crash"`, `algorithm="prism_flaw"`): all memory-safety bugs (`SEGV`, `ASAN`, `UBSAN`, `MSAN`, `LSAN`), Prism invariant failures (`node_relation`, `node_location`, `diagnostic_semantic`, `error_recovery`, `recursion_depth`, `stream_diff`), and fatal `CRASH[diff_parse_y]` crashes. Sorted first by descending occurrences.
+2. **Differential `parse.y` Divergences** (`group="diff_parse_y"`, `algorithm="diff_parse_y_dual_edge"`): AST and syntax mismatches (`syntax_mismatch`, `ast_tree_mismatch`, `ast_node_count_mismatch`, `ast_block_owner_mismatch`, `locals_count_mismatch`) between Prism and CRuby `parse.y`.
+
+### Dual-Parser Edge Collection & Function Weighting
+
+[`test/fuzz/harness/build_diff.sh`](../harness/build_diff.sh) links `build/fuzz.diff` with `-Wl,-Map=...` and invokes [`test/fuzz/harness/gen_diff_ids.rb`](../harness/gen_diff_ids.rb) to align the linker's `__sancov_guards` layout with each object's ELF COMDAT section groups (`readelf -g`), producing `build/fuzz.diff.ids` (snapshotted to `tmp/fuzz/bin/` via `AUX_FILES`). Every runtime PCGUARD edge ID (`5..23872`) is tagged with both its function name and domain:
+
+- `harness` (`diff.o` diff comparator and harness entrypoints): **excluded (`0.0`)** so AST traversal/formatting in `diff.c` never merges unrelated bugs.
+- `prism` (`src/*.c`) & `parse_y` (CRuby `parse.o`): retained, excluding non-signal driver/allocator/pool/visitor/Bison error-formatting boilerplate (`DIFF_BOILERPLATE_FUNCTIONS`, `DIFF_BOILERPLATE_PREFIXES` such as `ruby_show_error_line`, `rb_yytnamerr`, `yysyntax_error`, `pm_visit_child_nodes`, `pm_constant_*`, `pm_diagnostic_*`), and using balanced parser weighting:
+  - `DIFF_ENCODING_HELPER_WEIGHT = 0.25` (`pm_encoding_*`)
+  - `DIFF_IDENTIFIER_HELPER_WEIGHT = 0.15` (`parse_ident`, `dvar_*`, `local_id*`)
+  - `DIFF_LEXER_DISPATCHER_WEIGHT = 0.35` (`parser_lex`, `parser_yylex`)
+  - `DIFF_PRISM_DISPATCHER_WEIGHT = 0.50` (`parse_expression`, `parse_statements`)
+  - `DIFF_FUNCTION_EDGE_CAP = 400.0` (preserving Bison's monolithic `ruby_yyparse` state-machine signal alongside Prism's modular parser functions)
+
+### Dual-Domain Similarity & Calibration
+
+For two `diff_parse_y` buckets sharing the same mismatch class (`syntax_mismatch:prism_err_cruby_ok`, `syntax_mismatch:prism_ok_cruby_err`, or `ast` — without penalizing differing node tags such as `ALIAS` vs `VALIAS` across inputs triggering the same rule):
+
+$$S_{\text{dual}}(A, B) = \frac{1}{2}\sqrt{J_{\text{prism}} \cdot J_{\text{parse.y}}} + \frac{1}{2}\sqrt{\cos_{\text{prism}} \cdot \cos_{\text{parse.y}}}$$
+
+- Blending Weighted Jaccard and L2-normalized IDF Cosine merges size-asymmetric inputs hitting the same construct (e.g., nested `BEGIN` hoisting with `END{}` vs `BEGIN{alias ...}`) without letting sparse inputs merge into large unrelated programs.
+- Requiring geometric agreement across **both** `prism` and `parse_y` suppresses single-parser coincidences (e.g., `parse.y` falling into a shared error-recovery path).
+- Soft modifiers refine edge similarity: `locals_count_mismatch` vs structural AST mismatch (`0.65x`), different CRuby exception classes such as `ArgumentError` vs `SyntaxError` (`0.50x`), and a non-zero-overlap `0.10` boost for matching non-generic diagnostic codes (`S > 0.05`).
+- Cut with UPGMA at `DIFF_DEFAULT_THRESHOLD = 0.25` (configurable via `--diff-threshold` / `CLUSTER_DIFF_THRESHOLD`).
+- On the 205-bucket differential+Prism campaign (`tmp/fuzz/triage`), this separates all `37` Prism flaw/crash buckets into `9` clusters (`cluster-01..cluster-09`, unchanged) while consolidating the `168` `diff_parse_y` buckets from `81` clusters (`42` singletons) down to `61` clusters (`23` singletons) under `dual_edge_prism_and_parse_y`.
