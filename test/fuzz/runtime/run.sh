@@ -4,6 +4,7 @@ AFL_DIR=${1:-./tmp/fuzz/afl}
 AFL_IJON_DIR="${AFL_DIR}-ijon"
 CORPUS_DIR=${2:-./tmp/fuzz/corpus}
 SEEDS_BACKUP_DIR="$(dirname "$AFL_DIR")/seeds"
+BIN_DIR="$(dirname "$AFL_DIR")/bin"
 MAX_INPUT_SIZE=${FUZZ_MAX_INPUT_SIZE:-1024}
 SESSION="fuzzer"
 
@@ -60,6 +61,10 @@ fi
 
 mkdir -p "$AFL_DIR"
 
+# Snapshot compiled fuzzer binaries and provenance into $BIN_DIR so later edits
+# or rebuilds in ./build do not mutate the campaign binaries used by triage.
+ruby ./test/fuzz/runtime/provenance.rb snapshot "./build" "$BIN_DIR" || exit 1
+
 # --- Trap Signals ---
 # Trap SIGINT (Ctrl+C) and SIGTERM (docker stop)
 trap cleanup TERM INT EXIT
@@ -96,21 +101,21 @@ prepare_diff_seeds() {
     fi
 
     ruby -retc -rfileutils -e '
-      corpus_dir, seed_dir = ARGV
+      corpus_dir, seed_dir, diff_bin = ARGV
       files = Dir.children(corpus_dir).map { |f| File.join(corpus_dir, f) }.select { |p| File.file?(p) }.sort
       queue = Queue.new
       files.each { |f| queue << f }
       threads = [Etc.nprocessors, 1].max.times.map do
         Thread.new do
           while (f = queue.pop(true) rescue nil)
-            if system("./build/fuzz.diff", f, [:out, :err] => File::NULL)
+            if system(diff_bin, f, [:out, :err] => File::NULL)
               FileUtils.cp(f, File.join(seed_dir, File.basename(f)))
             end
           end
         end
       end
       threads.each(&:join)
-    ' "$CORPUS_DIR" "$seed_dir"
+    ' "$CORPUS_DIR" "$seed_dir" "$BIN_DIR/fuzz.diff"
 }
 
 add_diff_worker() {
@@ -118,7 +123,7 @@ add_diff_worker() {
     local extra_env=$2
     local afl_opts=$3
     prepare_diff_seeds "$name"
-    add_worker "$name" "${extra_env}afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- ./build/fuzz.diff"
+    add_worker "$name" "${extra_env}afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- $BIN_DIR/fuzz.diff"
 }
 
 prepare_seed_shard() {
@@ -201,29 +206,29 @@ diff_extra_idx=0
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
         0)
-            add_worker "main" "AFL_FUZZER_LOOPCOUNT=2000 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c ./build/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR ./build/fuzz || read -r -n 1"
+            add_worker "main" "AFL_FUZZER_LOOPCOUNT=2000 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -M main $MAIN_FOREIGN_FLAGS -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -c $BIN_DIR/fuzz.cmplog -i $CORPUS_DIR -p exploit -o $AFL_DIR $BIN_DIR/fuzz || read -r -n 1"
             ;;
         1)
-            add_worker "grammar" "ulimit -v 4194304 && ruby ./test/fuzz/runtime/grammar.rb '$AFL_DIR' '/tmp/afl-tmpdir/grammar/seeds'"
+            add_worker "grammar" "ulimit -v 4194304 && FUZZ_BIN_DIR=$BIN_DIR FUZZ_RUBY_EXT_DIR=$BIN_DIR/fuzz-ruby-ext ruby ./test/fuzz/runtime/grammar.rb '$AFL_DIR' '/tmp/afl-tmpdir/grammar/seeds'"
             ;;
         2)
             prepare_seed_shard "msan" 0
-            add_worker "msan" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- ./build/fuzz.msan"
+            add_worker "msan" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 MSAN_OPTIONS=$FUZZ_MSAN_OPTIONS ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/msan/seeds -o $AFL_DIR -S msan -p fast -- $BIN_DIR/fuzz.msan"
             ;;
         3)
             prepare_seed_shard "ijon" 1
-            add_worker "ijon" "ulimit -v 4194304 && AFL_SYNC_TIME=1 AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ijon/seeds -o $IJON_OUT_DIR $IJON_SYNC_FLAGS -p explore -- ./build/fuzz.ijon"
+            add_worker "ijon" "ulimit -v 4194304 && AFL_SYNC_TIME=1 AFL_CRASH_EXITCODE=23 afl-fuzz -t 250+ -m $FUZZ_HARD_RSS_LIMIT -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/ijon/seeds -o $IJON_OUT_DIR $IJON_SYNC_FLAGS -p explore -- $BIN_DIR/fuzz.ijon"
             ;;
         4)
             prepare_seed_shard "slow" 2
-            add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- ./build/fuzz.slow"
+            add_worker "slow" "AFL_FUZZER_LOOPCOUNT=2000 AFL_DISABLE_TRIM=1 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/slow/seeds -o $AFL_DIR -S slow -p fast -- $BIN_DIR/fuzz.slow"
             ;;
         5)
             add_diff_worker "diff" "" "-p explore"
             ;;
         6)
             prepare_seed_shard "main-2" 3
-            add_worker "main-2" "AFL_DISABLE_TRIM=1 AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/main-2/seeds -o $AFL_DIR -S main-2 -p explore -P explore -L 0 -w ./build/fuzz.sand -- ./build/fuzz.native"
+            add_worker "main-2" "AFL_DISABLE_TRIM=1 AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/main-2/seeds -o $AFL_DIR -S main-2 -p explore -P explore -L 0 -w $BIN_DIR/fuzz.sand -- $BIN_DIR/fuzz.native"
             ;;
         *)
             idx=$diff_extra_idx

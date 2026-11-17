@@ -429,6 +429,7 @@ module FuzzClustering
     occ = bucket.dig("occurrences", "count").to_i
     first_seen, last_seen, first_elapsed_ms = extract_bucket_timestamps(bucket)
     min_size = bucket.dig("input", "min_size_bytes")
+    versions = bucket["versions"].is_a?(Hash) && !bucket["versions"].empty? ? bucket["versions"] : nil
 
     {
       id: bucket["bucket_id"].to_s,
@@ -441,6 +442,7 @@ module FuzzClustering
       first_elapsed_ms: first_elapsed_ms,
       last_seen: last_seen,
       min_size_bytes: min_size,
+      versions: versions,
       headline: bucket.dig("symptom", "headline").to_s,
       cov_vec: cov_vec,
       cov_norm2: cov_norm2,
@@ -636,8 +638,59 @@ module FuzzClustering
     ]
   end
 
+  def summarize_versions_entries(features)
+    prism_seen = {}
+    ruby_seen = {}
+    container_seen = {}
+    fuzz_seen = {}
+    triage_seen = {}
+
+    features.each do |f|
+      v = f[:versions]
+      next unless v.is_a?(Hash)
+
+      pv = v["prism"]
+      if pv.is_a?(Hash) && !pv.empty?
+        key = [pv["version"], pv["target_ruby_version"], pv["git_commit"], pv["git_short"], pv["git_dirty"]]
+        prism_seen[key] ||= pv
+      end
+
+      rv = v["ruby_parse_y"]
+      if rv.is_a?(Hash) && !rv.empty?
+        key = [rv["version"], rv["revision"], rv["release_date"], rv["description"], rv["oracle_dir"]]
+        ruby_seen[key] ||= rv
+      end
+
+      cv = v["container"]
+      if cv.is_a?(Hash) && !cv.empty?
+        key = [cv["image_id"], cv["os"], cv["arch"], cv["clang"], cv["aflplusplus"], cv["ruby"]]
+        container_seen[key] ||= cv
+      end
+
+      fv = v["fuzz"]
+      if fv.is_a?(Hash) && !fv.empty?
+        key = [fv["binary"], fv["build_id"], fv["snapshot_dir"], fv["prism"], fv["ruby_parse_y"]]
+        fuzz_seen[key] ||= fv
+      end
+
+      tv = v["triage"]
+      if tv.is_a?(Hash) && !tv.empty?
+        key = [tv["binary"], tv["build_id"], tv["coverage_binary"], tv["prism"], tv["workspace_git"]]
+        triage_seen[key] ||= tv
+      end
+    end
+
+    out = {}
+    out["prism"] = prism_seen.values.sort_by { |p| [p["version"].to_s, p["git_commit"].to_s, p["target_ruby_version"].to_s] } unless prism_seen.empty?
+    out["ruby_parse_y"] = ruby_seen.values.sort_by { |r| [r["version"].to_s, r["revision"].to_s] } unless ruby_seen.empty?
+    out["container"] = container_seen.values.sort_by { |c| [c["os"].to_s, c["arch"].to_s, c["image_id"].to_s] } unless container_seen.empty?
+    out["fuzz"] = fuzz_seen.values.sort_by { |x| [x["binary"].to_s, x["build_id"].to_s] } unless fuzz_seen.empty?
+    out["triage"] = triage_seen.values.sort_by { |x| [x["binary"].to_s, x["build_id"].to_s] } unless triage_seen.empty?
+    out.empty? ? nil : out
+  end
+
   def format_bucket_entry(feature)
-    {
+    entry = {
       "bucket_id" => feature[:id],
       "reason" => feature[:reason],
       "signature" => feature[:signature],
@@ -649,6 +702,8 @@ module FuzzClustering
       "headline" => feature[:headline],
       "top_prism_frame" => feature[:top_prism_frame]
     }
+    entry["versions"] = feature[:versions] if feature[:versions]
+    entry
   end
 
   def cluster_mean_similarity(members, sim_matrix)
@@ -790,6 +845,7 @@ module FuzzClustering
         last_seen: latest&.fetch(:last_seen),
         min_merge_similarity: c[:min_merge_sim],
         mean_pairwise_similarity: cluster_mean_similarity(c[:members], sim_matrix),
+        versions: summarize_versions_entries(member_feats),
         buckets: sorted_members.map { |f| format_bucket_entry(f) }
       }
     end
@@ -813,7 +869,7 @@ module FuzzClustering
       rep_out = with_fallback_elapsed_ms(format_bucket_entry(entry[:representative]), campaign_first_seen)
       cluster_elapsed_ms = entry[:first_elapsed_ms] || elapsed_ms_between(entry[:first_seen], campaign_first_seen)
 
-      {
+      cluster_out = {
         "cluster_id" => cid,
         "bucket_count" => entry[:bucket_count],
         "occurrences" => entry[:occurrences],
@@ -824,9 +880,11 @@ module FuzzClustering
         "reasons" => entry[:reasons],
         "representative" => rep_out,
         "min_merge_similarity" => entry[:min_merge_similarity].round(6),
-        "mean_pairwise_similarity" => entry[:mean_pairwise_similarity].round(6),
-        "buckets" => buckets_out
+        "mean_pairwise_similarity" => entry[:mean_pairwise_similarity].round(6)
       }
+      cluster_out["versions"] = entry[:versions] if entry[:versions]
+      cluster_out["buckets"] = buckets_out
+      cluster_out
     end
 
     inter_pairs = []
@@ -850,7 +908,7 @@ module FuzzClustering
     min_intra = merge_similarities.empty? ? nil : merge_similarities.min.round(6)
     total_occurrences = features.sum { |f| f[:occurrences] }
 
-    {
+    out = {
       "schema_version" => SCHEMA_VERSION,
       "generated_at" => Time.now.utc.iso8601,
       "metadata_path" => metadata_path,
@@ -893,6 +951,11 @@ module FuzzClustering
       },
       "clusters" => clusters_json
     }
+    report_versions = metadata["versions"].is_a?(Hash) ? metadata["versions"].dup : {}
+    observed_versions = summarize_versions_entries(features)
+    report_versions["observed"] = observed_versions if observed_versions && !observed_versions.empty?
+    out["versions"] = report_versions unless report_versions.empty?
+    out
   end
 
   def format_first_seen_cell(cluster, campaign_first_seen = nil)
@@ -968,7 +1031,86 @@ module FuzzClustering
     lines << "Summary: #{summary['bucket_count']} buckets (#{summary['total_occurrences']} occurrences) -> " \
              "#{summary['cluster_count']} clusters (threshold=#{algo['threshold']}, reason_weight=#{algo['reason_weight']}" \
              "#{margin_suffix}#{excl_suffix})"
+    versions_line = format_versions_line(report["versions"])
+    lines << versions_line if versions_line
+    container_line = format_container_line(report["versions"])
+    lines << container_line if container_line
     lines.join("\n")
+  end
+
+  def format_prism_version_tag(pv)
+    return nil unless pv.is_a?(Hash) && !pv.empty?
+
+    ver = pv["version"]
+    rev = pv["git_short"] || pv["git_commit"]&.[](0, 9)
+    dirty = pv["git_dirty"] ? "-dirty" : ""
+    rev_str = rev ? "#{rev}#{dirty}" : nil
+
+    main = ver || rev_str
+    return nil unless main
+
+    (rev_str && rev_str != main) ? "#{main} (#{rev_str})" : main.to_s
+  end
+
+  def format_ruby_version_tag(rv)
+    return nil unless rv.is_a?(Hash) && !rv.empty?
+
+    ver = rv["version"]
+    rev = rv["revision"]&.[](0, 10)
+    main = ver || rev
+    return nil unless main
+
+    (rev && rev != main) ? "#{main} (#{rev})" : main.to_s
+  end
+
+  def format_versions_line(versions)
+    return nil unless versions.is_a?(Hash) && !versions.empty?
+
+    obs = versions["observed"].is_a?(Hash) ? versions["observed"] : {}
+    prism_tags = ([versions["prism"]] + Array(obs["prism"])).compact
+                 .filter_map { |pv| format_prism_version_tag(pv) }.uniq
+    ruby_tags = ([versions["ruby_parse_y"]] + Array(obs["ruby_parse_y"])).compact
+                .filter_map { |rv| format_ruby_version_tag(rv) }.uniq
+
+    triage_tags = ([versions.dig("triage", "prism")] + Array(obs["triage"]).map { |t| t.is_a?(Hash) ? t["prism"] : nil })
+                  .compact.filter_map { |pv| format_prism_version_tag(pv) }.uniq
+    extra_triage = triage_tags - prism_tags
+
+    parts = []
+    parts << "prism=#{prism_tags.join(' | ')}" unless prism_tags.empty?
+    parts << "triage_prism=#{extra_triage.join(' | ')}" unless extra_triage.empty?
+    parts << "ruby_parse_y=#{ruby_tags.join(' | ')}" unless ruby_tags.empty?
+    parts.empty? ? nil : "Versions: #{parts.join(', ')}"
+  end
+
+  def format_container_tag(cv)
+    return nil unless cv.is_a?(Hash) && !cv.empty?
+
+    items = []
+    if cv["os"] && !cv["os"].to_s.empty?
+      items << (cv["arch"] ? "#{cv['os']} (#{cv['arch']})" : cv["os"].to_s)
+    elsif cv["arch"]
+      items << cv["arch"].to_s
+    end
+    if cv["clang"] && !cv["clang"].to_s.empty?
+      c_ver = cv["clang"].to_s[/clang version ([0-9.]+)/, 1]
+      items << (c_ver ? "clang #{c_ver}" : cv["clang"].to_s)
+    end
+    items << cv["aflplusplus"].to_s if cv["aflplusplus"] && !cv["aflplusplus"].to_s.empty?
+    items << "lrama-fuzz #{cv['lrama_fuzz']}" if cv["lrama_fuzz"] && !cv["lrama_fuzz"].to_s.empty?
+    items.empty? ? nil : items.join(", ")
+  end
+
+  def format_container_line(versions)
+    return nil unless versions.is_a?(Hash) && !versions.empty?
+
+    obs = versions["observed"].is_a?(Hash) ? versions["observed"] : {}
+    c_tags = ([versions["container"], versions.dig("fuzz", "container"), versions.dig("triage", "container")] +
+              Array(obs["container"]) +
+              Array(obs["fuzz"]).map { |f| f.is_a?(Hash) ? f["container"] : nil } +
+              Array(obs["triage"]).map { |t| t.is_a?(Hash) ? t["container"] : nil })
+             .compact.filter_map { |cv| format_container_tag(cv) }.uniq
+    c_tags.empty? ? nil : "Container: #{c_tags.join(' | ')}"
   end
 end
 

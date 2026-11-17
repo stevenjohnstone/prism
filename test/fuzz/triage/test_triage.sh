@@ -2771,7 +2771,321 @@ EOF
   VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
     --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$WORKDIR/diff_repro_locals_pass" --json > "$WORKDIR/diff_autodetect.json"
 
+  ruby - << 'EOF'
+ENV["TRIAGE_LIB_ONLY"] = "1"
+load "./test/fuzz/triage/triage.rb"
+
+oracle = detect_oracle_dir_versions
+raise "expected detect_oracle_dir_versions from /opt/ruby, got: #{oracle.inspect}" unless oracle && oracle[:version] && oracle[:revision] && oracle[:release_date]
+
+if File.executable?("./build/fuzz.diff")
+  ver_out = `./build/fuzz.diff --version`
+  raise "expected ./build/fuzz.diff --version to exit 0, got #{$?.exitstatus}: #{ver_out}" unless $?.success?
+  raise "expected prism= and ruby_version= lines from ./build/fuzz.diff --version, got:\n#{ver_out}" unless ver_out.include?("prism=") && ver_out.include?("ruby_version=")
+
+  probed = probe_diff_binary_versions("./build/fuzz.diff")
+  raise "expected probe_diff_binary_versions(./build/fuzz.diff) to parse all 4 keys, got: #{probed.inspect}" unless probed && probed["prism"] && probed["ruby_version"] && probed["ruby_release_date"] && probed["ruby_description"]
+end
+
+vmeta = resolve_versions_metadata(executable: "fuzz.diff", is_diff: true, target_ruby_version: "4.0")
+raise "expected prism + ruby_parse_y metadata for diff oracle, got: #{vmeta.inspect}" unless vmeta && vmeta.dig("prism", "version") && vmeta.dig("ruby_parse_y", "version") && vmeta.dig("ruby_parse_y", "revision")
+EOF
+
   echo "  differential diff_parse_y verify_bucket.sh and standalone reproducer checks passed"
 fi
+
+# Version provenance across non-native safety guard, binary probe, triage.rb backfill/preservation, and cluster.rb reporting
+ruby - "$WORKDIR" << 'EOF'
+require "fileutils"
+require "json"
+
+workdir = ARGV.fetch(0)
+ENV["TRIAGE_LIB_ONLY"] = "1"
+ENV["TRIAGE_COVERAGE_BIN"] = "/nonexistent/fuzz"
+ENV["TRIAGE_CORPUS_DIR"] = File.join(workdir, "version_empty_corpus")
+FileUtils.mkdir_p(ENV["TRIAGE_CORPUS_DIR"])
+
+load "./test/fuzz/triage/triage.rb"
+load "./test/fuzz/triage/cluster.rb" unless defined?(FuzzClustering)
+
+# 1. Non-native scripts must never be executed by --version probe
+script_probe = File.join(workdir, "mock_non_native.sh")
+File.write(script_probe, "#!/bin/sh\nexit 99\n")
+File.chmod(0o755, script_probe)
+raise "expected native_executable_magic? == false for shell script" if native_executable_magic?(script_probe)
+raise "expected nil probe_diff_binary_versions for shell script" unless probe_diff_binary_versions(script_probe).nil?
+
+# 2. Compiled native binary stub --version probe (when cc/clang is available)
+cc = %w[clang cc gcc].find { |c| system("command -v #{c} >/dev/null 2>&1") }
+stub_bin = File.join(workdir, "stub_fuzz_diff")
+if cc
+  stub_c = File.join(workdir, "stub_fuzz_diff.c")
+  File.write(stub_c, <<~C)
+    #include <stdio.h>
+    #include <string.h>
+    int main(int argc, char **argv) {
+      if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        puts("prism=2.9.9");
+        puts("ruby_version=4.1.0");
+        puts("ruby_release_date=2027-01-02");
+        puts("ruby_description=ruby 4.1.0 (2027-01-02 revision deadbeef01)");
+        return 0;
+      }
+      return 1;
+    }
+  C
+  raise "failed to compile #{stub_c}" unless system(cc, stub_c, "-o", stub_bin)
+  raise "expected native_executable_magic? == true for compiled binary" unless native_executable_magic?(stub_bin)
+  probed_stub = probe_diff_binary_versions(stub_bin)
+  unless probed_stub == {
+    "prism" => "2.9.9",
+    "ruby_version" => "4.1.0",
+    "ruby_release_date" => "2027-01-02",
+    "ruby_description" => "ruby 4.1.0 (2027-01-02 revision deadbeef01)"
+  }
+    raise "unexpected stub probe result: #{probed_stub.inspect}"
+  end
+end
+
+# 3. Non-diff bucket omits ruby_parse_y and captures prism version + git + target_ruby_version
+header_ver = read_prism_header_version(Dir.pwd)
+raise "expected read_prism_header_version from include/prism/version.h" unless header_ver && !header_ver.empty?
+
+v_nondiff = resolve_versions_metadata(executable: "/nonexistent/fuzz", is_diff: false, target_ruby_version: "3.4")
+raise "expected prism metadata for non-diff bucket: #{v_nondiff.inspect}" unless v_nondiff && v_nondiff.dig("prism", "version") == header_ver && v_nondiff.dig("prism", "target_ruby_version") == "3.4"
+raise "non-diff bucket must not populate ruby_parse_y unless oracle requested" if v_nondiff.key?("ruby_parse_y")
+
+# 4. finalize_triage_metadata backfills missing versions on legacy buckets while preserving existing historical versions
+triage_dir = File.join(workdir, "version_triage_dir")
+b1_dir = File.join(triage_dir, "ABORT", "sig_backfill")
+b2_dir = File.join(triage_dir, "ABORT", "sig_historical")
+FileUtils.mkdir_p(b1_dir)
+FileUtils.mkdir_p(b2_dir)
+
+sample_min = "\x00\x00\x03\x011 + 2"
+b1_min = File.join(b1_dir, "input.min")
+b2_min = File.join(b2_dir, "input.min")
+File.binwrite(b1_min, sample_min)
+File.binwrite(b2_min, sample_min)
+File.write(File.join(b1_dir, "occurrences.jsonl"), JSON.generate({ "sha256" => "aaa111", "path" => "crashes/id:000001", "filename" => "id:000001,time:10", "fuzzer" => "afl", "worker" => "main", "queue" => "crashes", "size_bytes" => sample_min.bytesize, "mtime" => 1700000000, "time_ms" => 10 }) + "\n")
+File.write(File.join(b2_dir, "occurrences.jsonl"), JSON.generate({ "sha256" => "bbb222", "path" => "crashes/id:000002", "filename" => "id:000002,time:20", "fuzzer" => "afl", "worker" => "diff-1", "queue" => "crashes", "size_bytes" => sample_min.bytesize, "mtime" => 1700000001, "time_ms" => 20 }) + "\n")
+
+meta1 = build_bucket_metadata(
+  bucket_id: "ABORT/sig_backfill",
+  reason: "ABORT",
+  signature: "sig_backfill",
+  reproducible: true,
+  timed_out: false,
+  executable: "/nonexistent/fuzz",
+  crash_output: "Assertion failed: x != 0\n  #0 pm_parse_stream src/prism.c:100\n",
+  minimized_input: b1_min,
+  raw_size_bytes: sample_min.bytesize,
+  raw_sha256: "aaa111",
+  minimized_matches_signature: true,
+  occurrences: { "count" => 1, "by_fuzzer" => { "afl" => 1 }, "by_worker" => { "main" => 1 }, "by_queue" => { "crashes" => 1 }, "first_seen" => 1700000000, "first_elapsed_ms" => 10, "last_seen" => 1700000000, "sample_crashes" => [] }
+)
+raise "expected build_bucket_metadata to populate versions" unless meta1.dig("versions", "prism", "version") == header_ver
+meta1.delete("versions")
+File.write(File.join(b1_dir, "meta.json"), JSON.pretty_generate(meta1))
+
+historical_versions = {
+  "prism" => { "version" => "1.9.0", "git_short" => "111111111", "git_dirty" => false, "target_ruby_version" => "3.3" },
+  "ruby_parse_y" => { "version" => "3.4.1", "revision" => "abcdef0123", "release_date" => "2024-12-25" }
+}
+meta2 = build_bucket_metadata(
+  bucket_id: "ABORT/sig_historical",
+  reason: "ABORT",
+  signature: "sig_historical",
+  reproducible: true,
+  timed_out: false,
+  executable: cc ? stub_bin : "./build/fuzz.diff",
+  crash_output: "INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=1 prism=ok cruby=SyntaxError:foo\n  #0 diff_parse test/fuzz/harness/diff.c:200\n",
+  minimized_input: b2_min,
+  raw_size_bytes: sample_min.bytesize,
+  raw_sha256: "bbb222",
+  minimized_matches_signature: true,
+  occurrences: { "count" => 1, "by_fuzzer" => { "afl" => 1 }, "by_worker" => { "diff-1" => 1 }, "by_queue" => { "crashes" => 1 }, "first_seen" => 1700000001, "first_elapsed_ms" => 20, "last_seen" => 1700000001, "sample_crashes" => [] }
+)
+if cc
+  raise "expected stub_bin prism=2.9.9 and ruby_version=4.1.0 in meta2: #{meta2['versions'].inspect}" unless meta2.dig("versions", "prism", "version") == "2.9.9" && meta2.dig("versions", "ruby_parse_y", "version") == "4.1.0"
+end
+meta2["versions"] = historical_versions
+File.write(File.join(b2_dir, "meta.json"), JSON.pretty_generate(meta2))
+
+finalize_triage_metadata(triage_dir)
+index_data = JSON.parse(File.read(File.join(triage_dir, "metadata.json")))
+written_clusters = JSON.parse(File.read(File.join(triage_dir, "clusters.json")))
+raise "expected metadata.json root versions.prism.version" unless index_data.dig("versions", "prism", "version") == header_ver
+raise "expected clusters.json written by finalize_triage_metadata to contain versions" unless written_clusters.dig("versions", "prism", "version") == header_ver && written_clusters.dig("versions", "observed", "ruby_parse_y") == [historical_versions["ruby_parse_y"]]
+
+reloaded_b1 = JSON.parse(File.read(File.join(b1_dir, "meta.json")))
+reloaded_b2 = JSON.parse(File.read(File.join(b2_dir, "meta.json")))
+raise "expected finalize_triage_metadata to backfill versions on b1" unless reloaded_b1.dig("versions", "prism", "version") == header_ver
+raise "expected finalize_triage_metadata to preserve historical versions on b2, got: #{reloaded_b2['versions'].inspect}" unless reloaded_b2["versions"] == historical_versions
+
+# 5. Clustering propagates root, observed, per-cluster, and per-bucket versions without altering clusters, and formats summary cleanly
+report = FuzzClustering.cluster_metadata(index_data, metadata_path: File.join(triage_dir, "metadata.json"))
+raise "expected root report['versions']['prism']" unless report.dig("versions", "prism", "version") == header_ver
+raise "expected report['versions']['observed']['ruby_parse_y']" unless report.dig("versions", "observed", "ruby_parse_y") == [historical_versions["ruby_parse_y"]]
+raise "expected every cluster and bucket to include versions" unless report["clusters"].all? { |c| c["versions"].is_a?(Hash) && c["buckets"].all? { |b| b["versions"].is_a?(Hash) } }
+
+summary_text = FuzzClustering.format_summary_table(report)
+raise "expected summary_text to show prism and historical ruby_parse_y versions, got:\n#{summary_text}" unless summary_text.include?("Versions:") && summary_text.include?("prism=") && summary_text.include?("1.9.0 (111111111)") && summary_text.include?("ruby_parse_y=") && summary_text.include?("3.4.1 (abcdef0123)")
+
+stripped_index = JSON.parse(JSON.generate(index_data))
+stripped_index.delete("versions")
+stripped_index["buckets"].each { |b| b.delete("versions") }
+stripped_report = FuzzClustering.cluster_metadata(stripped_index)
+raise "expected stripped report to omit versions" if stripped_report.key?("versions")
+raise "expected version metadata not to alter cluster assignments" unless stripped_report["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] } } == report["clusters"].map { |c| c["buckets"].map { |b| b["bucket_id"] } }
+stripped_summary = FuzzClustering.format_summary_table(stripped_report)
+raise "expected stripped summary not to emit Versions line" if stripped_summary.include?("Versions:")
+raise "expected stripped summary not to emit Container line" if stripped_summary.include?("Container:")
+EOF
+echo "  version metadata tracking and clustering propagation verified"
+
+# Snapshot binary provenance, embedded .rodata marker, signature.sh bin/ normalization,
+# Makefile no-rebuild triage & fuzz-clean semantics, container provenance, and fuzz vs triage split
+snap_sig1=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/build/fuzz.diff(rb_st_free_table+0x14) [0x1] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
+snap_sig2=$(printf 'CRASH[diff_parse_y]: signal=SIGSEGV (11)\n/prism/tmp/fuzz/bin/fuzz.diff(rb_st_free_table+0x28) [0x2] /opt/ruby/st.c:667\n' | ./test/fuzz/triage/signature.sh)
+[ "$snap_sig1" = "$snap_sig2" ] || fail "expected identical signature for build/fuzz.diff and tmp/fuzz/bin/fuzz.diff ($snap_sig1 vs $snap_sig2)"
+
+triage_plan=$(make -n -o ./build/.fuzz.docker.stamp -o ./build/.fuzz.gen_templates.stamp fuzz-triage)
+if printf '%s\n' "$triage_plan" | grep -q 'fuzz-build'; then
+  fail "fuzz-triage must not rebuild fuzz binaries (found fuzz-build in plan: $triage_plan)"
+fi
+
+mkdir -p "$WORKDIR/clean_test/afl/w" "$WORKDIR/clean_test/afl-ijon/ijon" "$WORKDIR/clean_test/bin" "$WORKDIR/clean_test/corpus" "$WORKDIR/clean_test/triage/ABRT/sig1"
+touch "$WORKDIR/clean_test/.dotfile" "$WORKDIR/clean_test/bin/fuzz" "$WORKDIR/clean_test/triage/ABRT/sig1/meta.json"
+make fuzz-clean FUZZ_DIR="$WORKDIR/clean_test" < /dev/null | cat >/dev/null
+[ -f "$WORKDIR/clean_test/triage/ABRT/sig1/meta.json" ] || fail "fuzz-clean must preserve tmp/fuzz/triage"
+for deleted in "$WORKDIR/clean_test/afl" "$WORKDIR/clean_test/afl-ijon" "$WORKDIR/clean_test/bin" "$WORKDIR/clean_test/corpus" "$WORKDIR/clean_test/.dotfile"; do
+  [ ! -e "$deleted" ] || fail "fuzz-clean failed to remove $deleted"
+done
+
+ruby - "$WORKDIR" << 'EOF'
+require "fileutils"
+require "json"
+
+workdir = ARGV.fetch(0)
+ENV["TRIAGE_LIB_ONLY"] = "1"
+ENV.delete("TRIAGE_COVERAGE_BIN")
+ENV.delete("TRIAGE_COVERAGE_IDS")
+ENV["TRIAGE_CORPUS_DIR"] = File.join(workdir, "snap_empty_corpus")
+FileUtils.mkdir_p(ENV["TRIAGE_CORPUS_DIR"])
+
+load "./test/fuzz/triage/triage.rb"
+
+cc = %w[clang cc gcc].find { |c| system("command -v #{c} >/dev/null 2>&1") }
+if cc
+  src_dir = File.join(workdir, "snap_build")
+  bin_dir = File.join(workdir, "snap_campaign", "bin")
+  triage_dir = File.join(workdir, "snap_campaign", "triage")
+  afl_dir = File.join(workdir, "snap_campaign", "afl")
+  FileUtils.mkdir_p(src_dir)
+  FileUtils.mkdir_p(File.join(afl_dir, "w1", "crashes"))
+
+  harness_stub = File.join(workdir, "snap_main_stub.c")
+  File.write(harness_stub, <<~C)
+    #include <stdint.h>
+    #include <stddef.h>
+    int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+    void harness(const uint8_t *input, size_t size) { (void)input; (void)size; }
+    int main(void) {
+      const uint8_t buf[4] = {0, 0, 3, 1};
+      return LLVMFuzzerTestOneInput(buf, 4);
+    }
+  C
+
+  snap_fuzz = File.join(src_dir, "fuzz")
+  ok = system(
+    cc, "-O2", "-std=c99", "-Wall", "-Werror", "-Iinclude",
+    "-DFUZZ_GIT_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "-DFUZZ_GIT_DIRTY=0",
+    "test/fuzz/harness/fuzz.c", harness_stub, "-o", snap_fuzz
+  )
+  raise "failed to compile test/fuzz/harness/fuzz.c provenance stub" unless ok
+  File.write(File.join(src_dir, "fuzz.ids"), "1\tpm_parse\n")
+
+  emb = FuzzProvenance.read_embedded_binary_provenance(snap_fuzz)
+  unless emb && emb.dig("prism", "git_commit") == "a" * 40 && emb.dig("prism", "git_dirty") == false && emb.dig("prism", "version") == read_prism_header_version(Dir.pwd)
+    raise "unexpected embedded provenance from compiled fuzz.c: #{emb.inspect}"
+  end
+
+  manifest_path = FuzzProvenance.write_build_manifest(src_dir, repo_root: Dir.pwd)
+  raise "expected build manifest at #{manifest_path}" unless File.file?(manifest_path)
+
+  snap_manifest = FuzzProvenance.snapshot_build_to_bin(src_dir, bin_dir, repo_root: Dir.pwd)
+  raise "expected snapshot versions.json at #{snap_manifest}" unless File.file?(snap_manifest)
+  raise "expected copied fuzz and fuzz.ids in #{bin_dir}" unless File.executable?(File.join(bin_dir, "fuzz")) && File.file?(File.join(bin_dir, "fuzz.ids"))
+
+  # Simulate rebuilding/wiping ./build after campaign started: snapshot remains intact & self-contained
+  FileUtils.rm_rf(src_dir)
+
+  snap_fuzz_bin = File.join(bin_dir, "fuzz")
+  snap_diff_bin = File.join(bin_dir, "fuzz.diff")
+  File.write(snap_diff_bin, "#!/bin/sh\nexit 0\n")
+  File.chmod(0o755, snap_diff_bin)
+  raise "expected companion_executable to resolve snapshot sibling fuzz" unless companion_executable(snap_diff_bin, "fuzz") == snap_fuzz_bin
+  cov_resolved, ids_resolved = resolve_coverage_target(triage_dir: triage_dir, output_dirs: [afl_dir])
+  raise "expected resolve_coverage_target to pick snapshot fuzz (#{snap_fuzz_bin}), got #{cov_resolved}" unless cov_resolved == snap_fuzz_bin && ids_resolved == "#{snap_fuzz_bin}.ids"
+
+  # Simulate retriage where a rebuilt binary (commit bbbb..., dirty=1) classifies a survivor originally found by snap_fuzz
+  retriage_dir = File.join(workdir, "retriage_build")
+  FileUtils.mkdir_p(retriage_dir)
+  rebuilt_fuzz = File.join(retriage_dir, "fuzz")
+  ok2 = system(
+    cc, "-O2", "-std=c99", "-Wall", "-Werror", "-Iinclude",
+    "-DFUZZ_GIT_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "-DFUZZ_GIT_DIRTY=1",
+    "test/fuzz/harness/fuzz.c", harness_stub, "-o", rebuilt_fuzz
+  )
+  raise "failed to compile rebuilt fuzz.c provenance stub" unless ok2
+
+  orig_fuzz_prov = FuzzProvenance.resolve_binary_provenance(snap_fuzz_bin, is_diff: false, repo_root: Dir.pwd)
+  v_split = resolve_versions_metadata(
+    executable: rebuilt_fuzz,
+    worker_executable: rebuilt_fuzz,
+    is_diff: false,
+    fuzz_versions_override: orig_fuzz_prov,
+    coverage_bin: rebuilt_fuzz
+  )
+  unless v_split.dig("fuzz", "prism", "git_short") == "aaaaaaaaa" &&
+         v_split.dig("fuzz", "prism", "git_dirty") == false &&
+         v_split.dig("triage", "prism", "git_short") == "bbbbbbbbb" &&
+         v_split.dig("triage", "prism", "git_dirty") == true
+    raise "expected distinct fuzz vs triage provenance, got: #{v_split.inspect}"
+  end
+
+  if File.file?("/etc/os-release")
+    cont = FuzzProvenance.collect_container_provenance(repo_root: Dir.pwd)
+    unless cont && cont["os"] && cont["arch"] && cont["clang"] && cont["aflplusplus"] && cont["afl_patch_sha256"] && cont["ruby"] && cont["lrama_fuzz"]
+      raise "expected full container provenance in Docker, got: #{cont.inspect}"
+    end
+  end
+
+  split_report = FuzzClustering.cluster_metadata(
+    {
+      "versions" => v_split,
+      "buckets" => [
+        {
+          "bucket_id" => "ABORT/sig_split",
+          "reason" => "ABORT",
+          "signature" => "sig_split",
+          "reproducible" => true,
+          "occurrences" => { "count" => 1 },
+          "input" => { "min_size_bytes" => 8 },
+          "versions" => v_split
+        }
+      ]
+    }
+  )
+  split_summary = FuzzClustering.format_summary_table(split_report)
+  unless split_summary.include?("aaaaaaaaa") && split_summary.include?("triage_prism=") && split_summary.include?("bbbbbbbbb-dirty") && split_summary.include?("Container:")
+    raise "expected split versions and container line in summary:\n#{split_summary}"
+  end
+end
+EOF
+echo "  snapshot isolation, embedded provenance, container metadata, and fuzz/triage split verified"
 
 echo "PASS: Fuzz crash triage and minimization suite verified."

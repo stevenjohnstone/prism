@@ -12,7 +12,7 @@ sed -E \
   -e '/__kernel_rt_sigreturn/d' \
   -e '/__restore_rt/d' \
   -e 's#^([^ :]+/)?fuzz(\.[A-Za-z0-9_.-]+)*:#fuzz_bin:#g' \
-  -e 's#(/?[^ ("'\'']+/)?build/fuzz(\.[A-Za-z0-9_.-]+)*#fuzz_bin#g' \
+  -e 's#(/?[^ ("'\'']+/)?(build|bin)/fuzz(\.[A-Za-z0-9_.-]+)*#fuzz_bin#g' \
   -e 's/ \[detail: .*\]$//' \
   -e 's/0x[0-9a-fA-F]+//g' \
   -e ':u' \

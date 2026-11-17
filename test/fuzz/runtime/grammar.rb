@@ -1,7 +1,11 @@
 # frozen_string_literal: true
 
 WORKSPACE_LIB = File.expand_path("../../../lib", __dir__)
-WORKSPACE_EXT = File.expand_path("../../../build/fuzz-ruby-ext", __dir__)
+WORKSPACE_EXT = if ENV["FUZZ_RUBY_EXT_DIR"] && !ENV["FUZZ_RUBY_EXT_DIR"].empty?
+                  File.expand_path(ENV["FUZZ_RUBY_EXT_DIR"])
+                else
+                  File.expand_path("../../../build/fuzz-ruby-ext", __dir__)
+                end
 if File.exist?(File.join(WORKSPACE_EXT, "prism", "prism.so"))
   $LOAD_PATH.unshift(WORKSPACE_EXT, WORKSPACE_LIB)
 end
@@ -1475,7 +1479,8 @@ def run_grammar_supervisor(argv = ARGV)
   FileUtils.mkdir_p(crashes_dir)
 
   # Allow `make fuzz-triage` to triage any crashes caught directly inside grammar.rb
-  File.write(cmdline_path, "./build/fuzz.native\n")
+  bin_dir = ENV["FUZZ_BIN_DIR"] && !ENV["FUZZ_BIN_DIR"].empty? ? ENV["FUZZ_BIN_DIR"] : "./build"
+  File.write(cmdline_path, "#{File.join(bin_dir, "fuzz.native")}\n")
 
   # Parse CRuby's parse.y once in the supervisor before forking so respawned
   # workers inherit the prepared grammar via copy-on-write without re-parsing.

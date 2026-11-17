@@ -322,6 +322,30 @@ if [ "$(uname -s)" = "Linux" ]; then
   LINK_EXPORT_FLAGS=(-Wl,--export-dynamic)
 fi
 
+mapfile -t PROVENANCE_CFLAGS < <(ruby -r"${FUZZ_ROOT}/test/fuzz/runtime/provenance" -e '
+  prism_root, ruby_dir, c, d = ARGV
+  if c.to_s.empty? || c == "unknown"
+    git = FuzzProvenance.detect_git_state(prism_root)
+    c = git["git_commit"] if git && git["git_commit"]
+    d = git["git_dirty"] ? "1" : "0" if git && !git["git_dirty"].nil? && (d.to_s.empty? || d == "unknown")
+  end
+  c = "unknown" if c.to_s.empty? || !c.match?(/\A[0-9a-fA-F]{7,40}\z/)
+  d = "unknown" unless %w[0 1].include?(d.to_s)
+  puts "-DFUZZ_GIT_COMMIT=#{c}"
+  puts "-DFUZZ_GIT_DIRTY=#{d}"
+
+  oracle = FuzzProvenance.detect_oracle_dir_versions(ruby_dir) || {}
+  {
+    "FUZZ_RUBY_VERSION" => oracle["version"],
+    "FUZZ_RUBY_REVISION" => oracle["revision"],
+    "FUZZ_RUBY_RELEASE_DATE" => oracle["release_date"]
+  }.each do |macro, val|
+    next if val.nil? || val.empty? || !val.match?(/\A[0-9A-Za-z._-]+\z/)
+
+    puts %(-D#{macro}="#{val}")
+  end
+' "$PRISM_ROOT" "$RUBY_DIR" "${FUZZ_GIT_COMMIT:-}" "${FUZZ_GIT_DIRTY:-}")
+
 if [ "$MODE" = "fuzz" ]; then
   PRISM_CC=(env "AFL_PATH=$AFL_PATH_ARG" "AFL_LLVM_INSTRUMENT=PCGUARD" afl-clang-fast)
   PRISM_CFLAGS=(
@@ -345,6 +369,7 @@ if [ "$MODE" = "fuzz" ]; then
     -g -gdwarf-4 -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fPIE \
     ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"} \
     ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"} \
+    ${PROVENANCE_CFLAGS[@]+"${PROVENANCE_CFLAGS[@]}"} \
     "-I$PRISM_ROOT/include" \
     "${RUBY_EMBED_INC[@]}" \
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE" \

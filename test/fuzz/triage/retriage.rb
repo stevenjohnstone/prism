@@ -215,6 +215,7 @@ Dir.mktmpdir("prism-retriage-") do |workdir|
   survivors_by_sha = {}
   surviving_all_shas = Set.new
   occ_overrides = {}
+  fuzz_versions_overrides = {}
 
   checked_buckets.each do |b|
     bucket_id = b["bucket_id"]
@@ -238,6 +239,21 @@ Dir.mktmpdir("prism-retriage-") do |workdir|
 
     executable = resolve_reclassify_executable(provenance[:meta], b["profile"])
     default_queue = provenance[:meta]&.dig("reason") == "hang" ? "hangs" : "crashes"
+    orig_meta = provenance[:meta]
+    orig_fuzz_prov = if orig_meta.is_a?(Hash)
+                       if orig_meta.dig("versions", "fuzz").is_a?(Hash)
+                         fv = orig_meta.dig("versions", "fuzz").dup
+                         fv["container"] ||= orig_meta.dig("versions", "container") if orig_meta.dig("versions", "container")
+                         fv.compact
+                       elsif orig_meta["versions"].is_a?(Hash) && !orig_meta["versions"].empty?
+                         {
+                           "binary" => orig_meta["reproduced_by"],
+                           "prism" => orig_meta.dig("versions", "prism"),
+                           "ruby_parse_y" => orig_meta.dig("versions", "ruby_parse_y"),
+                           "container" => orig_meta.dig("versions", "container")
+                         }.compact
+                       end
+                     end
 
     files.each do |file_path|
       bname = File.basename(file_path)
@@ -248,6 +264,7 @@ Dir.mktmpdir("prism-retriage-") do |workdir|
       if occ
         occ_overrides[content_sha] ||= occ.merge("sha256" => content_sha)
       end
+      fuzz_versions_overrides[content_sha] ||= orig_fuzz_prov if orig_fuzz_prov && !orig_fuzz_prov.empty?
 
       surviving_all_shas.add(orig_sha)
       surviving_all_shas.add(content_sha)
@@ -302,8 +319,10 @@ Dir.mktmpdir("prism-retriage-") do |workdir|
     FileUtils.rm_f(File.join(processed_dir, sha))
   end
 
+  retriage_cov_bin = ENV.key?("TRIAGE_COVERAGE_BIN") ? ENV["TRIAGE_COVERAGE_BIN"] : "./build/fuzz"
+
   if survivors_by_sha.empty?
-    finalize_triage_metadata(triage_dir)
+    finalize_triage_metadata(triage_dir, coverage_bin: retriage_cov_bin)
   else
     staged_root = File.join(workdir, "staged")
     survivors_by_sha.values.group_by { |s| [s[:executable], s[:queue]] }.each_with_index do |((executable, queue), items), group_idx|
@@ -321,7 +340,9 @@ Dir.mktmpdir("prism-retriage-") do |workdir|
     run_triage_pipeline(
       output_dirs: [staged_root],
       testcases_dir: triage_dir,
-      occurrence_overrides: occ_overrides
+      occurrence_overrides: occ_overrides,
+      fuzz_versions_overrides: fuzz_versions_overrides,
+      coverage_bin: retriage_cov_bin
     )
   end
 

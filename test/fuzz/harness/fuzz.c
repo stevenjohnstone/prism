@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#if defined(__has_include)
+#  if __has_include("prism/version.h")
+#    include "prism/version.h"
+#  endif
+#endif
+
 #if defined(__has_feature)
 #  if __has_feature(memory_sanitizer)
 #include <sanitizer/msan_interface.h>
@@ -35,6 +41,34 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 #define FUZZ_MAX_ALLOCATED_BYTES ((size_t) FUZZ_MAX_ALLOCATED * 1024 * 1024)
 #define FUZZ_STR_HELPER(x) #x
 #define FUZZ_STR(x) FUZZ_STR_HELPER(x)
+
+#ifndef PRISM_VERSION
+#define PRISM_VERSION "unknown"
+#endif
+
+#ifndef FUZZ_GIT_COMMIT
+#define FUZZ_GIT_COMMIT unknown
+#endif
+
+#ifndef FUZZ_GIT_DIRTY
+#define FUZZ_GIT_DIRTY unknown
+#endif
+
+#if defined(__has_attribute)
+#  if __has_attribute(retain)
+#    define FUZZ_PROVENANCE_ATTR __attribute__((used, retain))
+#  else
+#    define FUZZ_PROVENANCE_ATTR __attribute__((used))
+#  endif
+#else
+#  define FUZZ_PROVENANCE_ATTR __attribute__((used))
+#endif
+
+static const char fuzz_provenance_marker[] FUZZ_PROVENANCE_ATTR =
+    "@(#)PRISM_FUZZ_PROVENANCE\tprism=" PRISM_VERSION
+    "\tgit_commit=" FUZZ_STR(FUZZ_GIT_COMMIT)
+    "\tgit_dirty=" FUZZ_STR(FUZZ_GIT_DIRTY)
+    "\n";
 
 #ifdef PRISM_XALLOCATOR
 typedef union {

@@ -1,6 +1,7 @@
 FUZZ_DIR = $(CURDIR)/tmp/fuzz
 FUZZ_AFL_DIR = $(FUZZ_DIR)/afl
 FUZZ_AFL_IJON_DIR = $(FUZZ_DIR)/afl-ijon
+FUZZ_BIN_DIR = $(FUZZ_DIR)/bin
 FUZZ_CORPUS_DIR = $(FUZZ_DIR)/corpus
 FUZZ_SEEDS_DIR = $(FUZZ_DIR)/seeds
 FUZZ_COVERAGE_DIR = $(FUZZ_DIR)/coverage
@@ -43,8 +44,11 @@ FUZZ_DEFAULT_DEFINES := $(strip \
 	$(call fuzz_define_default,FUZZ_HARD_RSS_LIMIT,$(FUZZ_HARD_RSS_LIMIT)))
 FUZZ_DEFAULT_WARNINGS := -Wno-gnu-statement-expression-from-macro-expansion -Wno-shorten-64-to-32 -Wno-switch -Wno-implicit-function-declaration
 override FUZZ_FLAGS := $(strip $(FUZZ_DEFAULT_DEFINES) $(filter-out $(FUZZ_DEFAULT_WARNINGS),$(FUZZ_USER_FLAGS)) $(FUZZ_DEFAULT_WARNINGS))
+FUZZ_GIT_COMMIT := $(or $(strip $(shell git rev-parse HEAD 2>/dev/null)),unknown)
+FUZZ_GIT_DIRTY := $(if $(shell git rev-parse --is-inside-work-tree 2>/dev/null),$(if $(strip $(shell git status --porcelain -- src include templates test/fuzz/harness 2>/dev/null)),1,0),unknown)
+FUZZ_PROVENANCE_DEFINES := -DFUZZ_GIT_COMMIT=$(FUZZ_GIT_COMMIT) -DFUZZ_GIT_DIRTY=$(FUZZ_GIT_DIRTY)
 FUZZ_SOURCES := $(SOURCES) test/fuzz/harness/parse.c test/fuzz/harness/fuzz.c
-FUZZ_DIFF_DEPS := test/fuzz/harness/diff.c test/fuzz/harness/build_diff.sh
+FUZZ_DIFF_DEPS := test/fuzz/harness/diff.c test/fuzz/harness/build_diff.sh test/fuzz/runtime/provenance.rb
 
 FUZZ_DOCKER_STAMP := ./build/.fuzz.docker.stamp
 FUZZ_AFL_STAMP := ./build/.fuzz.afl.stamp
@@ -87,30 +91,32 @@ test/fuzz/harness/node_locations.inc: test/fuzz/harness/gen_node_locations.rb co
 $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(FUZZ_DIFF_DEPS) $(HEADERS) $(wildcard ext/prism/*) test/fuzz/harness/node_locations.inc test/fuzz/harness/include/prism_xallocator.h test/fuzz/Makefile
 	$(Q) $(MAKEDIRS) $(@D)
 	$(ECHO) "building with MSAN (SLOW)"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_MSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.msan $(FUZZ_SOURCES)
 	$(ECHO) "building with LSAN (SLOW)"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_LSAN=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.lsan $(FUZZ_SOURCES)
 	$(ECHO) "building with IJON state tracking and custom leak detector"
 	# Enable IJON state tracking (AFL_LLVM_IJON=1 -DPRISM_FUZZ_IJON) on fuzz.ijon
 	# for the ijon worker.
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_IJON=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -DPRISM_FUZZ_IJON -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ijon $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_IJON=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -DPRISM_FUZZ_IJON -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.ijon $(FUZZ_SOURCES)
 	$(ECHO) "building native leak detector for SAND workers"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.native $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -Itest/fuzz/harness/include -DPRISM_XALLOCATOR -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.native $(FUZZ_SOURCES)
 	$(ECHO) "building main fuzz binary"
-	$(Q) rm -f $(CURDIR)/build/fuzz.ids && AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_DOCUMENT_IDS=$(CURDIR)/build/fuzz.ids AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
+	$(Q) rm -f $(CURDIR)/build/fuzz.ids && AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_DOCUMENT_IDS=$(CURDIR)/build/fuzz.ids AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz $(FUZZ_SOURCES)
 	$(ECHO) "building SAND sanitizer binary (forkserver-only ASAN+UBSAN)"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_ONLY_FSRV=1 AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.sand $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_ONLY_FSRV=1 AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.sand $(FUZZ_SOURCES)
 	$(ECHO) "building ASAN+UBSAN (SLOW) binary"
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.slow $(FUZZ_SOURCES)
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_USE_UBSAN=1 AFL_UBSAN_VERBOSE=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_SANITIZER_FLAGS) $(FUZZ_SLOW_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -fsanitize=address,fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.slow $(FUZZ_SOURCES)
 	$(ECHO) "building cmplog binary"
 	# Replace pm_strncasecmp with standard strncasecmp so AFL++ CmpLog hooks
 	# can instrument case-insensitive string comparisons for better coverage.
-	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
+	$(Q) AFL_PATH=$(CURDIR)/build/afl AFL_LLVM_CMPLOG=1 afl-clang-lto $(DEBUG_FLAGS) $(CPPFLAGS) $(CFLAGS) $(FUZZ_FAST_FLAGS) $(FUZZ_FLAGS) $(FUZZ_PROVENANCE_DEFINES) -Dpm_strncasecmp=strncasecmp -fsanitize=fuzzer -ggdb3 -std=c99 -Iinclude -o build/fuzz.cmplog $(filter-out src/strncasecmp.c,$(FUZZ_SOURCES))
 	$(ECHO) "building differential fuzz binary (CRuby parse.y)"
-	$(Q) $(CURDIR)/test/fuzz/harness/build_diff.sh --mode fuzz --prism-root $(CURDIR) --afl-path $(CURDIR)/build/afl --max-input-size $(FUZZ_MAX_INPUT_SIZE) --output build/fuzz.diff
+	$(Q) FUZZ_GIT_COMMIT=$(FUZZ_GIT_COMMIT) FUZZ_GIT_DIRTY=$(FUZZ_GIT_DIRTY) $(CURDIR)/test/fuzz/harness/build_diff.sh --mode fuzz --prism-root $(CURDIR) --afl-path $(CURDIR)/build/afl --max-input-size $(FUZZ_MAX_INPUT_SIZE) --output build/fuzz.diff
 	$(ECHO) "building workspace Ruby C extension for grammar generator"
 	$(Q) $(MAKEDIRS) build/fuzz-ruby-ext/prism
 	$(Q) cd build/fuzz-ruby-ext/prism && ruby $(CURDIR)/ext/prism/extconf.rb && $(MAKE)
+	$(ECHO) "recording fuzz build provenance manifest"
+	$(Q) ruby ./test/fuzz/runtime/provenance.rb write-build ./build
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
 
@@ -130,11 +136,10 @@ fuzz-debug: fuzz-docker-build
 
 fuzz-triage: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "starting triage -- may take a long time"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz make fuzz-build
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_MINIMIZE -e TRIAGE_RECOUNT -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/triage.rb
 
 FUZZ_VERIFY_ENV_FLAGS := -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BY_CLUSTER -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_MAX_FAILURES -e VERIFY_EXTRACT_SURVIVORS -e VERIFY_INPUT_MIN_ONLY -e VERIFY_SKIP_MIN -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_SYMBOLIZE -e VERIFY_FAIL_FAST -e VERIFY_INVERT -e VERIFY_BISECT -e VERIFY_VERBOSE -e VERIFY_QUIET -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED)
 
@@ -172,7 +177,7 @@ fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
 	fi; \
-	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e BUCKET -e REASON -e VERIFY_TIMEOUT -e VERIFY_UNREPRODUCIBLE -e VERIFY_REBUILD -e VERIFY_VERBOSE -e VERIFY_QUIET -e TRIAGE_MINIMIZE -e TRIAGE_THREADS -e TRIAGE_COVERAGE_BIN -e TRIAGE_CORPUS_DIR -e RETRIAGE_BUILD -e RETRIAGE_DRY_RUN -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -e HISTFILE=/prism/tmp/fuzz/.bash_history -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/retriage.rb $(RETRIAGE_ARGS)
 
 fuzz-gen-templates: $(FUZZ_GEN_TEMPLATES_STAMP) test/fuzz/harness/node_locations.inc
 	$(ECHO) "Templates up to date"
@@ -185,10 +190,10 @@ $(FUZZ_GEN_TEMPLATES_STAMP): $(FUZZ_TEMPLATE_DEPS) | $(FUZZ_DOCKER_STAMP)
 
 fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "running fuzzer"
-	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz make fuzz-build
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -v $(CURDIR):/prism prism/fuzz make fuzz-build
 	$(ECHO) "starting AFL++ run"
-	$(Q) $(MAKEDIRS) $(FUZZ_AFL_DIR)
-	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "exec ./test/fuzz/runtime/run.sh"
+	$(Q) $(MAKEDIRS) $(FUZZ_AFL_DIR) $(FUZZ_BIN_DIR)
+	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -v $(CURDIR):/prism prism/fuzz /bin/bash -c "exec ./test/fuzz/runtime/run.sh"
 ifneq ($(FUZZ_DAEMON),)
 	$(ECHO) "Fuzzer daemon started in container '$(FUZZ_CONTAINER_NAME)'."
 	$(ECHO) "Attach to tmux with: make fuzz-attach (or: docker exec -it $(FUZZ_CONTAINER_NAME) tmux -2 attach-session -t fuzzer)"
@@ -248,13 +253,15 @@ define FUZZ_CLEAN_CONFIRM
 	echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"; \
 	echo "@         WARNING: DESTRUCTIVE OPERATION AHEAD!           @"; \
 	echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"; \
-	echo "This will permanently delete:"; \
+	echo "This will permanently delete everything under tmp/fuzz/ except tmp/fuzz/triage:"; \
 	echo "  - tmp/fuzz/afl      ($(FUZZ_FINDINGS) crash/hang findings)"; \
 	echo "  - tmp/fuzz/afl-ijon"; \
+	echo "  - tmp/fuzz/bin"; \
 	echo "  - tmp/fuzz/corpus"; \
 	echo "  - tmp/fuzz/seeds"; \
 	echo "  - tmp/fuzz/coverage"; \
 	echo "  - tmp/fuzz/plots"; \
+	echo "  - any other files/directories under tmp/fuzz/"; \
 	echo ""; \
 	echo "Preserved:"; \
 	echo "  - tmp/fuzz/triage"; \
@@ -275,8 +282,8 @@ endef
 fuzz-clean: FUZZ_FINDINGS := $(shell find $(FUZZ_AFL_DIR)/*/{crashes,hangs} $(FUZZ_AFL_IJON_DIR)/*/{crashes,hangs} -name "id*" -print 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 fuzz-clean:
 	$(FUZZ_CLEAN_CONFIRM)
-	$(ECHO) "Removing fuzz data (preserving tmp/fuzz/triage)"
-	$(Q) $(RMALL) $(FUZZ_AFL_DIR) $(FUZZ_AFL_IJON_DIR) $(FUZZ_CORPUS_DIR) $(FUZZ_SEEDS_DIR) $(FUZZ_COVERAGE_DIR) $(FUZZ_PLOTS_DIR) $(FUZZ_DIR)/.coverage.* $(FUZZ_DIR)/.live-seeds.*
+	$(ECHO) "Removing everything under tmp/fuzz/ except tmp/fuzz/triage"
+	$(Q) if [ -d "$(FUZZ_DIR)" ]; then find $(FUZZ_DIR) -mindepth 1 -maxdepth 1 ! -name triage -exec rm -rf -- {} +; fi
 	$(ECHO) "done"
 
 .PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test

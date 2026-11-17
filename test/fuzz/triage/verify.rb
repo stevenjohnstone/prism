@@ -660,6 +660,7 @@ report = {
 report["target_root"] = target_root if target_root != fuzz_root
 if cluster_mode
   report["clusters_file"] = clusters_source if clusters_source
+  report["versions"] = cluster_report["versions"] if cluster_report && cluster_report["versions"]
   report["clusters"] = cluster_results
 end
 

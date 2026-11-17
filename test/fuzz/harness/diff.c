@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <ruby.h>
+#include <ruby/version.h>
 
 #ifndef FUZZ_MAX_INPUT_SIZE
 #define FUZZ_MAX_INPUT_SIZE 1024
@@ -24,6 +25,48 @@
 #ifndef FUZZ_DIFF_PERSISTENT_ITERS
 #define FUZZ_DIFF_PERSISTENT_ITERS 1000
 #endif
+
+#define FUZZ_STR_HELPER(x) #x
+#define FUZZ_STR(x) FUZZ_STR_HELPER(x)
+
+#ifndef FUZZ_GIT_COMMIT
+#define FUZZ_GIT_COMMIT unknown
+#endif
+
+#ifndef FUZZ_GIT_DIRTY
+#define FUZZ_GIT_DIRTY unknown
+#endif
+
+#ifndef FUZZ_RUBY_VERSION
+#define FUZZ_RUBY_VERSION "unknown"
+#endif
+
+#ifndef FUZZ_RUBY_REVISION
+#define FUZZ_RUBY_REVISION "unknown"
+#endif
+
+#ifndef FUZZ_RUBY_RELEASE_DATE
+#define FUZZ_RUBY_RELEASE_DATE "unknown"
+#endif
+
+#if defined(__has_attribute)
+#  if __has_attribute(retain)
+#    define FUZZ_PROVENANCE_ATTR __attribute__((used, retain))
+#  else
+#    define FUZZ_PROVENANCE_ATTR __attribute__((used))
+#  endif
+#else
+#  define FUZZ_PROVENANCE_ATTR __attribute__((used))
+#endif
+
+static const char diff_fuzz_provenance[] FUZZ_PROVENANCE_ATTR =
+    "@(#)PRISM_FUZZ_PROVENANCE\tprism=" PRISM_VERSION
+    "\tgit_commit=" FUZZ_STR(FUZZ_GIT_COMMIT)
+    "\tgit_dirty=" FUZZ_STR(FUZZ_GIT_DIRTY)
+    "\truby_version=" FUZZ_RUBY_VERSION
+    "\truby_revision=" FUZZ_RUBY_REVISION
+    "\truby_release_date=" FUZZ_RUBY_RELEASE_DATE
+    "\n";
 
 /* CRuby internal helpers in thread.c / vm_dump.c (not exposed in public ruby.h). */
 extern void rb_thread_stop_timer_thread(void);
@@ -5019,6 +5062,19 @@ static int diff_run_stdin(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf(
+            "prism=%s\ngit_commit=%s\ngit_dirty=%s\nruby_version=%s\nruby_release_date=%s\nruby_description=%s\n",
+            pm_version(),
+            FUZZ_STR(FUZZ_GIT_COMMIT),
+            FUZZ_STR(FUZZ_GIT_DIRTY),
+            ruby_version,
+            ruby_release_date,
+            ruby_description
+        );
+        return 0;
+    }
+
     diff_oracle_init();
 
 #ifdef __AFL_HAVE_MANUAL_CONTROL

@@ -17,6 +17,9 @@ require "zlib"
 cluster_lib = [(__dir__ && File.join(__dir__, "cluster.rb")), File.expand_path("test/fuzz/triage/cluster.rb")].compact.find { |p| File.file?(p) }
 require cluster_lib if cluster_lib
 
+provenance_lib = [(__dir__ && File.expand_path("../runtime/provenance.rb", __dir__)), File.expand_path("test/fuzz/runtime/provenance.rb")].compact.find { |p| File.file?(p) }
+require provenance_lib if provenance_lib
+
 TRIAGE_FILE_DIR = __dir__
 PRISM_LOUPE_BASE_URL = "https://stevenjohnstone.github.io/prism-loupe/"
 
@@ -29,6 +32,32 @@ HALFEMPTY_THREADS = Integer(ENV.fetch("HALFEMPTY_THREADS", "2"))
 TRIAGE_THREADS = Integer(ENV.fetch("TRIAGE_THREADS", [Concurrent.processor_count / 2, 1].max.to_s))
 COVERAGE_BIN = ENV.fetch("TRIAGE_COVERAGE_BIN", "./build/fuzz")
 COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_COVERAGE_IDS", COVERAGE_BIN.empty? ? "" : "#{COVERAGE_BIN}.ids")
+
+def resolve_coverage_target(triage_dir: TESTCASES_DIR, output_dirs: nil, coverage_bin: nil)
+  if ENV.key?("TRIAGE_COVERAGE_BIN")
+    return [COVERAGE_BIN, COVERAGE_IDS_PATH]
+  end
+
+  if coverage_bin
+    ids = ENV.key?("TRIAGE_COVERAGE_IDS") ? ENV["TRIAGE_COVERAGE_IDS"] : (coverage_bin.empty? ? "" : "#{coverage_bin}.ids")
+    return [coverage_bin, ids]
+  end
+
+  if COVERAGE_BIN != "./build/fuzz"
+    return [COVERAGE_BIN, COVERAGE_IDS_PATH]
+  end
+
+  candidates = []
+  candidates << File.join(File.dirname(triage_dir), "bin", "fuzz") if triage_dir && !triage_dir.empty?
+  Array(output_dirs).each do |d|
+    candidates << File.join(File.dirname(d), "bin", "fuzz") if d && !d.empty?
+  end
+  snap_bin = candidates.uniq.find { |p| File.file?(p) && File.executable?(p) }
+
+  bin = snap_bin || COVERAGE_BIN
+  ids = ENV.key?("TRIAGE_COVERAGE_IDS") ? ENV["TRIAGE_COVERAGE_IDS"] : (bin.empty? ? "" : "#{bin}.ids")
+  [bin, ids]
+end
 CORPUS_DIR = ENV.fetch("TRIAGE_CORPUS_DIR", "tmp/fuzz/corpus")
 AFL_SHOWMAP_BIN = ENV.fetch("AFL_SHOWMAP", "afl-showmap")
 SHOWMAP_TIMEOUT_MS = Integer(ENV.fetch("TRIAGE_SHOWMAP_TIMEOUT_MS", "1000"))
@@ -88,6 +117,165 @@ FORWARDING_CHARS = [
 
 HARNESS_SLICE_MUTEX = Mutex.new
 HARNESS_SLICES_CACHE = {}
+def locate_version_repo_root
+  FuzzProvenance.locate_repo_root
+end
+
+def native_executable_magic?(path)
+  FuzzProvenance.native_executable_magic?(path)
+end
+
+def probe_diff_binary_versions(bin_path)
+  FuzzProvenance.probe_diff_binary_versions(bin_path)
+end
+
+def read_prism_header_version(repo_root)
+  FuzzProvenance.read_prism_header_version(repo_root)
+end
+
+def detect_git_revision(repo_root)
+  git_info = FuzzProvenance.detect_git_state(repo_root)
+  return nil unless git_info
+
+  {
+    commit: git_info["git_commit"],
+    short: git_info["git_short"],
+    dirty: git_info["git_dirty"]
+  }.compact
+end
+
+def detect_oracle_dir_versions(oracle_dir = ENV["RUBY_ORACLE_DIR"])
+  info = FuzzProvenance.detect_oracle_dir_versions(oracle_dir)
+  return nil unless info
+
+  info.transform_keys(&:to_sym)
+end
+
+def compact_provenance_entry(entry, top_container:, include_workspace_git: false, workspace_git: nil, coverage_bin: nil)
+  return nil unless entry.is_a?(Hash) && !entry.empty?
+
+  out = {}
+  out["binary"] = entry["binary"] if entry["binary"] && !entry["binary"].empty?
+  out["build_id"] = entry["build_id"] if entry["build_id"] && !entry["build_id"].empty?
+  out["snapshot_dir"] = entry["snapshot_dir"] if entry["snapshot_dir"] && !entry["snapshot_dir"].empty?
+  out["built_at"] = entry["built_at"] if entry["built_at"] && !entry["built_at"].empty?
+  out["started_at"] = entry["started_at"] if entry["started_at"] && !entry["started_at"].empty?
+  out["coverage_binary"] = normalize_repo_path(coverage_bin) if coverage_bin && !coverage_bin.to_s.empty?
+  out["prism"] = entry["prism"] if entry["prism"].is_a?(Hash) && !entry["prism"].empty?
+  out["ruby_parse_y"] = entry["ruby_parse_y"] if entry["ruby_parse_y"].is_a?(Hash) && !entry["ruby_parse_y"].empty?
+  if include_workspace_git && workspace_git.is_a?(Hash) && !workspace_git.empty?
+    out["workspace_git"] = workspace_git
+  end
+  if entry["container"].is_a?(Hash) && !entry["container"].empty? && entry["container"] != top_container
+    out["container"] = entry["container"]
+  end
+  out.empty? ? nil : out
+end
+
+def resolve_versions_metadata(executable: "", worker_executable: nil, is_diff: false, target_ruby_version: nil, include_ruby_oracle: is_diff, include_diff_binary: false, triage_dir: nil, coverage_bin: nil, fuzz_versions_override: nil, fuzz_buckets: nil)
+  repo_root = locate_version_repo_root
+  exe_str = executable.to_s
+  worker_str = (worker_executable && !worker_executable.to_s.empty?) ? worker_executable.to_s : exe_str
+
+  diff_bin = if is_diff && !exe_str.empty? && (exe_str.end_with?("diff") || File.basename(exe_str) == "fuzz.diff") && File.file?(exe_str)
+               exe_str
+             elsif !worker_str.empty? && File.file?(File.join(File.dirname(worker_str), "fuzz.diff"))
+               File.join(File.dirname(worker_str), "fuzz.diff")
+             elsif triage_dir && File.file?(File.join(File.dirname(triage_dir), "bin", "fuzz.diff"))
+               File.join(File.dirname(triage_dir), "bin", "fuzz.diff")
+             elsif File.file?("./tmp/fuzz/bin/fuzz.diff")
+               "./tmp/fuzz/bin/fuzz.diff"
+             elsif File.file?("./build/fuzz.diff")
+               "./build/fuzz.diff"
+             elsif repo_root
+               File.join(repo_root, "build/fuzz.diff")
+             else
+               "./build/fuzz.diff"
+             end
+
+  snap_bin_dir = triage_dir ? File.join(File.dirname(triage_dir), "bin") : nil
+  fuzz_prov = if fuzz_versions_override.is_a?(Hash) && !fuzz_versions_override.empty?
+                fuzz_versions_override.dup
+              elsif !worker_str.empty?
+                FuzzProvenance.resolve_binary_provenance(
+                  worker_str,
+                  is_diff: is_diff,
+                  target_ruby_version: target_ruby_version,
+                  include_ruby_oracle: is_diff || include_ruby_oracle,
+                  repo_root: repo_root
+                )
+              elsif snap_bin_dir && File.directory?(snap_bin_dir) && (File.file?(File.join(snap_bin_dir, "versions.json")) || FuzzProvenance::BINARIES.any? { |b| File.file?(File.join(snap_bin_dir, b)) })
+                dir_prov = FuzzProvenance.resolve_dir_provenance(snap_bin_dir, repo_root: repo_root)
+                snap_manifest = FuzzProvenance.find_manifest_for_bin_dir(snap_bin_dir)
+                {
+                  "snapshot_dir" => normalize_repo_path(snap_bin_dir),
+                  "built_at" => snap_manifest&.dig("built_at"),
+                  "started_at" => snap_manifest&.dig("started_at"),
+                  "prism" => dir_prov["prism"],
+                  "ruby_parse_y" => dir_prov["ruby_parse_y"],
+                  "container" => dir_prov["container"]
+                }.compact
+              elsif Array(fuzz_buckets).any? { |b| b.dig("versions", "fuzz").is_a?(Hash) }
+                first_f = Array(fuzz_buckets).lazy.filter_map { |b| b.dig("versions", "fuzz") }.first
+                first_c = Array(fuzz_buckets).lazy.filter_map { |b| b.dig("versions", "container") }.first
+                fc = first_f.dup
+                fc["container"] ||= first_c if first_c
+                fc
+              end
+
+  triage_target = if !exe_str.empty?
+                    exe_str
+                  elsif coverage_bin && !coverage_bin.to_s.empty? && File.file?(coverage_bin.to_s)
+                    coverage_bin.to_s
+                  elsif File.file?(diff_bin)
+                    diff_bin
+                  else
+                    ""
+                  end
+
+  triage_prov = FuzzProvenance.resolve_binary_provenance(
+    triage_target,
+    is_diff: is_diff,
+    target_ruby_version: nil,
+    include_ruby_oracle: is_diff || include_ruby_oracle,
+    repo_root: repo_root
+  )
+  workspace_git = FuzzProvenance.detect_git_state(repo_root)
+
+  top_container = fuzz_prov&.dig("container") || triage_prov&.dig("container")
+  top_prism = (fuzz_prov&.dig("prism") || triage_prov&.dig("prism"))&.dup
+  if top_prism && target_ruby_version && !target_ruby_version.to_s.empty?
+    top_prism["target_ruby_version"] = target_ruby_version
+  end
+
+  top_ruby = nil
+  if include_ruby_oracle || is_diff
+    top_ruby = (fuzz_prov&.dig("ruby_parse_y") || triage_prov&.dig("ruby_parse_y"))&.dup
+    if include_diff_binary && File.file?(diff_bin)
+      top_ruby ||= {}
+      top_ruby["binary"] ||= normalize_repo_path(diff_bin) if File.executable?(diff_bin)
+      top_ruby["build_id"] ||= binary_build_id(diff_bin)
+    end
+    top_ruby = nil if top_ruby && top_ruby.empty?
+  end
+
+  fuzz_out = compact_provenance_entry(fuzz_prov, top_container: top_container)
+  triage_out = compact_provenance_entry(
+    triage_prov,
+    top_container: top_container,
+    include_workspace_git: true,
+    workspace_git: workspace_git,
+    coverage_bin: coverage_bin
+  )
+
+  versions = {}
+  versions["prism"] = top_prism if top_prism && !top_prism.empty?
+  versions["ruby_parse_y"] = top_ruby if top_ruby && !top_ruby.empty?
+  versions["container"] = top_container if top_container && !top_container.empty?
+  versions["fuzz"] = fuzz_out if fuzz_out && !fuzz_out.empty?
+  versions["triage"] = triage_out if triage_out && !triage_out.empty?
+  versions.empty? ? nil : versions
+end
 
 # Locate a fuzz harness source file relative to FUZZ_HARNESS_DIR, this file's
 # directory (when loaded normally rather than via eval), or the repo root cwd.
@@ -1650,7 +1838,7 @@ ensure
   FileUtils.rm_f(tmp_path) if tmp_path && File.exist?(tmp_path)
 end
 
-def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_out:, executable:, crash_output:, minimized_input:, raw_size_bytes:, raw_sha256:, minimized_matches_signature:, occurrences:, coverage: nil, archive: nil, verify_profile: nil)
+def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_out:, executable:, worker_executable: nil, fuzz_versions_override: nil, crash_output:, minimized_input:, raw_size_bytes:, raw_sha256:, minimized_matches_signature:, occurrences:, coverage: nil, archive: nil, verify_profile: nil)
   parsed = parse_crash_output(crash_output)
   io_meta = input_and_options_metadata(
     minimized_input,
@@ -1661,8 +1849,16 @@ def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_
     minimized_matches_signature: minimized_matches_signature,
     executable: executable
   )
+  is_diff = diff_bucket?(executable: executable, crash_output: crash_output)
+  versions_meta = resolve_versions_metadata(
+    executable: executable,
+    worker_executable: worker_executable,
+    is_diff: is_diff,
+    target_ruby_version: io_meta.dig("options", "ruby_version"),
+    fuzz_versions_override: fuzz_versions_override
+  )
 
-  {
+  meta = {
     "schema_version" => META_SCHEMA_VERSION,
     "bucket_id" => bucket_id,
     "reason" => reason,
@@ -1679,12 +1875,25 @@ def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_
     "frames" => parsed["frames"],
     "coverage" => coverage
   }
+  meta["versions"] = versions_meta if versions_meta
+  meta
+end
+
+def companion_executable(executable, name)
+  exe_dir = File.dirname(executable.to_s)
+  if !exe_dir.empty? && exe_dir != "."
+    cand = File.join(exe_dir, name)
+    return cand if File.executable?(cand) && !File.directory?(cand)
+  end
+  "./build/#{name}"
 end
 
 def classify_crash_execution(crash_dir, crash_input, executable)
   reason = File.basename(crash_dir) == "hangs" ? "hang" : "unknown"
   timed_out = false
   Thread.current[:last_testcase_signal] = nil
+  fast_exe = companion_executable(executable, "fuzz")
+  lsan_exe = companion_executable(executable, "fuzz.lsan")
 
   if reason == "hang"
     testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
@@ -1692,18 +1901,18 @@ def classify_crash_execution(crash_dir, crash_input, executable)
   elsif executable.end_with?("ijon", "native")
     # fuzz.ijon and fuzz.native are built without sanitizers (and SAND workers
     # record fuzz.native in cmdline while running fuzz.sand under -w), so try
-    # ./build/fuzz (ASAN/UBSAN) first for sanitizer crashes and assertions so
-    # they deduplicate with main; next try ./build/fuzz.lsan for memory leaks;
+    # fast ASAN/UBSAN binary first for sanitizer crashes and assertions so
+    # they deduplicate with main; next try fuzz.lsan for memory leaks;
     # finally fall back to executable for cumulative allocation limit assertions
     # in PRISM_XALLOCATOR.
-    testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
+    testcase_output, crashed, timed_out = run_testcase(fast_exe, crash_input)
     if crashed
-      executable = "./build/fuzz"
+      executable = fast_exe
     else
       Thread.current[:last_testcase_signal] = nil
-      testcase_output, crashed, timed_out = run_testcase("./build/fuzz.lsan", crash_input)
+      testcase_output, crashed, timed_out = run_testcase(lsan_exe, crash_input)
       if crashed
-        executable = "./build/fuzz.lsan"
+        executable = lsan_exe
       else
         Thread.current[:last_testcase_signal] = nil
         testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
@@ -1715,9 +1924,9 @@ def classify_crash_execution(crash_dir, crash_input, executable)
     # classification, minimization, and deduplication against main/grammar;
     # otherwise fall back to msan/slow/diff for read issues (MSAN), -DSLOW consumer /
     # differential checks, or CRuby parse.y differential invariants / crashes.
-    testcase_output, crashed, timed_out = run_testcase("./build/fuzz", crash_input)
+    testcase_output, crashed, timed_out = run_testcase(fast_exe, crash_input)
     if crashed
-      executable = "./build/fuzz"
+      executable = fast_exe
     else
       Thread.current[:last_testcase_signal] = nil
       testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
@@ -2255,7 +2464,8 @@ def backfill_bucket_meta(bucket_dir)
   )
 end
 
-def finalize_triage_metadata(triage_dir)
+def finalize_triage_metadata(triage_dir, coverage_bin: nil, output_dirs: nil)
+  cov_bin, cov_ids_path = resolve_coverage_target(triage_dir: triage_dir, output_dirs: output_dirs, coverage_bin: coverage_bin)
   bucket_dirs = discover_bucket_dirs(triage_dir)
 
   metas_by_dir = {}
@@ -2279,6 +2489,21 @@ def finalize_triage_metadata(triage_dir)
     elsif meta["occurrences"] != occ_summary
       meta["occurrences"] = occ_summary
       dirty_dirs.add(bucket_dir)
+    end
+    if !meta["versions"].is_a?(Hash) || meta["versions"].empty?
+      is_diff_meta = diff_bucket?(executable: meta["reproduced_by"].to_s, crash_output: meta.dig("symptom", "headline").to_s)
+      repro_name = File.basename(meta["reproduced_by"].to_s)
+      snap_bin_cand = File.join(File.dirname(triage_dir), "bin", repro_name)
+      repro_exec = (!repro_name.empty? && File.file?(snap_bin_cand)) ? snap_bin_cand : meta["reproduced_by"].to_s
+      backfilled_versions = resolve_versions_metadata(
+        executable: repro_exec,
+        is_diff: is_diff_meta,
+        target_ruby_version: meta.dig("options", "ruby_version")
+      )
+      if backfilled_versions
+        meta["versions"] = backfilled_versions
+        dirty_dirs.add(bucket_dir)
+      end
     end
 
     archive_info = sync_bucket_archive(bucket_dir, meta["archive"])
@@ -2305,17 +2530,17 @@ def finalize_triage_metadata(triage_dir)
   end
 
   showmap_path = find_executable_in_path(AFL_SHOWMAP_BIN)
-  cov_disabled_reason = if COVERAGE_BIN.empty?
+  cov_disabled_reason = if cov_bin.empty?
                           "TRIAGE_COVERAGE_BIN is empty"
-                        elsif !File.executable?(COVERAGE_BIN)
-                          "reference binary not found or not executable: #{COVERAGE_BIN}"
+                        elsif !File.executable?(cov_bin)
+                          "reference binary not found or not executable: #{cov_bin}"
                         elsif showmap_path.nil?
                           "afl-showmap not found in PATH"
                         end
 
   ref_binary_meta = {
     "available" => false,
-    "path" => COVERAGE_BIN.empty? ? nil : normalize_repo_path(COVERAGE_BIN),
+    "path" => cov_bin.empty? ? nil : normalize_repo_path(cov_bin),
     "build_id" => nil,
     "ids_path" => nil,
     "ids_available" => false,
@@ -2331,11 +2556,11 @@ def finalize_triage_metadata(triage_dir)
       dirty_dirs.add(dir)
     end
   else
-    build_id = binary_build_id(COVERAGE_BIN)
-    ids_info = load_coverage_ids(COVERAGE_IDS_PATH)
+    build_id = binary_build_id(cov_bin)
+    ids_info = load_coverage_ids(cov_ids_path)
     ref_binary_meta = {
       "available" => true,
-      "path" => normalize_repo_path(COVERAGE_BIN),
+      "path" => normalize_repo_path(cov_bin),
       "build_id" => build_id,
       "ids_path" => ids_info[:path] ? normalize_repo_path(ids_info[:path]) : nil,
       "ids_available" => ids_info[:available],
@@ -2343,7 +2568,7 @@ def finalize_triage_metadata(triage_dir)
     }
 
     corpus_info = load_or_build_corpus_coverage(
-      COVERAGE_BIN,
+      cov_bin,
       build_id,
       ids_info,
       CORPUS_DIR,
@@ -2364,14 +2589,14 @@ def finalize_triage_metadata(triage_dir)
 
     unless stale_inputs.empty?
       puts "Collecting afl-showmap bucket coverage (#{stale_inputs.size} buckets)..."
-      batch = collect_showmap_batch(stale_inputs, COVERAGE_BIN, showmap_path)
+      batch = collect_showmap_batch(stale_inputs, cov_bin, showmap_path)
       if batch[:ok]
         stale_inputs.each_key do |dir|
           edges = batch[:maps][dir]
           metas_by_dir[dir]["coverage"] = if edges
                                             {
                                               "available" => true,
-                                              "binary" => normalize_repo_path(COVERAGE_BIN),
+                                              "binary" => normalize_repo_path(cov_bin),
                                               "build_id" => build_id,
                                               "edge_count" => edges.size,
                                               "edges" => edges
@@ -2379,7 +2604,7 @@ def finalize_triage_metadata(triage_dir)
                                           else
                                             {
                                               "available" => false,
-                                              "binary" => normalize_repo_path(COVERAGE_BIN),
+                                              "binary" => normalize_repo_path(cov_bin),
                                               "build_id" => build_id,
                                               "reason" => "no coverage map produced"
                                             }
@@ -2412,12 +2637,22 @@ def finalize_triage_metadata(triage_dir)
     (b.dig("occurrences", "by_worker") || {}).each { |w, c| by_worker[w] += c }
   end
 
+  versions_meta = resolve_versions_metadata(
+    triage_dir: triage_dir,
+    coverage_bin: cov_bin,
+    include_ruby_oracle: true,
+    include_diff_binary: true,
+    fuzz_buckets: buckets
+  )
   corpus_payload = corpus_info.reject { |k, _| %w[corpus_fingerprint ids_sha256].include?(k) }
   index_data = {
     "schema_version" => META_SCHEMA_VERSION,
     "generated_at" => Time.now.utc.iso8601,
     "triage_dir" => normalize_repo_path(triage_dir),
-    "reference_binary" => ref_binary_meta,
+    "reference_binary" => ref_binary_meta
+  }
+  index_data["versions"] = versions_meta if versions_meta
+  index_data.merge!(
     "corpus" => corpus_payload,
     "summary" => {
       "bucket_count" => buckets.size,
@@ -2426,7 +2661,7 @@ def finalize_triage_metadata(triage_dir)
       "by_worker" => by_worker.sort.to_h
     },
     "buckets" => buckets
-  }
+  )
 
   metadata_path = File.join(triage_dir, "metadata.json")
   write_json_atomic(metadata_path, index_data)
@@ -2440,9 +2675,10 @@ def binary_build_id(bin_path)
   Digest::SHA256.file(bin_path).hexdigest
 end
 
-def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes = Set.new, archived_hashes = Set.new, testcases_dir: TESTCASES_DIR, occurrence_overrides: nil)
+def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_sentinels, pending_occurrences, pending_inputs, recorded_hashes = Set.new, archived_hashes = Set.new, testcases_dir: TESTCASES_DIR, occurrence_overrides: nil, fuzz_versions_overrides: nil)
   raw_crash = File.binread(crash)
   crash_hash = Digest::SHA2.hexdigest(raw_crash)
+  worker_executable = executable
   sentinel = File.join(testcases_dir, ".processed", crash_hash)
 
   recount_only = false
@@ -2618,6 +2854,8 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
         reproducible: !unreproducible,
         timed_out: timed_out,
         executable: executable,
+        worker_executable: worker_executable,
+        fuzz_versions_override: fuzz_versions_overrides&.dig(crash_hash),
         crash_output: effective_output,
         minimized_input: minimized_input,
         raw_size_bytes: occ_record["size_bytes"],
@@ -2669,7 +2907,7 @@ def process_crash(crash_dir, crash, executable, semaphore, in_progress, pending_
   end
 end
 
-def run_triage_pipeline(output_dirs: OUTPUT_DIRS, testcases_dir: TESTCASES_DIR, occurrence_overrides: nil)
+def run_triage_pipeline(output_dirs: OUTPUT_DIRS, testcases_dir: TESTCASES_DIR, occurrence_overrides: nil, fuzz_versions_overrides: nil, coverage_bin: nil)
   FileUtils.mkdir_p(File.join(testcases_dir, ".processed"))
   pool = Concurrent::FixedThreadPool.new(TRIAGE_THREADS)
   semaphore = Mutex.new
@@ -2698,7 +2936,8 @@ def run_triage_pipeline(output_dirs: OUTPUT_DIRS, testcases_dir: TESTCASES_DIR, 
           recorded_hashes,
           archived_hashes,
           testcases_dir: testcases_dir,
-          occurrence_overrides: occurrence_overrides
+          occurrence_overrides: occurrence_overrides,
+          fuzz_versions_overrides: fuzz_versions_overrides
         )
       rescue StandardError => e
         warn "Error processing #{crash}: #{e.class}: #{e.message}\n#{e.backtrace.join("\n")}"
@@ -2707,7 +2946,7 @@ def run_triage_pipeline(output_dirs: OUTPUT_DIRS, testcases_dir: TESTCASES_DIR, 
   end
   pool.shutdown
   pool.wait_for_termination
-  finalize_triage_metadata(testcases_dir)
+  finalize_triage_metadata(testcases_dir, coverage_bin: coverage_bin, output_dirs: output_dirs)
 end
 
 pool = unless ENV["TRIAGE_LIB_ONLY"] == "1"
