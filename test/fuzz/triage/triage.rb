@@ -2152,6 +2152,7 @@ def showmap_env
   SANITIZER_ENV.merge(
     "AFL_NO_IJON" => "1",
     "AFL_CMIN_ALLOW_ANY" => "1",
+    "FUZZ_DIFF_BACKTRACE" => "0",
     "ASAN_OPTIONS" => "abort_on_error=1:handle_abort=1:symbolize=0:detect_leaks=0:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}",
     "UBSAN_OPTIONS" => "abort_on_error=1:symbolize=0",
     "MSAN_OPTIONS" => "abort_on_error=1:handle_abort=1:symbolize=0:max_allocation_size_mb=#{MAX_ALLOCATED_MB}:hard_rss_limit_mb=#{HARD_RSS_LIMIT_MB}"

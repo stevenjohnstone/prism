@@ -216,7 +216,7 @@ fuzz-run: fuzz-docker-build fuzz-gen-templates
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_FLAGS="$(FUZZ_USER_FLAGS)" -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -v $(CURDIR):/prism prism/fuzz make fuzz-build
 	$(ECHO) "starting AFL++ run"
 	$(Q) $(MAKEDIRS) $(FUZZ_AFL_DIR) $(FUZZ_BIN_DIR)
-	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -v $(CURDIR):/prism prism/fuzz /bin/bash -c "exec ./test/fuzz/runtime/run.sh"
+	$(Q) docker run $(FUZZ_RUN_DOCKER_FLAGS) --init --rm $(FUZZ_TMPFS_FLAGS) -e FUZZ_WORKERS -e FUZZ_DIFF_BACKTRACE -e FUZZ_MAX_INPUT_SIZE=$(FUZZ_MAX_INPUT_SIZE) -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -e FUZZ_IMAGE_ID="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)" -v $(CURDIR):/prism prism/fuzz /bin/bash -c "exec ./test/fuzz/runtime/run.sh"
 ifneq ($(FUZZ_DAEMON),)
 	$(ECHO) "Fuzzer daemon started in container '$(FUZZ_CONTAINER_NAME)'."
 	$(ECHO) "Attach to tmux with: make fuzz-attach (or: docker exec -it $(FUZZ_CONTAINER_NAME) tmux -2 attach-session -t fuzzer)"

@@ -4731,6 +4731,7 @@ static void diff_compare_asts(diff_summary_t *prism, diff_summary_t *cruby) {
 /* TRIAGE_SLICE_END(diff_ast) */
 
 static int diff_oracle_initialized = 0;
+static volatile sig_atomic_t diff_print_backtrace_enabled = 1;
 
 static const int diff_crash_signals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGTRAP, SIGPIPE };
 static const int diff_fatal_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE };
@@ -4761,8 +4762,10 @@ static void diff_fatal_signal_handler(int sig) {
         default:      break;
     }
     diff_write_stderr_str(msg, strlen(msg));
-    rb_print_backtrace(stderr);
-    fflush(stderr);
+    if (diff_print_backtrace_enabled) {
+        rb_print_backtrace(stderr);
+        fflush(stderr);
+    }
     sigset_t unblock;
     sigemptyset(&unblock);
     sigaddset(&unblock, sig);
@@ -4799,6 +4802,9 @@ static void diff_oracle_init(void) {
     if (diff_oracle_initialized) {
         return;
     }
+
+    const char *bt_env = getenv("FUZZ_DIFF_BACKTRACE");
+    diff_print_backtrace_enabled = (bt_env != NULL && strcmp(bt_env, "0") == 0) ? 0 : 1;
 
     struct sigaction saved[DIFF_CRASH_SIGNAL_COUNT];
     diff_snapshot_signals(saved);

@@ -32,6 +32,8 @@ FUZZ_HARD_RSS_LIMIT=$(( FUZZ_MAX_ALLOCATED * 16 ))
 FUZZ_ASAN_OPTIONS="abort_on_error=1:handle_abort=1:detect_leaks=0:quarantine_size_mb=16:malloc_context_size=0:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
 FUZZ_UBSAN_OPTIONS="abort_on_error=1:symbolize=0"
 FUZZ_MSAN_OPTIONS="exit_code=86:abort_on_error=1:max_allocation_size_mb=${FUZZ_MAX_ALLOCATED}:hard_rss_limit_mb=${FUZZ_HARD_RSS_LIMIT}:symbolize=0"
+# Skip expensive CRuby ELF/DWARF rb_print_backtrace() in afl-fuzz workers by default (stderr is discarded anyway).
+FUZZ_DIFF_BACKTRACE=${FUZZ_DIFF_BACKTRACE:-0}
 
 cleanup() {
     trap '' TERM INT
@@ -118,7 +120,7 @@ prepare_diff_seeds() {
       threads = [Etc.nprocessors, 1].max.times.map do
         Thread.new do
           while (f = queue.pop(true) rescue nil)
-            if system(diff_bin, f, [:out, :err] => File::NULL)
+            if system({ "FUZZ_DIFF_BACKTRACE" => "0" }, diff_bin, f, [:out, :err] => File::NULL)
               FileUtils.cp(f, File.join(seed_dir, File.basename(f)))
             end
           end
@@ -133,7 +135,7 @@ add_diff_worker() {
     local extra_env=$2
     local afl_opts=$3
     prepare_diff_seeds "$name"
-    add_worker "$name" "${extra_env}afl-fuzz -t 250+ -m none -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- $BIN_DIR/fuzz.diff"
+    add_worker "$name" "FUZZ_DIFF_BACKTRACE=${FUZZ_DIFF_BACKTRACE} ${extra_env}afl-fuzz -t 250+ -m none -x $DICT_FILE -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name $afl_opts -- $BIN_DIR/fuzz.diff"
 }
 
 prepare_seed_shard() {

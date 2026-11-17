@@ -3104,8 +3104,23 @@ C
 require "json"
 rep = JSON.parse(File.read(ARGV.fetch(0)))
 f = rep.dig("failures", 0)
-unless f && f["signal"] == 11 && f["output"].to_s.start_with?("CRASH[diff_parse_y]: signal=SIGSEGV (11)")
-  raise "expected signaled SIGSEGV CRASH[diff_parse_y] failure, got: #{rep.inspect}"
+unless f && f["signal"] == 11 && f["output"].to_s.start_with?("CRASH[diff_parse_y]: signal=SIGSEGV (11)") && f["output"].to_s.include?("ruby_yyparse")
+  raise "expected signaled SIGSEGV CRASH[diff_parse_y] failure with backtrace, got: #{rep.inspect}"
+end
+EOF
+
+  set +e
+  FUZZ_DIFF_BACKTRACE=0 VERIFY_BUILD_DIR="$WORKDIR/diff_verify_build" ./test/fuzz/triage/verify_bucket.sh \
+    --repo-root "$PWD" --fuzz-root "$PWD" --bucket-dir "$diff_bucket" --json > "$WORKDIR/diff_segv_nobt_fail.json"
+  diff_segv_nobt_rc=$?
+  set -e
+  [ "$diff_segv_nobt_rc" -eq 1 ] || fail "expected verify_bucket.sh diff_parse_y FUZZ_DIFF_BACKTRACE=0 SEGV FAIL exit 1, got $diff_segv_nobt_rc"
+  ruby - "$WORKDIR/diff_segv_nobt_fail.json" << 'EOF'
+require "json"
+rep = JSON.parse(File.read(ARGV.fetch(0)))
+f = rep.dig("failures", 0)
+unless f && f["signal"] == 11 && f["output"].to_s.strip == "CRASH[diff_parse_y]: signal=SIGSEGV (11)"
+  raise "expected FUZZ_DIFF_BACKTRACE=0 to omit CRuby backtrace, got: #{rep.inspect}"
 end
 EOF
   printf '\0\0\003\001%s' "1 + 2" > "$diff_bucket/input.min"
@@ -3203,6 +3218,7 @@ end
 
 vmeta = resolve_versions_metadata(executable: "fuzz.diff", is_diff: true, target_ruby_version: "4.1")
 raise "expected prism + ruby_parse_y metadata for diff oracle, got: #{vmeta.inspect}" unless vmeta && vmeta.dig("prism", "version") && vmeta.dig("ruby_parse_y", "version") && vmeta.dig("ruby_parse_y", "revision")
+raise "expected showmap_env to set FUZZ_DIFF_BACKTRACE=0" unless showmap_env["FUZZ_DIFF_BACKTRACE"] == "0"
 EOF
 
   echo "  differential diff_parse_y verify_bucket.sh and standalone reproducer checks passed"
