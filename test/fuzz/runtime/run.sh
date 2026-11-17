@@ -64,8 +64,8 @@ mkdir -p "$AFL_DIR"
 # Trap SIGINT (Ctrl+C) and SIGTERM (docker stop)
 trap cleanup TERM INT EXIT
 
-SCHEDULES=("explore" "fast" "coe" "lin" "quad" "exploit" "rare" "mmopt")
-INPUT_FORMATS=("" "-a text" "-a binary")
+DIFF_SCHEDULES=("fast" "coe" "lin" "quad" "exploit" "rare" "mmopt" "explore")
+DIFF_FORMATS=("" "-a text")
 MUTATION_STRATEGIES=("-P explore" "" "-P exploit" "-P explore" "")
 WORKER_NAMES=()
 WORKER_CMDS=()
@@ -73,12 +73,12 @@ WORKER_CMDS=()
 shopt -s nullglob
 CORPUS_FILES=("$CORPUS_DIR"/*)
 shopt -u nullglob
-if [ "$FUZZ_WORKERS" -ge 8 ]; then
-    NUM_SHARDS=$(( FUZZ_WORKERS - 4 ))
-elif [ "$FUZZ_WORKERS" -ge 6 ]; then
-    NUM_SHARDS=$(( FUZZ_WORKERS - 3 ))
-elif [ "$FUZZ_WORKERS" -gt 2 ]; then
-    NUM_SHARDS=$(( FUZZ_WORKERS - 2 ))
+if [ "$FUZZ_WORKERS" -ge 7 ]; then
+    NUM_SHARDS=4
+elif [ "$FUZZ_WORKERS" -ge 5 ]; then
+    NUM_SHARDS=3
+elif [ "$FUZZ_WORKERS" -eq 4 ]; then
+    NUM_SHARDS=2
 else
     NUM_SHARDS=1
 fi
@@ -196,8 +196,7 @@ if [ -d "${AFL_DIR}-diff/diff" ] && [ ! -d "$AFL_DIR/diff" ]; then
     rmdir "${AFL_DIR}-diff" 2>/dev/null || true
 fi
 
-main_extra_idx=0
-next_shard=3
+diff_extra_idx=0
 
 for (( i = 0; i < FUZZ_WORKERS; i++ )); do
     case $i in
@@ -222,29 +221,35 @@ for (( i = 0; i < FUZZ_WORKERS; i++ )); do
         5)
             add_diff_worker "diff" "" "-p explore"
             ;;
-        7)
-            add_diff_worker "diff-2" "AFL_DISABLE_TRIM=1 " "-p fast -L 0"
+        6)
+            prepare_seed_shard "main-2" 3
+            add_worker "main-2" "AFL_DISABLE_TRIM=1 AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/main-2/seeds -o $AFL_DIR -S main-2 -p explore -P explore -L 0 -w ./build/fuzz.sand -- ./build/fuzz.native"
             ;;
         *)
-            idx=$main_extra_idx
-            name="main-$(( main_extra_idx + 2 ))"
-            prepare_seed_shard "$name" "$next_shard"
-            main_extra_idx=$(( main_extra_idx + 1 ))
-            next_shard=$(( next_shard + 1 ))
-            sched=${SCHEDULES[$(( idx % ${#SCHEDULES[@]} ))]}
-            fmt=${INPUT_FORMATS[$(( idx % ${#INPUT_FORMATS[@]} ))]}
-            strat=${MUTATION_STRATEGIES[$(( idx % ${#MUTATION_STRATEGIES[@]} ))]}
-            extra_flags="$fmt $strat"
+            idx=$diff_extra_idx
+            name="diff-$(( diff_extra_idx + 2 ))"
+            diff_extra_idx=$(( diff_extra_idx + 1 ))
+            sched=${DIFF_SCHEDULES[$(( idx % ${#DIFF_SCHEDULES[@]} ))]}
+            fmt=${DIFF_FORMATS[$(( idx % ${#DIFF_FORMATS[@]} ))]}
+            afl_opts="-p $sched"
+            if [ -n "$fmt" ]; then
+                afl_opts="$afl_opts $fmt"
+            fi
             if [ "$idx" -eq 0 ]; then
-                extra_flags="$extra_flags -L 0"
+                afl_opts="$afl_opts -L 0"
             elif [ "$idx" -eq 1 ]; then
-                extra_flags="$extra_flags -Z"
+                afl_opts="$afl_opts -Z"
+            else
+                strat=${MUTATION_STRATEGIES[$(( idx % ${#MUTATION_STRATEGIES[@]} ))]}
+                if [ -n "$strat" ]; then
+                    afl_opts="$afl_opts $strat"
+                fi
             fi
             extra_env=""
             if [ $(( idx % 2 )) -eq 0 ]; then
                 extra_env="AFL_DISABLE_TRIM=1 "
             fi
-            add_worker "$name" "${extra_env}AFL_SAN_ABSTRACTION=coverage_increase AFL_CRASH_EXITCODE=23 ASAN_OPTIONS=$FUZZ_ASAN_OPTIONS UBSAN_OPTIONS=$FUZZ_UBSAN_OPTIONS afl-fuzz -t 250+ -m none -x ./test/fuzz/dict -G $MAX_INPUT_SIZE -i /tmp/afl-tmpdir/$name/seeds -o $AFL_DIR -S $name -p $sched $extra_flags -w ./build/fuzz.sand -- ./build/fuzz.native"
+            add_diff_worker "$name" "$extra_env" "$afl_opts"
             ;;
     esac
 done
