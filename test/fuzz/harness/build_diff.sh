@@ -148,17 +148,88 @@ if [ "$MODE" = "fuzz" ]; then
   ORACLE_MODE="fuzz"
 fi
 
-# Turn __builtin_unreachable() / UNREACHABLE_RETURN(...) in CRuby parse.c into
-# a deterministic trap instead of UB fallthrough across persistent/cold runs.
-PARSE_UNREACHABLE_FLAGS=()
-probe_obj="$ORACLE_DIR/.unreachable-probe.$$.o"
-rm -f "$probe_obj"
-if "${PARSE_CC[@]}" -x c -fsanitize=unreachable -fsanitize-trap=unreachable -c /dev/null -o "$probe_obj" >/dev/null 2>&1; then
-  PARSE_UNREACHABLE_FLAGS=(-fsanitize=unreachable -fsanitize-trap=unreachable)
-elif "${PARSE_CC[@]}" -x c -fsanitize=unreachable -fsanitize-undefined-trap-on-error -c /dev/null -o "$probe_obj" >/dev/null 2>&1; then
-  PARSE_UNREACHABLE_FLAGS=(-fsanitize=unreachable -fsanitize-undefined-trap-on-error)
+# Probe hardening and trapping UBSan flags supported by the active C compiler.
+# Trapping UBSan avoids libubsan linkage against uninstrumented libruby-static.a,
+# emits inline trap instructions already stripped by aflplusplus.patch, and uses
+# per-check -fsanitize-trap=<checks> so caller --cflag sanitizers don't collide.
+probe_cc_supports() {
+  local probe_obj="$ORACLE_DIR/.flag-probe.$$.o"
+  rm -f "$probe_obj"
+  if printf '#include <string.h>\nint diff_flag_probe(void) { return 0; }\n' \
+      | "${PARSE_CC[@]}" -x c -O2 "$@" -Werror -c - -o "$probe_obj" >/dev/null 2>&1; then
+    rm -f "$probe_obj"
+    return 0
+  fi
+  rm -f "$probe_obj"
+  return 1
+}
+
+HAS_EXPLICIT_O0=0
+for flag in "${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"}"; do
+  if [ "$flag" = "-O0" ]; then
+    HAS_EXPLICIT_O0=1
+    break
+  fi
+done
+
+HARDEN_CFLAGS=()
+if probe_cc_supports -fstack-protector-strong; then
+  HARDEN_CFLAGS+=(-fstack-protector-strong)
 fi
-rm -f "$probe_obj"
+if [ "$HAS_EXPLICIT_O0" -eq 0 ]; then
+  if probe_cc_supports -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3; then
+    HARDEN_CFLAGS+=(-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3)
+  elif probe_cc_supports -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2; then
+    HARDEN_CFLAGS+=(-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+  fi
+fi
+if probe_cc_supports -ftrivial-auto-var-init=pattern; then
+  HARDEN_CFLAGS+=(-ftrivial-auto-var-init=pattern)
+fi
+
+UBS_TRAP_STYLE=""
+if probe_cc_supports -fsanitize=unreachable -fsanitize-trap=unreachable; then
+  UBS_TRAP_STYLE="per-check"
+elif probe_cc_supports -fsanitize=unreachable -fsanitize-undefined-trap-on-error; then
+  UBS_TRAP_STYLE="gcc-all"
+fi
+
+probe_trap_ubsan_flags() {
+  [ -n "$UBS_TRAP_STYLE" ] || return 0
+
+  local enabled=()
+  local check
+  for check in "$@"; do
+    if [ "$UBS_TRAP_STYLE" = "per-check" ]; then
+      if probe_cc_supports "-fsanitize=$check" "-fsanitize-trap=$check"; then
+        enabled+=("$check")
+      fi
+    else
+      if probe_cc_supports "-fsanitize=$check" -fsanitize-undefined-trap-on-error; then
+        enabled+=("$check")
+      fi
+    fi
+  done
+
+  if [ "${#enabled[@]}" -gt 0 ]; then
+    local joined
+    joined="$(IFS=,; printf '%s' "${enabled[*]}")"
+    if [ "$UBS_TRAP_STYLE" = "per-check" ]; then
+      printf '%s\n' "-fsanitize=$joined" "-fsanitize-trap=$joined"
+    else
+      printf '%s\n' "-fsanitize=$joined" "-fsanitize-undefined-trap-on-error"
+    fi
+  fi
+}
+
+# CRuby parse.c builds with -fno-strict-overflow and triggers expected NULL
+# dereference SEGVs tracked in triage tests, so omit signed-integer-overflow and null.
+mapfile -t PARSE_HARDEN_FLAGS < <(probe_trap_ubsan_flags \
+  unreachable bounds local-bounds object-size return shift-exponent vla-bound)
+PARSE_HARDEN_FLAGS+=("${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"}")
+
+mapfile -t HARNESS_SAN_FLAGS < <(probe_trap_ubsan_flags \
+  unreachable bounds local-bounds object-size null return shift-exponent shift-base signed-integer-overflow pointer-overflow vla-bound)
 
 ORACLE_STAMP_FILE="$ORACLE_DIR/.oracle.stamp"
 ORACLE_ARCHIVE="$ORACLE_DIR/libcruby_oracle.a"
@@ -176,7 +247,7 @@ oracle_fp="$(ruby -rdigest -e '
     end
   end
   puts d.hexdigest
-' "$ORACLE_MODE" "$RUBY_PARSE_FLAGS ${PARSE_UNREACHABLE_FLAGS[*]+"${PARSE_UNREACHABLE_FLAGS[*]}"}" "$RUBY_DIR/libruby-static.a" "$RUBY_DIR/parse.c" "$ORACLE_DEP")"
+' "$ORACLE_MODE" "$RUBY_PARSE_FLAGS ${PARSE_HARDEN_FLAGS[*]+"${PARSE_HARDEN_FLAGS[*]}"}" "$RUBY_DIR/libruby-static.a" "$RUBY_DIR/parse.c" "$ORACLE_DEP")"
 
 if [ ! -f "$ORACLE_ARCHIVE" ] || [ ! -f "$ORACLE_STAMP_FILE" ] || [ "$(cat "$ORACLE_STAMP_FILE" 2>/dev/null)" != "$oracle_fp" ]; then
   tmp_parse_o="$ORACLE_DIR/parse.o.tmp.$$"
@@ -184,10 +255,12 @@ if [ ! -f "$ORACLE_ARCHIVE" ] || [ ! -f "$ORACLE_STAMP_FILE" ] || [ "$(cat "$ORA
   tmp_archive="$ORACLE_ARCHIVE.tmp.$$"
   rm -f "$tmp_parse_o" "$tmp_sym_map" "$tmp_archive"
 
+  # Put PARSE_HARDEN_FLAGS after PARSE_CPP_FLAGS so -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
+  # cleanly overrides any inherited CRuby Makefile macro definitions without warnings.
   "${PARSE_CC[@]}" \
     -O3 -ggdb3 -fno-strict-overflow -fvisibility=hidden -fPIE -w \
-    ${PARSE_UNREACHABLE_FLAGS[@]+"${PARSE_UNREACHABLE_FLAGS[@]}"} \
     "${PARSE_CPP_FLAGS[@]}" \
+    ${PARSE_HARDEN_FLAGS[@]+"${PARSE_HARDEN_FLAGS[@]}"} \
     -c "$RUBY_DIR/parse.c" -o "$tmp_parse_o"
 
   cp "$RUBY_DIR/libruby-static.a" "$tmp_archive"
@@ -261,6 +334,8 @@ if [ "$MODE" = "fuzz" ]; then
     -DPRISM_EXCLUDE_SERIALIZATION -DPRISM_EXCLUDE_JSON -DPRISM_EXCLUDE_PRETTYPRINT
     -DPM_INTEGER_DIVIDE_THRESHOLD=8
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE"
+    ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"}
+    ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"}
     ${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"}
   )
   compile_prism_objs "$ORACLE_DIR/prism_objs" 1
@@ -268,6 +343,8 @@ if [ "$MODE" = "fuzz" ]; then
   DIFF_OBJ="$ORACLE_DIR/diff.o"
   "${PRISM_CC[@]}" \
     -g -gdwarf-4 -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fPIE \
+    ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"} \
+    ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"} \
     "-I$PRISM_ROOT/include" \
     "${RUBY_EMBED_INC[@]}" \
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE" \
@@ -291,6 +368,8 @@ elif [ "$MODE" = "verify" ] || [ "$MODE" = "testcase" ]; then
     "-I$PRISM_ROOT/include"
     -DPM_INTEGER_DIVIDE_THRESHOLD=8
     "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE"
+    ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"}
+    ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"}
     ${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"}
   )
   if [ "$MODE" = "testcase" ]; then
@@ -300,6 +379,8 @@ elif [ "$MODE" = "verify" ] || [ "$MODE" = "testcase" ]; then
     "$CC_BIN" \
       -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=gnu99 \
       -Wall -Wextra -Wno-unused-parameter -fPIE \
+      ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"} \
+      ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"} \
       "-I$PRISM_ROOT/include" \
       "${RUBY_EMBED_INC[@]}" \
       ${EXTRA_CFLAGS[@]+"${EXTRA_CFLAGS[@]}"} \
@@ -321,6 +402,8 @@ elif [ "$MODE" = "verify" ] || [ "$MODE" = "testcase" ]; then
     "$CC_BIN" \
       -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=gnu99 \
       -Wall -Wextra -Wno-unused-parameter -fPIE -DPRISM_DIFF_NO_MAIN \
+      ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"} \
+      ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"} \
       "-I$PRISM_ROOT/include" \
       "${RUBY_EMBED_INC[@]}" \
       "-DFUZZ_MAX_INPUT_SIZE=$MAX_INPUT_SIZE" \
@@ -330,6 +413,8 @@ elif [ "$MODE" = "verify" ] || [ "$MODE" = "testcase" ]; then
     "$CC_BIN" \
       -O1 -fno-omit-frame-pointer -ggdb3 -gdwarf-4 -std=gnu99 \
       -Wall -Wextra -Wno-unused-parameter -fPIE \
+      ${HARDEN_CFLAGS[@]+"${HARDEN_CFLAGS[@]}"} \
+      ${HARNESS_SAN_FLAGS[@]+"${HARNESS_SAN_FLAGS[@]}"} \
       -c "$FUZZ_ROOT/test/fuzz/triage/verify_runner.c" -o "$RUNNER_OBJ"
 
     tmp_out="$OUTPUT.tmp.$$"
