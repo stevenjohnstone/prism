@@ -1789,6 +1789,81 @@ cli_json = JSON.parse(File.read(out_path))
 raise "expected --diff-threshold 0.30 recorded in algorithm JSON" unless (cli_json.dig("algorithm", "diff_threshold") - 0.30).abs < 1e-6
 stdout_json = JSON.parse(`ruby ./test/fuzz/triage/cluster.rb --metadata #{meta_path} --output - --quiet`)
 raise "cluster.rb stdout JSON mismatch" unless stdout_json["clusters"] == cli_json["clusters"]
+
+# Exercise encode_fuzz_header round-trip and FuzzClustering.place_probe
+ENV["TRIAGE_LIB_ONLY"] = "1"
+load File.expand_path("test/fuzz/triage/triage.rb")
+
+default_hdr = encode_fuzz_header
+raise "expected default header \\x00\\x00\\x03\\x01" unless default_hdr == "\x00\x00\x03\x01".b
+dec_def = decode_fuzz_header(default_hdr + "1+1")
+unless dec_def[:version] == "4.1" && dec_def[:start_line] == 1 && dec_def[:encoding].nil?
+  raise "unexpected default decode_fuzz_header: #{dec_def.inspect}"
+end
+
+custom_hdr = encode_fuzz_header(
+  ruby_version: "3.4",
+  encoding: "UTF-8",
+  frozen_string_literal: true,
+  partial_script: true,
+  stream_mode: true,
+  command_line: "xa",
+  scopes_count: 2,
+  forwarding: "pb"
+)
+dec_custom = decode_fuzz_header(custom_hdr + "x")
+unless dec_custom[:version] == "3.4" &&
+       dec_custom[:encoding] == "UTF-8" &&
+       dec_custom[:has_frozen_string_literal] == true &&
+       dec_custom[:frozen_string_literal] == true &&
+       dec_custom[:partial_script] == true &&
+       dec_custom[:stream_mode] == true &&
+       dec_custom[:command_line_chars] == %w[a x] &&
+       dec_custom[:scopes_count] == 2 &&
+       dec_custom[:forwarding_chars] == %w[p b]
+  raise "header round-trip mismatch: #{dec_custom.inspect}"
+end
+
+probe_ctx = FuzzClustering.prepare_placement_context(metadata, report: cli_json, metadata_path: meta_path)
+target_prism_cluster = cli_json["clusters"].find { |c| c["group"] == "prism_flaw" && c["bucket_count"] >= 2 } || cli_json["clusters"].first
+target_prism_bid = target_prism_cluster.dig("representative", "bucket_id")
+target_prism_bucket = metadata["buckets"].find { |b| b["bucket_id"] == target_prism_bid }
+prism_probe = target_prism_bucket.merge("bucket_id" => "probe:prism")
+prism_place = FuzzClustering.place_probe(metadata, prism_probe, placement_ctx: probe_ctx)
+unless prism_place["status"] == "matched" && prism_place.dig("best_cluster", "cluster_id") == target_prism_cluster["cluster_id"]
+  raise "expected prism_flaw probe to match #{target_prism_cluster['cluster_id']}: #{prism_place.inspect}"
+end
+
+dual_meta = {
+  "schema_version" => 1,
+  "corpus" => corpus,
+  "diff_corpus" => diff_dual_corpus,
+  "buckets" => [prism_flaw_b, dual_buckets[1], dual_buckets[3]]
+}
+dual_ctx = FuzzClustering.prepare_placement_context(dual_meta)
+dual_probe = dual_buckets[1].merge("bucket_id" => "probe:dual")
+dual_place = FuzzClustering.place_probe(dual_meta, dual_probe, placement_ctx: dual_ctx)
+expected_dual_cid = dual_ctx[:report]["clusters"].find { |c| c["buckets"].any? { |b| b["bucket_id"] == dual_buckets[1]["bucket_id"] } }&.dig("cluster_id")
+unless dual_place["status"] == "matched" &&
+       dual_place.dig("best_cluster", "cluster_id") == expected_dual_cid &&
+       dual_place["candidates"].all? { |c| c["group"] == "diff_parse_y" }
+  raise "expected dual diff_parse_y probe to match #{expected_dual_cid} within diff_parse_y oracle: #{dual_place.inspect}"
+end
+
+unmatched_diff_probe = dual_buckets[1].merge(
+  "bucket_id" => "probe:novel_diff",
+  "symptom" => {
+    "headline" => "INVARIANT[diff_parse_y]: diagnostics_mismatch ...",
+    "invariant" => { "namespace" => "diff_parse_y", "fields" => { "mismatch" => "diagnostics_mismatch" }, "detail" => {} }
+  },
+  "frames" => [],
+  "coverage" => { "available" => false },
+  "diff_coverage" => { "available" => true, "edges" => { "99999" => 1 } }
+)
+unmatched_place = FuzzClustering.place_probe(dual_meta, unmatched_diff_probe, placement_ctx: dual_ctx)
+unless unmatched_place["status"] == "unmatched" && unmatched_place["matched_clusters"].empty? && !unmatched_place["candidates"].empty?
+  raise "expected novel diff probe to remain unmatched with candidate list: #{unmatched_place.inspect}"
+end
 EOF
 
 # Exercise verify.rb cluster-based verification workflows (--cluster, --by-cluster, --list-clusters, stale auto-refresh)
@@ -2204,6 +2279,244 @@ raise "expected 0 buckets remaining" unless idx.dig("summary", "bucket_count") =
 raise "expected 0 clusters remaining" unless cl.dig("summary", "cluster_count") == 0
 EOF
 echo "  retriage.rb (--dry-run, scoped cluster survivor split, occurrence provenance, #skip sentinels, and full PASS cleanup) checks passed"
+
+# Exercise match.rb snippet/file/stdin probing, fuzz.diff -> fuzz promotion, --all-fuzzers, --expect-cluster, and JSON reporting
+match_suite="$WORKDIR/match_suite"
+mkdir -p "$match_suite/bin" "$match_suite/triage" "$match_suite/inputs"
+
+cat > "$match_suite/bin/fuzz.diff" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$1" << 'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+hdr, body = data[:4], data[4:]
+text = body.decode("utf-8", "replace").strip()
+if "diff_known" in text:
+    assert hdr == b"\x00\x00\x03\x01", f"unexpected header: {hdr!r}"
+    sys.stderr.write("INVARIANT[diff_parse_y]: ast_mismatch ...\n    #0 0x100 in parse_expression src/parser.c:100\n")
+    sys.exit(6)
+if "diff_custom_hdr" in text:
+    assert hdr != b"\x00\x00\x03\x01", "expected custom header"
+    sys.stderr.write("INVARIANT[diff_parse_y]: ast_mismatch ...\n    #0 0x100 in parse_expression src/parser.c:100\n")
+    sys.exit(6)
+if "diff_new" in text:
+    sys.stderr.write("INVARIANT[diff_parse_y]: diagnostics_mismatch ...\n    #0 0x200 in pm_novel_diag_bug src/parser.c:999\n")
+    sys.exit(6)
+if "prism_via_diff" in text:
+    sys.stderr.write("CRASH[diff_parse_y]: signal=SIGSEGV\n    #0 0x300 in sigsegv parse_y_shim.c:1\n")
+    sys.exit(139)
+if "cruby_only" in text:
+    sys.stderr.write("CRASH[diff_parse_y]: signal=SIGSEGV\n    #0 0x400 in rb_parse_y_crash parse.y:12\n")
+    sys.exit(139)
+sys.exit(0)
+PY
+EOF
+
+cat > "$match_suite/bin/fuzz" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$1" << 'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+text = data[4:].decode("utf-8", "replace")
+if "prism_via_diff" in text:
+    sys.stderr.write("=================================================================\n")
+    sys.stderr.write("SUMMARY: AddressSanitizer: SEGV on unknown address 0x0000\n")
+    sys.stderr.write("    #0 0x500 in pm_prism_crash_fn src/prism.c:50\n")
+    sys.exit(1)
+sys.exit(0)
+PY
+EOF
+
+cat > "$match_suite/bin/fuzz.msan" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$1" << 'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+text = data[4:].decode("utf-8", "replace")
+if "msan_only" in text or "prism_via_diff" in text:
+    sys.stderr.write("SUMMARY: MemorySanitizer: use-of-uninitialized-value\n")
+    sys.stderr.write("    #0 0x600 in pm_msan_helper src/prism.c:77\n")
+    sys.exit(86)
+sys.exit(0)
+PY
+EOF
+chmod +x "$match_suite/bin/fuzz.diff" "$match_suite/bin/fuzz" "$match_suite/bin/fuzz.msan"
+
+ruby - "$match_suite" << 'EOF'
+require "json"
+
+suite = ARGV.fetch(0)
+triage = File.join(suite, "triage")
+
+metadata = {
+  "schema_version" => 1,
+  "corpus" => { "available" => false, "corpus_count" => 0, "edge_df" => {}, "edge_functions" => {} },
+  "diff_corpus" => { "available" => false, "corpus_count" => 0, "edge_df" => {}, "edge_functions" => {} },
+  "buckets" => [
+    {
+      "schema_version" => 1,
+      "bucket_id" => "ABRT/diff_ast_seed",
+      "reason" => "ABRT",
+      "signature" => "diffseed0001",
+      "reproducible" => true,
+      "reproduced_by" => "bin/fuzz.diff",
+      "verify_profile" => "diff_parse_y",
+      "occurrences" => { "count" => 5 },
+      "symptom" => {
+        "headline" => "INVARIANT[diff_parse_y]: ast_mismatch ...",
+        "invariant" => { "namespace" => "diff_parse_y", "fields" => { "mismatch" => "ast_mismatch" }, "detail" => {} }
+      },
+      "frames" => [{ "depth" => 0, "scope" => "prism", "func" => "parse_expression", "file" => "src/parser.c", "line" => 100 }],
+      "coverage" => { "available" => false },
+      "diff_coverage" => { "available" => false }
+    },
+    {
+      "schema_version" => 1,
+      "bucket_id" => "SEGV/prism_seed",
+      "reason" => "SEGV",
+      "signature" => "prismseed001",
+      "reproducible" => true,
+      "reproduced_by" => "bin/fuzz",
+      "verify_profile" => "asan_ubsan",
+      "occurrences" => { "count" => 3 },
+      "symptom" => { "headline" => "SUMMARY: AddressSanitizer: SEGV on unknown address 0x0000" },
+      "frames" => [{ "depth" => 0, "scope" => "prism", "func" => "pm_prism_crash_fn", "file" => "src/prism.c", "line" => 50 }],
+      "coverage" => { "available" => false }
+    },
+    {
+      "schema_version" => 1,
+      "bucket_id" => "SEGV/cruby_seed",
+      "reason" => "SEGV",
+      "signature" => "crubyseed001",
+      "reproducible" => true,
+      "reproduced_by" => "bin/fuzz.diff",
+      "verify_profile" => "diff_parse_y",
+      "occurrences" => { "count" => 2 },
+      "symptom" => { "headline" => "CRASH[diff_parse_y]: signal=SIGSEGV" },
+      "frames" => [{ "depth" => 0, "scope" => "external", "func" => "rb_parse_y_crash", "file" => "parse.y", "line" => 12 }],
+      "coverage" => { "available" => false }
+    },
+    {
+      "schema_version" => 1,
+      "bucket_id" => "use-of-uninitialized-value/msan_seed",
+      "reason" => "use-of-uninitialized-value",
+      "signature" => "msanseed0001",
+      "reproducible" => true,
+      "reproduced_by" => "bin/fuzz.msan",
+      "verify_profile" => "msan_slow",
+      "occurrences" => { "count" => 1 },
+      "symptom" => { "headline" => "SUMMARY: MemorySanitizer: use-of-uninitialized-value" },
+      "frames" => [{ "depth" => 0, "scope" => "prism", "func" => "pm_msan_helper", "file" => "src/prism.c", "line" => 77 }],
+      "coverage" => { "available" => false }
+    }
+  ]
+}
+File.write(File.join(triage, "metadata.json"), JSON.pretty_generate(metadata))
+EOF
+
+File_diff="$match_suite/inputs/repro.rb"
+File_clean="$match_suite/inputs/clean.rb"
+File_raw="$match_suite/inputs/input.min"
+printf 'diff_known\n' > "$File_diff"
+printf '1 + 2\n' > "$File_clean"
+printf '\x00\x00\x03\x01msan_only\n' > "$File_raw"
+
+# 1) Inline snippet matching diff_parse_y cluster + auto-computed clusters.json
+match_out1=$(TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --json -e "diff_known")
+ruby -rjson -e '
+r = JSON.parse(STDIN.read)
+raise "expected computed-in-memory" unless r["clusters_source"] == "computed-in-memory"
+res = r["results"][0]
+raise "expected header 00000301" unless res.dig("header", "hex") == "00000301"
+raise "expected matched status" unless res["status"] == "matched" && res["suspected_duplicate"] == true
+f = res["findings"][0]
+raise "expected fuzz.diff finding" unless f["name"] == "fuzz.diff"
+raise "expected ABRT/diff_ast_seed cluster" unless f.dig("placement", "best_cluster", "representative", "bucket_id") == "ABRT/diff_ast_seed"
+' <<< "$match_out1"
+
+# 2) Promotion: fuzz.diff CRASH[diff_parse_y] -> fuzz (prism_flaw) vs cruby_only staying on fuzz.diff (cruby_crashes)
+match_out2=$(TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --json -e "prism_via_diff" -e "cruby_only")
+ruby -rjson -e '
+r = JSON.parse(STDIN.read)
+p_res, c_res = r["results"]
+raise "expected prism_via_diff promoted to fuzz" unless p_res["findings"][0]["name"] == "fuzz"
+raise "expected prism_via_diff matched SEGV/prism_seed" unless p_res.dig("findings", 0, "placement", "best_cluster", "representative", "bucket_id") == "SEGV/prism_seed"
+raise "expected cruby_only to try fuzz then stay fuzz.diff" unless c_res["attempts"].map { |a| a["name"] } == %w[fuzz.diff fuzz]
+raise "expected cruby_only finding on fuzz.diff" unless c_res["findings"][0]["name"] == "fuzz.diff"
+raise "expected cruby_only matched SEGV/cruby_seed" unless c_res.dig("findings", 0, "placement", "best_cluster", "representative", "bucket_id") == "SEGV/cruby_seed"
+' <<< "$match_out2"
+
+# 3) Batch check (raw input.min + preserve.rb + clean.rb), non-destructive --json, and custom-header --stdin
+cp "$File_diff" "$match_suite/inputs/preserve.rb"
+batch_json="$match_suite/batch.json"
+TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --json --json-file "$batch_json" \
+    "$File_raw" "$match_suite/inputs/preserve.rb" "$File_clean" > "$match_suite/batch_stdout.json"
+grep -q '^diff_known$' "$match_suite/inputs/preserve.rb" || fail "--json modified input file contents!"
+cmp -s "$batch_json" "$match_suite/batch_stdout.json" || fail "--json-file and --json stdout differ!"
+
+ruby -rjson - "$batch_json" << 'EOF'
+r = JSON.parse(File.read(ARGV.fetch(0)))
+raise "expected 3 inputs" unless r["results"].size == 3
+raw_res, diff_res, cln_res = r["results"]
+raise "expected msan fallback match on raw input.min" unless raw_res["mode"] == "raw" && raw_res["findings"][0]["name"] == "fuzz.msan" && raw_res["status"] == "matched"
+raise "expected snippet match on preserve.rb" unless diff_res["mode"] == "snippet" && diff_res["findings"][0]["name"] == "fuzz.diff" && diff_res["status"] == "matched"
+raise "expected clean pass" unless cln_res["status"] == "pass" && cln_res["suspected_duplicate"] == false
+raise "expected summary counts 2 matched, 1 passed" unless r.dig("summary", "matched_inputs") == 2 && r.dig("summary", "passed_inputs") == 1
+EOF
+
+stdin_json=$(printf 'diff_custom_hdr\n' | TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --ruby-version 3.4 --encoding UTF-8 --partial-script \
+    --json --stdin)
+ruby -rjson -e '
+r = JSON.parse(STDIN.read)
+s_res = r["results"][0]
+raise "expected stdin custom-header match" unless s_res["status"] == "matched" && s_res["mode"] == "snippet" && s_res.dig("header", "ruby_version") == "3.4" && s_res.dig("header", "encoding") == "UTF-8" && s_res.dig("header", "partial_script") == true
+' <<< "$stdin_json"
+
+# 4) --all-fuzzers on prism_via_diff catches both promoted fuzz and fuzz.msan, and diff_new reports unmatched
+all_json=$(TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --all-fuzzers --json -e "prism_via_diff" -e "diff_new")
+ruby -rjson -e '
+r = JSON.parse(STDIN.read)
+both, novel = r["results"]
+names = both["findings"].map { |f| f["name"] }
+raise "expected both fuzz and fuzz.msan findings under --all-fuzzers, got #{names.inspect}" unless names.include?("fuzz") && names.include?("fuzz.msan")
+raise "expected novel diff_new unmatched" unless novel["status"] == "unmatched" && !novel.dig("findings", 0, "placement", "candidates").empty?
+' <<< "$all_json"
+
+# 5) --expect-cluster / CLUSTER workflow checks exit codes
+TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --expect-cluster "ABRT/diff_ast_seed" --quiet "$File_diff" > "$match_suite/expect_ok.out"
+grep -q '\[expect: PASS\]' "$match_suite/expect_ok.out" || fail "expected [expect: PASS] in quiet output"
+
+if TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --cluster "SEGV/prism_seed" --quiet "$File_diff" > /dev/null; then
+    fail "expected wrong --cluster to exit non-zero"
+fi
+if TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --expect-cluster "ABRT/diff_ast_seed" --quiet "$File_clean" > /dev/null; then
+    fail "expected non-crashing input with --expect-cluster to exit non-zero"
+fi
+if TRIAGE_COVERAGE_BIN="" TRIAGE_DIFF_COVERAGE_BIN="" ruby ./test/fuzz/triage/match.rb \
+    --triage-dir "$match_suite/triage" \
+    --expect-cluster "ABRT/diff_ast_seed" --quiet -e "diff_new" > /dev/null; then
+    fail "expected unmatched novel crash with --expect-cluster to exit non-zero"
+fi
+echo "  match.rb snippet/raw/stdin probing, fuzz promotion, --all-fuzzers, --expect-cluster, and JSON checks passed"
 
 echo "[8/8] Checking external target verification, template regeneration, 2026 API shims, exit 125, --invert/--fail-fast, and bisect.rb..."
 

@@ -15,6 +15,7 @@ For user workflows and reproduction/verification commands, see [`docs/fuzzing.md
 | [`verify_runner.c`](verify_runner.c) | C99 batch verifier linking Prism and the fuzz harness directly to execute thousands of archived inputs quickly under `fork()` + shared `mmap` isolation. |
 | [`verify_bucket.sh`](verify_bucket.sh) | Builds/caches `verify_runner.<profile>` cleanly and verifies `input.min`, `.inputs.pending`, and `inputs.tar.gz` for a single bucket. |
 | [`verify.rb`](verify.rb) | Multi-bucket verification sweep (`make fuzz-verify`) reporting `PASS`, `PARTIAL`, `FAIL`, and `EMPTY`, with survivor extraction and JSON reporting. |
+| [`match.rb`](match.rb) | Abstract snippet/testcase probe (`make fuzz-match`) that executes fuzzers starting with `fuzz.diff`, collects matching reference coverage, and places crashes against `clusters.json` / `metadata.json`. |
 | [`retriage.rb`](retriage.rb) | Post-fix triage refresh (`make fuzz-retriage`) that removes cured buckets, marks fixed inputs `#skip`, and re-triages surviving failures into fresh buckets and clusters. |
 | [`cluster.rb`](cluster.rb) | Metadata-only root-cause bucket clustering (UPGMA with Weighted Jaccard over Laplace-smoothed corpus-IDF coverage, leaf-anchored Prism call frames, and soft reason weight -> `clusters.json`). See [`clustering.md`](clustering.md). |
 | [`clustering.md`](clustering.md) | Mathematical specification, calibration calculations, and output schema for [`cluster.rb`](cluster.rb). |
@@ -246,6 +247,10 @@ Forwarded by `make fuzz-verify` (in [`test/fuzz/Makefile`](../Makefile)) or acce
 | `RETRIAGE_BUILD` | `--no-build` (`retriage.rb`, `RETRIAGE_BUILD=0`) | `1` | Skip `make fuzz-build` before re-triaging surviving inputs in `retriage.rb`. |
 | `RETRIAGE_DRY_RUN` | `--dry-run` (`retriage.rb`) | `0` | Verify and print what `retriage.rb` would remove/re-triage without modifying disk. |
 | — | `VERIFY_BUILD_DIR` | `build/verify` | Override compiled `verify_runner` cache directory (`verify_bucket.sh`). |
+
+### Snippet & Reproducer Cluster Matching (`match.rb`)
+
+`match.rb` (`make fuzz-match`) accepts Ruby snippets (`-e/--code`, `.rb` files, or `--stdin`/`-`, automatically prepending the encoded 4-byte fuzzer header unless `--raw` is used), probes `fuzz.diff -> fuzz -> fuzz.msan -> fuzz.lsan -> fuzz.slow` (promoting non-invariant `fuzz.diff` crashes via `fuzz`), collects `afl-showmap` edges against the reference binaries recorded in `metadata.json`, and places any crash against existing clusters via `FuzzClustering.place_probe`. Pass `--expect-cluster PATTERN` (`CLUSTER=...` / `-c`) to assert a reduced bug-report snippet still lands in the target cluster (exit `0` on match, `1` otherwise), or pass multiple files with `--json` to batch-check bug-tracker reproducers against known triage clusters.
 
 ---
 

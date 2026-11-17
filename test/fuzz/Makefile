@@ -188,6 +188,14 @@ endif
 fuzz-bisect: fuzz-docker-build
 	$(Q) FUZZ_TMPFS_FLAGS="$(FUZZ_TMPFS_FLAGS)" FUZZ_MAX_INPUT_SIZE="$(FUZZ_MAX_INPUT_SIZE)" FUZZ_MAX_ALLOCATED="$(FUZZ_MAX_ALLOCATED)" ruby ./test/fuzz/triage/bisect.rb $(BISECT_ARGS)
 
+fuzz-match: fuzz-docker-build
+	@if [ -t 0 ] && [ -t 1 ]; then \
+		DOCKER_ARGS="-it"; \
+	else \
+		DOCKER_ARGS="-i"; \
+	fi; \
+	docker run $${DOCKER_ARGS} --init --rm $(FUZZ_TMPFS_FLAGS) -e TRIAGE_DIR -e CLUSTER -e CLUSTERS_FILE -e TRIAGE_COVERAGE_BIN -e TRIAGE_COVERAGE_IDS -e TRIAGE_DIFF_COVERAGE_BIN -e TRIAGE_DIFF_COVERAGE_IDS -e FUZZ_MAX_ALLOCATED=$(FUZZ_MAX_ALLOCATED) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/triage/match.rb $(MATCH_ARGS)
+
 fuzz-retriage: fuzz-docker-build fuzz-gen-templates
 	@if [ -t 1 ]; then \
 		DOCKER_ARGS="-it"; \
@@ -302,5 +310,5 @@ fuzz-clean:
 	$(Q) if [ -d "$(FUZZ_DIR)" ]; then find $(FUZZ_DIR) -mindepth 1 -maxdepth 1 ! -name triage -exec rm -rf -- {} +; fi
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-docker-force fuzz-docker-update fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-docker-force fuzz-docker-update fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-match fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
 

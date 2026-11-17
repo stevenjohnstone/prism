@@ -40,6 +40,7 @@ test/fuzz
     ├── clustering.md               mathematical specification and calibration for cluster.rb
     ├── halfempty.sh                minimizes crash inputs with Google Project Zero's halfempty
     ├── halfempty_compare.sh        identifies similar backtraces during minimization
+    ├── match.rb                    probes snippets/inputs through fuzzers and matches against clusters
     ├── retriage.rb                 removes cured buckets and re-triages surviving failures into fresh buckets
     ├── signature.sh                hashes stack traces into a crash signature
     ├── test_triage.sh              verifies signature normalization, minimization, triage, and verification
@@ -271,6 +272,21 @@ make fuzz-bisect GOOD=main~100 BAD=HEAD CLUSTER=cluster-01 VERIFY_INPUT_MIN_ONLY
 
 # Find which commit fixed an existing failure (broken -> fixed):
 make fuzz-bisect BROKEN=main~50 FIXED=HEAD CLUSTER=cluster-01
+```
+
+#### Matching Snippets & Bug Reports Against Clusters
+
+[`test/fuzz/triage/match.rb`](../test/fuzz/triage/match.rb) (`make fuzz-match`) runs a Ruby snippet or raw testcase through the fuzzer binaries (starting with `fuzz.diff`, followed by `fuzz`, `fuzz.msan`, `fuzz.lsan`, and `fuzz.slow`) and checks whether any crash or divergence places into an existing cluster under `tmp/fuzz/triage/`:
+
+```bash
+# Test an inline Ruby snippet against fuzz.diff and existing clusters:
+make fuzz-match MATCH_ARGS='-e "case; when 1; case; value; in 1; end; end"'
+
+# Batch-check candidate bug-tracker reproducers and emit JSON:
+make fuzz-match MATCH_ARGS="--json bugs/*.rb"
+
+# Assert a simplified bug-report reproducer still lands in cluster-03 (exits 0 only on match):
+make fuzz-match CLUSTER=cluster-03 MATCH_ARGS="reduced_bug.rb"
 ```
 
 Compatibility & skip behavior across revisions:

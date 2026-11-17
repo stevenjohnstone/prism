@@ -1193,6 +1193,257 @@ module FuzzClustering
     summary
   end
 
+  def effective_thresholds(threshold: DEFAULT_THRESHOLD, diff_threshold: nil, reason_weight: DEFAULT_REASON_WEIGHT)
+    raise ArgumentError, "threshold must be between 0.0 and 1.0" unless threshold >= 0.0 && threshold <= 1.0
+    raise ArgumentError, "reason_weight must be between 0.0 and 1.0" unless reason_weight >= 0.0 && reason_weight <= 1.0
+
+    effective_diff = if diff_threshold.nil?
+                       (threshold - DEFAULT_THRESHOLD).abs <= TIE_EPSILON ? DIFF_DEFAULT_THRESHOLD : threshold
+                     else
+                       diff_threshold
+                     end
+    unless effective_diff >= 0.0 && effective_diff <= 1.0
+      raise ArgumentError, "diff_threshold must be between 0.0 and 1.0"
+    end
+
+    [threshold, effective_diff]
+  end
+
+  def prepare_feature_context(
+    metadata,
+    idf_smoothing: IDF_SMOOTHING,
+    frame_decay: FRAME_DECAY,
+    setup_weight: SETUP_FUNCTION_WEIGHT,
+    encoding_weight: ENCODING_HELPER_WEIGHT,
+    recovery_weight: RECOVERY_FUNCTION_WEIGHT,
+    dispatcher_weight: DISPATCHER_WEIGHT,
+    function_edge_cap: FUNCTION_EDGE_CAP
+  )
+    corpus = metadata["corpus"].is_a?(Hash) ? metadata["corpus"] : {}
+    corpus_edge_df = corpus["edge_df"].is_a?(Hash) ? corpus["edge_df"] : {}
+    cov_model = build_edge_idf(
+      corpus,
+      smoothing: idf_smoothing,
+      setup_weight: setup_weight,
+      encoding_weight: encoding_weight,
+      recovery_weight: recovery_weight,
+      dispatcher_weight: dispatcher_weight,
+      function_edge_cap: function_edge_cap
+    )
+
+    diff_corpus = metadata["diff_corpus"].is_a?(Hash) ? metadata["diff_corpus"] : {}
+    diff_corpus_edge_df = diff_corpus["edge_df"].is_a?(Hash) ? diff_corpus["edge_df"] : {}
+    diff_cov_model = build_diff_edge_idf(diff_corpus, smoothing: idf_smoothing)
+
+    {
+      corpus: corpus,
+      corpus_edge_df: corpus_edge_df,
+      cov_model: cov_model,
+      diff_corpus: diff_corpus,
+      diff_corpus_edge_df: diff_corpus_edge_df,
+      diff_cov_model: diff_cov_model,
+      frame_decay: frame_decay
+    }
+  end
+
+  def feature_for_bucket(bucket, feature_ctx)
+    build_bucket_feature(
+      bucket,
+      feature_ctx[:cov_model],
+      feature_ctx[:corpus_edge_df],
+      feature_ctx[:diff_cov_model],
+      feature_ctx[:diff_corpus_edge_df],
+      frame_decay: feature_ctx[:frame_decay]
+    )
+  end
+
+  def cluster_matches_pattern?(cluster, patterns)
+    pats = Array(patterns).map { |p| p.to_s.strip }.reject(&:empty?)
+    return true if pats.empty?
+
+    cid = cluster["cluster_id"].to_s
+    cid_num = cid[/\d+\z/]&.to_i
+    members = cluster["buckets"] || []
+
+    pats.any? do |pat|
+      if pat.match?(/\A\d{1,15}\z/) && !cid_num.nil? && cid_num == pat.to_i
+        true
+      elsif cid.casecmp?(pat) || File.fnmatch?(pat.downcase, cid.downcase, File::FNM_PATHNAME)
+        true
+      else
+        allow_glob = pat.include?("/") || pat.match?(/[*?\[]/)
+        members.any? do |b|
+          bid = b["bucket_id"].to_s
+          bid == pat || b["signature"].to_s == pat || (allow_glob && File.fnmatch?(pat, bid, File::FNM_PATHNAME))
+        end
+      end
+    end
+  end
+
+  def prepare_placement_context(
+    metadata,
+    report: nil,
+    threshold: DEFAULT_THRESHOLD,
+    diff_threshold: nil,
+    reason_weight: DEFAULT_REASON_WEIGHT,
+    idf_smoothing: IDF_SMOOTHING,
+    frame_decay: FRAME_DECAY,
+    frame_blend: FRAME_BLEND_WEIGHT,
+    mismatch_penalty: FRAME_MISMATCH_PENALTY,
+    setup_weight: SETUP_FUNCTION_WEIGHT,
+    encoding_weight: ENCODING_HELPER_WEIGHT,
+    recovery_weight: RECOVERY_FUNCTION_WEIGHT,
+    dispatcher_weight: DISPATCHER_WEIGHT,
+    function_edge_cap: FUNCTION_EDGE_CAP,
+    diff_conflict_scale: DIFF_CONFLICT_SCALE,
+    diff_match_boost: DIFF_MATCH_BOOST,
+    include_unreproducible: false,
+    metadata_path: DEFAULT_METADATA_PATH
+  )
+    eff_thresh, eff_diff_thresh = effective_thresholds(
+      threshold: threshold,
+      diff_threshold: diff_threshold,
+      reason_weight: reason_weight
+    )
+    feature_ctx = prepare_feature_context(
+      metadata,
+      idf_smoothing: idf_smoothing,
+      frame_decay: frame_decay,
+      setup_weight: setup_weight,
+      encoding_weight: encoding_weight,
+      recovery_weight: recovery_weight,
+      dispatcher_weight: dispatcher_weight,
+      function_edge_cap: function_edge_cap
+    )
+    report ||= cluster_metadata(
+      metadata,
+      threshold: eff_thresh,
+      diff_threshold: eff_diff_thresh,
+      reason_weight: reason_weight,
+      idf_smoothing: idf_smoothing,
+      frame_decay: frame_decay,
+      frame_blend: frame_blend,
+      mismatch_penalty: mismatch_penalty,
+      setup_weight: setup_weight,
+      encoding_weight: encoding_weight,
+      recovery_weight: recovery_weight,
+      dispatcher_weight: dispatcher_weight,
+      function_edge_cap: function_edge_cap,
+      diff_conflict_scale: diff_conflict_scale,
+      diff_match_boost: diff_match_boost,
+      include_unreproducible: include_unreproducible,
+      metadata_path: metadata_path
+    )
+
+    features_by_id = {}
+    Array(metadata["buckets"]).each do |b|
+      next unless b.is_a?(Hash) && b["bucket_id"]
+
+      features_by_id[b["bucket_id"].to_s] = feature_for_bucket(b, feature_ctx)
+    end
+
+    {
+      report: report,
+      feature_ctx: feature_ctx,
+      features_by_id: features_by_id,
+      threshold: eff_thresh,
+      diff_threshold: eff_diff_thresh,
+      sim_opts: {
+        reason_weight: reason_weight,
+        frame_blend: frame_blend,
+        mismatch_penalty: mismatch_penalty,
+        diff_conflict_scale: diff_conflict_scale,
+        diff_match_boost: diff_match_boost
+      }
+    }
+  end
+
+  def place_probe(
+    metadata,
+    probe_bucket,
+    placement_ctx: nil,
+    report: nil,
+    threshold: DEFAULT_THRESHOLD,
+    diff_threshold: nil,
+    reason_weight: DEFAULT_REASON_WEIGHT,
+    top_n: 5,
+    **ctx_opts
+  )
+    ctx = placement_ctx || prepare_placement_context(
+      metadata,
+      report: report,
+      threshold: threshold,
+      diff_threshold: diff_threshold,
+      reason_weight: reason_weight,
+      **ctx_opts
+    )
+    probe_feat = feature_for_bucket(probe_bucket, ctx[:feature_ctx])
+    features_by_id = ctx[:features_by_id]
+    sim_opts = ctx[:sim_opts]
+
+    candidates = []
+    ctx[:report]["clusters"].each do |cl|
+      m_feats = Array(cl["buckets"]).filter_map { |mb| features_by_id[mb["bucket_id"].to_s] }
+      next if m_feats.empty?
+      next if probe_feat[:oracle] && m_feats.first[:oracle] && probe_feat[:oracle] != m_feats.first[:oracle]
+
+      cluster_diff_dual = m_feats.all? { |mf| mf[:oracle] == "diff_parse_y" && mf[:diff_cov_available] }
+      probe_diff_dual = probe_feat[:oracle] == "diff_parse_y" && probe_feat[:diff_cov_available]
+      pair_thresh = (probe_diff_dual && cluster_diff_dual) ? ctx[:diff_threshold] : ctx[:threshold]
+
+      scored_members = m_feats.map { |mf| [pair_similarity(probe_feat, mf, **sim_opts), mf] }
+      sims = scored_members.map(&:first)
+      avg_sim = sims.sum / sims.size.to_f
+      best_member_sim, best_member = scored_members.max_by { |s, mf| [s, -mf[:occurrences], mf[:id]] }
+      min_sim = sims.min
+      rep_id = cl.dig("representative", "bucket_id").to_s
+      rep_feat = features_by_id[rep_id]
+      rep_sim = rep_feat ? pair_similarity(probe_feat, rep_feat, **sim_opts) : best_member_sim
+      matched = avg_sim >= pair_thresh
+
+      candidates << {
+        "cluster_id" => cl["cluster_id"],
+        "group" => cl["group"] || cluster_group_for_oracle(probe_feat[:oracle]),
+        "algorithm" => cl["algorithm"],
+        "matched" => matched,
+        "threshold_used" => pair_thresh.round(6),
+        "avg_similarity" => avg_sim.round(6),
+        "rep_similarity" => rep_sim.round(6),
+        "max_similarity" => best_member_sim.round(6),
+        "min_similarity" => min_sim.round(6),
+        "bucket_count" => cl["bucket_count"],
+        "occurrences" => cl["occurrences"],
+        "closest_bucket_id" => best_member[:id],
+        "representative" => cl["representative"]
+      }
+    end
+
+    candidates.sort_by! do |c|
+      [c["matched"] ? 0 : 1, -c["avg_similarity"], -c["max_similarity"], c["cluster_id"].to_s]
+    end
+    matched_clusters = candidates.select { |c| c["matched"] }
+    shown = top_n && top_n > 0 ? candidates.first(top_n) : candidates
+
+    {
+      "status" => matched_clusters.empty? ? "unmatched" : "matched",
+      "probe" => {
+        "bucket_id" => probe_feat[:id],
+        "oracle" => probe_feat[:oracle],
+        "group" => cluster_group_for_oracle(probe_feat[:oracle]),
+        "reason" => probe_feat[:reason],
+        "headline" => probe_feat[:headline],
+        "top_prism_frame" => probe_feat[:top_prism_frame],
+        "diff_fields" => probe_feat[:diff_fields],
+        "cov_available" => probe_feat[:cov_available],
+        "diff_cov_available" => probe_feat[:diff_cov_available],
+        "threshold_used" => ((probe_feat[:oracle] == "diff_parse_y" && probe_feat[:diff_cov_available]) ? ctx[:diff_threshold] : ctx[:threshold]).round(6)
+      },
+      "matched_clusters" => matched_clusters,
+      "best_cluster" => matched_clusters.first,
+      "candidates" => shown
+    }
+  end
+
   def cluster_metadata(
     metadata,
     threshold: DEFAULT_THRESHOLD,
@@ -1212,17 +1463,11 @@ module FuzzClustering
     include_unreproducible: false,
     metadata_path: DEFAULT_METADATA_PATH
   )
-    raise ArgumentError, "threshold must be between 0.0 and 1.0" unless threshold >= 0.0 && threshold <= 1.0
-    raise ArgumentError, "reason_weight must be between 0.0 and 1.0" unless reason_weight >= 0.0 && reason_weight <= 1.0
-
-    effective_diff_threshold = if diff_threshold.nil?
-                                 (threshold - DEFAULT_THRESHOLD).abs <= TIE_EPSILON ? DIFF_DEFAULT_THRESHOLD : threshold
-                               else
-                                 diff_threshold
-                               end
-    unless effective_diff_threshold >= 0.0 && effective_diff_threshold <= 1.0
-      raise ArgumentError, "diff_threshold must be between 0.0 and 1.0"
-    end
+    threshold, effective_diff_threshold = effective_thresholds(
+      threshold: threshold,
+      diff_threshold: diff_threshold,
+      reason_weight: reason_weight
+    )
 
     raw_buckets = Array(metadata["buckets"])
     excluded_unreproducible = 0
@@ -1241,25 +1486,21 @@ module FuzzClustering
 
     filtered.sort_by! { |b| b["bucket_id"].to_s }
 
-    corpus = metadata["corpus"].is_a?(Hash) ? metadata["corpus"] : {}
-    corpus_edge_df = corpus["edge_df"].is_a?(Hash) ? corpus["edge_df"] : {}
-    cov_model = build_edge_idf(
-      corpus,
-      smoothing: idf_smoothing,
+    feature_ctx = prepare_feature_context(
+      metadata,
+      idf_smoothing: idf_smoothing,
+      frame_decay: frame_decay,
       setup_weight: setup_weight,
       encoding_weight: encoding_weight,
       recovery_weight: recovery_weight,
       dispatcher_weight: dispatcher_weight,
       function_edge_cap: function_edge_cap
     )
+    corpus = feature_ctx[:corpus]
+    diff_corpus = feature_ctx[:diff_corpus]
+    diff_cov_model = feature_ctx[:diff_cov_model]
 
-    diff_corpus = metadata["diff_corpus"].is_a?(Hash) ? metadata["diff_corpus"] : {}
-    diff_corpus_edge_df = diff_corpus["edge_df"].is_a?(Hash) ? diff_corpus["edge_df"] : {}
-    diff_cov_model = build_diff_edge_idf(diff_corpus, smoothing: idf_smoothing)
-
-    features = filtered.map do |b|
-      build_bucket_feature(b, cov_model, corpus_edge_df, diff_cov_model, diff_corpus_edge_df, frame_decay: frame_decay)
-    end
+    features = filtered.map { |b| feature_for_bucket(b, feature_ctx) }
     sim_matrix = compute_similarity_matrix(
       features,
       reason_weight: reason_weight,

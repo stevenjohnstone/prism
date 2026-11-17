@@ -2,8 +2,13 @@
 
 require "base64"
 require "cgi"
-require "concurrent"
+begin
+  require "concurrent"
+rescue LoadError
+  raise unless ENV["TRIAGE_LIB_ONLY"] == "1"
+end
 require "digest"
+require "etc"
 require "fileutils"
 require "json"
 require "open3"
@@ -29,7 +34,7 @@ TESTCASES_PROCESSED_DIR = File.join(TESTCASES_DIR, ".processed")
 MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
 HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 16
 HALFEMPTY_THREADS = Integer(ENV.fetch("HALFEMPTY_THREADS", "2"))
-TRIAGE_THREADS = Integer(ENV.fetch("TRIAGE_THREADS", [Concurrent.processor_count / 2, 1].max.to_s))
+TRIAGE_THREADS = Integer(ENV.fetch("TRIAGE_THREADS", [(defined?(Concurrent) ? Concurrent.processor_count : Etc.nprocessors) / 2, 1].max.to_s))
 COVERAGE_BIN = ENV.fetch("TRIAGE_COVERAGE_BIN", "./build/fuzz")
 COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_COVERAGE_IDS", COVERAGE_BIN.empty? ? "" : "#{COVERAGE_BIN}.ids")
 DIFF_COVERAGE_BIN = ENV.fetch("TRIAGE_DIFF_COVERAGE_BIN", "./build/fuzz.diff")
@@ -493,6 +498,76 @@ def decode_fuzz_header(raw)
     shebang_callback: shebang_callback,
     has_shebang_prefix: has_shebang_prefix
   }
+end
+
+def encode_fuzz_header(
+  ruby_version: "4.1",
+  encoding: nil,
+  frozen_string_literal: nil,
+  partial_script: false,
+  freeze: false,
+  attach_comments: false,
+  encoding_locked: false,
+  stream_mode: false,
+  main_script: false,
+  command_line: nil,
+  scopes_count: 0,
+  forwarding: nil,
+  start_line: 1
+)
+  ver_idx = VERSIONS.index(ruby_version.to_s)
+  raise ArgumentError, "Unknown ruby_version '#{ruby_version}' (expected #{VERSIONS.join(', ')})" unless ver_idx
+
+  b0 = 0
+  b0 |= 0x01 if freeze
+  b0 |= 0x02 if partial_script
+  b0 |= 0x04 if attach_comments
+  b0 |= 0x08 if encoding_locked
+  unless frozen_string_literal.nil?
+    b0 |= 0x10
+    b0 |= 0x20 if frozen_string_literal
+  end
+  b0 |= 0x40 if stream_mode
+
+  b1 = 0
+  unless command_line.nil? || command_line.to_s.empty?
+    command_line.to_s.each_char do |ch|
+      pair = COMMAND_LINE_CHARS.find { |_, c| c == ch }
+      raise ArgumentError, "Unknown command_line flag '#{ch}'" unless pair
+
+      b1 |= pair[0]
+    end
+  end
+  b1 |= 0x40 if main_script
+
+  fwd_bits = 0
+  unless forwarding.nil? || forwarding.to_s.empty?
+    forwarding.to_s.each_char do |ch|
+      pair = FORWARDING_CHARS.find { |_, c| c == ch }
+      raise ArgumentError, "Unknown forwarding flag '#{ch}'" unless pair
+
+      fwd_bits |= pair[0]
+    end
+  end
+  unless (0..3).cover?(scopes_count.to_i)
+    raise ArgumentError, "scopes_count must be between 0 and 3"
+  end
+
+  b2 = (ver_idx & 0x03) | ((scopes_count.to_i & 0x03) << 2) | ((fwd_bits & 0x0f) << 4)
+
+  if encoding && !encoding.to_s.empty?
+    enc_idx = ENCODINGS.index { |e| e.casecmp?(encoding.to_s) }
+    raise ArgumentError, "Unknown encoding '#{encoding}' (expected #{ENCODINGS.join(', ')})" unless enc_idx
+
+    b0 |= 0x80
+    b3 = enc_idx & 0x07
+  else
+    raise ArgumentError, "start_line must be in -128..127" unless (-128..127).cover?(start_line.to_i)
+
+    b3 = [start_line.to_i].pack("c").unpack1("C")
+  end
+
+  [b0, b1, b2, b3].pack("C4")
 end
 
 def build_prism_loupe_url(raw, sanitize: false)
@@ -1932,6 +2007,27 @@ def build_bucket_metadata(bucket_id:, reason:, signature:, reproducible:, timed_
   meta
 end
 
+def infer_crash_reason(clean_output, sig_name = nil, default_reason: "unknown")
+  reason = default_reason == "hang" ? "unknown" : default_reason
+  clean_output.match(/SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: ([[:alpha:]-]*) .*/) do |m|
+    reason = m.captures[1]
+  end
+  if reason == "unknown"
+    if clean_output.match?(/ERROR: LeakSanitizer: detected memory leaks/) || clean_output.include?("Assertion `allocated == 0' failed")
+      reason = "memory-leak"
+    elsif clean_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
+      reason = "allocation-size-too-big"
+    elsif clean_output.include?("Assertion `") || clean_output.include?("INVARIANT[")
+      reason = "ABRT"
+    elsif clean_output =~ /^CRASH\[[^\]]+\]:\s*signal=SIG([A-Z0-9_]+)/
+      reason = Regexp.last_match(1)
+    elsif sig_name && !sig_name.empty?
+      reason = sig_name
+    end
+  end
+  reason
+end
+
 def companion_executable(executable, name)
   exe_dir = File.dirname(executable.to_s)
   if !exe_dir.empty? && exe_dir != "."
@@ -1992,26 +2088,7 @@ def classify_crash_execution(crash_dir, crash_input, executable)
   unreproducible = !crashed && !(reason == "hang" && timed_out)
 
   clean_output = utf8_safe(testcase_output)
-
-  if crashed
-    reason = "unknown" if reason == "hang"
-    clean_output.match(/SUMMARY: (Memory|UndefinedBehavior|Address|Leak)Sanitizer: ([[:alpha:]-]*) .*/) do |m|
-      reason = m.captures[1]
-    end
-    if reason == "unknown"
-      if clean_output.match?(/ERROR: LeakSanitizer: detected memory leaks/) || clean_output.include?("Assertion `allocated == 0' failed")
-        reason = "memory-leak"
-      elsif clean_output.include?("FUZZ_MAX_ALLOCATED_BYTES")
-        reason = "allocation-size-too-big"
-      elsif clean_output.include?("Assertion `") || clean_output.include?("INVARIANT[")
-        reason = "ABRT"
-      elsif clean_output =~ /^CRASH\[[^\]]+\]:\s*signal=SIG([A-Z0-9_]+)/
-        reason = Regexp.last_match(1)
-      elsif sig_name && !sig_name.empty?
-        reason = sig_name
-      end
-    end
-  end
+  reason = infer_crash_reason(clean_output, sig_name, default_reason: reason) if crashed
 
   sig_lines = case reason
               when "undefined-behavior"
