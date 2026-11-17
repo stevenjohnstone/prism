@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:-abort_on_error=1:print_stacktrace=1}"
 : "${SIGLINES:=10}"
 : "${HALFEMPTY_THREADS:=2}"
+: "${HALFEMPTY_TIMEOUT:=15}"
 
 FUZZ_EXE=$1
 INPUT=$2
@@ -16,7 +17,7 @@ if [ ! -f "$INPUT" ] || [ "$(wc -c < "$INPUT")" -lt 4 ]; then
 fi
 
 set +e
-initial_out=$(timeout -k 1 5 "$FUZZ_EXE" "$INPUT" 2>&1)
+initial_out=$(timeout -k 1 "$HALFEMPTY_TIMEOUT" "$FUZZ_EXE" "$INPUT" 2>&1)
 initial_rc=$?
 set -e
 

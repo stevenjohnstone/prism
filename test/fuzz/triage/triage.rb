@@ -35,6 +35,8 @@ MAX_ALLOCATED_MB = Integer(ENV.fetch("FUZZ_MAX_ALLOCATED", "128"))
 HARD_RSS_LIMIT_MB = MAX_ALLOCATED_MB * 16
 HALFEMPTY_THREADS = Integer(ENV.fetch("HALFEMPTY_THREADS", "2"))
 TRIAGE_THREADS = Integer(ENV.fetch("TRIAGE_THREADS", [(defined?(Concurrent) ? Concurrent.processor_count : Etc.nprocessors) / 2, 1].max.to_s))
+HANG_TIMEOUT_SECONDS = Integer(ENV.fetch("TRIAGE_HANG_TIMEOUT", "5"))
+CRASH_TIMEOUT_SECONDS = Integer(ENV.fetch("TRIAGE_CRASH_TIMEOUT", "15"))
 COVERAGE_BIN = ENV.fetch("TRIAGE_COVERAGE_BIN", "./build/fuzz")
 COVERAGE_IDS_PATH = ENV.fetch("TRIAGE_COVERAGE_IDS", COVERAGE_BIN.empty? ? "" : "#{COVERAGE_BIN}.ids")
 DIFF_COVERAGE_BIN = ENV.fetch("TRIAGE_DIFF_COVERAGE_BIN", "./build/fuzz.diff")
@@ -1447,9 +1449,18 @@ def testcase_output_signature(testcase_output, siglines = 10)
   o.strip
 end
 
+def with_testcase_timeout(seconds)
+  prev = Thread.current[:testcase_timeout_sec]
+  Thread.current[:testcase_timeout_sec] = seconds
+  yield
+ensure
+  Thread.current[:testcase_timeout_sec] = prev
+end
+
 def run_testcase(executable, input_file)
   Thread.current[:last_testcase_signal] = nil
-  o, s = Open3.capture2e(SANITIZER_ENV, "timeout", "-k", "1", "5", executable, input_file)
+  timeout_sec = Thread.current[:testcase_timeout_sec] || CRASH_TIMEOUT_SECONDS
+  o, s = Open3.capture2e(SANITIZER_ENV, "timeout", "-k", "1", timeout_sec.to_s, executable, input_file)
   timed_out = s.exitstatus == 124 || s.exitstatus == 137
   crashed = !s.success? && !timed_out
   sig = if crashed
@@ -1457,6 +1468,15 @@ def run_testcase(executable, input_file)
         end
   Thread.current[:last_testcase_signal] = sig && (1..64).include?(sig) ? Signal.signame(sig) : nil
   [o.b, crashed, timed_out]
+end
+
+def run_crash_testcase(executable, input_file)
+  out, crashed, timed_out = with_testcase_timeout(CRASH_TIMEOUT_SECONDS) { run_testcase(executable, input_file) }
+  return [out, crashed, timed_out] unless !crashed && timed_out
+
+  # Retry once on transient wall-clock timeouts (e.g. parallel fuzz.diff DWARF backtrace contention)
+  retry_timeout = [CRASH_TIMEOUT_SECONDS * 2, 30].max
+  with_testcase_timeout(retry_timeout) { run_testcase(executable, input_file) }
 end
 
 def clang_format(c_code)
@@ -2045,7 +2065,7 @@ def classify_crash_execution(crash_dir, crash_input, executable)
   lsan_exe = companion_executable(executable, "fuzz.lsan")
 
   if reason == "hang"
-    testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+    testcase_output, crashed, timed_out = with_testcase_timeout(HANG_TIMEOUT_SECONDS) { run_testcase(executable, crash_input) }
     return { transient_timeout: true } if !crashed && !timed_out
   elsif executable.end_with?("ijon", "native")
     # fuzz.ijon and fuzz.native are built without sanitizers (and SAND workers
@@ -2054,17 +2074,17 @@ def classify_crash_execution(crash_dir, crash_input, executable)
     # they deduplicate with main; next try fuzz.lsan for memory leaks;
     # finally fall back to executable for cumulative allocation limit assertions
     # in PRISM_XALLOCATOR.
-    testcase_output, crashed, timed_out = run_testcase(fast_exe, crash_input)
+    testcase_output, crashed, timed_out = run_crash_testcase(fast_exe, crash_input)
     if crashed
       executable = fast_exe
     else
       Thread.current[:last_testcase_signal] = nil
-      testcase_output, crashed, timed_out = run_testcase(lsan_exe, crash_input)
+      testcase_output, crashed, timed_out = run_crash_testcase(lsan_exe, crash_input)
       if crashed
         executable = lsan_exe
       else
         Thread.current[:last_testcase_signal] = nil
-        testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+        testcase_output, crashed, timed_out = run_crash_testcase(executable, crash_input)
       end
     end
   elsif executable.end_with?("msan", "slow", "diff")
@@ -2073,15 +2093,15 @@ def classify_crash_execution(crash_dir, crash_input, executable)
     # classification, minimization, and deduplication against main/grammar;
     # otherwise fall back to msan/slow/diff for read issues (MSAN), -DSLOW consumer /
     # differential checks, or CRuby parse.y differential invariants / crashes.
-    testcase_output, crashed, timed_out = run_testcase(fast_exe, crash_input)
+    testcase_output, crashed, timed_out = run_crash_testcase(fast_exe, crash_input)
     if crashed
       executable = fast_exe
     else
       Thread.current[:last_testcase_signal] = nil
-      testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+      testcase_output, crashed, timed_out = run_crash_testcase(executable, crash_input)
     end
   else
-    testcase_output, crashed, timed_out = run_testcase(executable, crash_input)
+    testcase_output, crashed, timed_out = run_crash_testcase(executable, crash_input)
   end
 
   sig_name = crashed ? Thread.current[:last_testcase_signal] : nil
@@ -2581,7 +2601,8 @@ def backfill_bucket_meta(bucket_dir)
     candidates.each do |cand|
       next unless File.executable?(cand)
 
-      out, crashed, t_out = run_testcase(cand, min_path)
+      cand_timeout = reason == "hang" ? HANG_TIMEOUT_SECONDS : CRASH_TIMEOUT_SECONDS
+      out, crashed, t_out = with_testcase_timeout(cand_timeout) { run_testcase(cand, min_path) }
       if crashed || (reason == "hang" && t_out)
         crash_output = utf8_safe(out)
         timed_out = t_out

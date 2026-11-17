@@ -1217,6 +1217,22 @@ end
 mock_nonutf8 = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.diff")
 raise "expected mocked UTF-8-invalid crash output to classify as ABRT: #{mock_nonutf8.inspect}" unless mock_nonutf8[:reason] == "ABRT" && mock_nonutf8[:crashed]
 
+diff_calls = Hash.new(0)
+t_mod.define_singleton_method(:run_testcase) do |exe, _input|
+  diff_calls[exe] += 1
+  if exe == "./build/fuzz"
+    ["", false, false]
+  elsif diff_calls[exe] == 1
+    ["", false, true]
+  else
+    ["CRASH[diff_parse_y]: signal=SIGSEGV (11)\n", true, false]
+  end
+end
+retry_diff = t_mod.classify_crash_execution("crashes", "/tmp/in", "./build/fuzz.diff")
+unless retry_diff[:reason] == "SEGV" && !retry_diff[:unreproducible] && !retry_diff[:timed_out] && diff_calls["./build/fuzz.diff"] == 2
+  raise "expected transient timeout on fuzz.diff crash to retry once and classify SEGV: #{retry_diff.inspect} (#{diff_calls.inspect})"
+end
+
 sig_raw = t_sig_mod.testcase_output_signature(nonutf8_cls[:testcase_output], nonutf8_cls[:sig_lines])
 sig_clean = t_sig_mod.testcase_output_signature("INVARIANT[diff_parse_y]: kind=syntax_mismatch sub=prism_ok_cruby_err nul=0 utf8=0 prism=ok cruby=ArgumentError:unknown_encoding [detail: other]\n", nonutf8_cls[:sig_lines])
 raise "expected identical signature for non-UTF-8 [detail: ...]: #{sig_raw} vs #{sig_clean}" unless sig_raw == sig_clean
