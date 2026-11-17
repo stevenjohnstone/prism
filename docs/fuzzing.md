@@ -56,6 +56,14 @@ Docker: runs on Linux, Windows and Mac OS.
 
 Everything needed to build the fuzzers, run a campaign, and triage crashes is self-contained inside the Docker image.
 
+[`test/fuzz/docker/Dockerfile`](../test/fuzz/docker/Dockerfile) pins an explicit `ruby/ruby` mainline commit SHA (`ARG RUBY_GIT_REF`) for the differential `parse.y` oracle so edits invalidate both Make and Docker build caches deterministically. To advance the pinned commit to current `ruby/ruby` `master` HEAD and rebuild the container (plus mark `./build/fuzz*` for rebuild on the next run), run:
+
+```bash
+make fuzz-docker-update
+```
+
+You can also test a specific revision without editing the `Dockerfile` via `make fuzz-docker-build RUBY_GIT_REF=<sha>`.
+
 ## Usage
 
 ### Quick Start

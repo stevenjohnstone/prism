@@ -120,14 +120,29 @@ $(FUZZ_BUILD_STAMP): $(FUZZ_AFL_STAMP) $(FUZZ_SOURCES) $(FUZZ_DIFF_DEPS) $(HEADE
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
 
+RUBY_GIT_REF ?=
+FUZZ_DOCKER_DEPS := test/fuzz/docker/Dockerfile Gemfile Gemfile.lock prism.gemspec $(if $(strip $(RUBY_GIT_REF)),fuzz-docker-force,)
+
+fuzz-docker-force: ;
+
 fuzz-docker-build: $(FUZZ_DOCKER_STAMP)
 	$(ECHO) "Docker image is up to date"
 
-$(FUZZ_DOCKER_STAMP): test/fuzz/docker/Dockerfile Gemfile Gemfile.lock prism.gemspec
+$(FUZZ_DOCKER_STAMP): $(FUZZ_DOCKER_DEPS)
 	$(ECHO) "building docker image"
-	$(Q) docker build -t prism/fuzz -f test/fuzz/docker/Dockerfile .
+	$(Q) old_id="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)"; \
+		docker build $(if $(strip $(RUBY_GIT_REF)),--build-arg RUBY_GIT_REF=$(strip $(RUBY_GIT_REF)),) -t prism/fuzz -f test/fuzz/docker/Dockerfile . || exit $$?; \
+		new_id="$$(docker image inspect -f '{{.Id}}' prism/fuzz 2>/dev/null || true)"; \
+		if [ "$$old_id" != "$$new_id" ]; then rm -rf build/diff-oracle $(FUZZ_BUILD_STAMP) $(FUZZ_AFL_STAMP); fi
 	$(Q) $(MAKEDIRS) build
 	$(Q) touch $@
+
+fuzz-docker-update:
+	$(ECHO) "resolving mainline CRuby HEAD from ruby/ruby"
+	$(Q) rev="$$(git ls-remote https://github.com/ruby/ruby.git refs/heads/master | awk 'NR==1 { print $$1 }')"; \
+		test -n "$$rev" || { echo "Failed to resolve ruby/ruby master SHA" >&2; exit 1; }; \
+		ruby -e 'p, rev = ARGV; s = File.read(p); cur = s[/^ARG RUBY_GIT_REF=(.*)/, 1] or abort("ARG RUBY_GIT_REF not found in #{p}"); if cur.strip == rev then puts("Dockerfile already pinned to #{rev}") else s.sub!(/^ARG RUBY_GIT_REF=.*/, "ARG RUBY_GIT_REF=#{rev}"); File.write(p, s); puts("Updated #{p} RUBY_GIT_REF: #{cur} -> #{rev}") end' test/fuzz/docker/Dockerfile "$$rev" && \
+		$(MAKE) fuzz-docker-build
 
 fuzz-debug: fuzz-docker-build
 	$(ECHO) "entering debug shell"
@@ -287,5 +302,5 @@ fuzz-clean:
 	$(Q) if [ -d "$(FUZZ_DIR)" ]; then find $(FUZZ_DIR) -mindepth 1 -maxdepth 1 ! -name triage -exec rm -rf -- {} +; fi
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-docker-force fuzz-docker-update fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
 
