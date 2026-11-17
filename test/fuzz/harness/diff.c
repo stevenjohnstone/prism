@@ -4854,7 +4854,7 @@ static void diff_run_prism(
     const uint8_t *source_buf = (size == 0) ? (const uint8_t *) "" : copy;
 
     pm_options_t *options = pm_options_new();
-    if (!pm_options_version_set(options, "4.0", 3)) {
+    if (!pm_options_version_set(options, "4.1", 3)) {
         abort();
     }
 
@@ -4896,9 +4896,9 @@ diff_ignore_syntax_mismatch(bool prism_ok, bool cruby_ok, const char *cruby_tag,
         return true;
     }
 
-    // Documented Prism vs CRuby 4.0 parse.y divergences (test/prism/fixtures_test.rb):
-    // 3.4/command_call_do_block_in_arguments.txt, 3.4-4.0/command_call_do_block_in_index_arguments.txt,
-    // and pattern_alternation_non_captures.txt (Ruby #22310).
+    // Documented Prism vs CRuby parse.y divergences (test/prism/fixtures_test.rb):
+    // 3.4/command_call_do_block_in_arguments.txt (Ruby #21168) and
+    // pattern_alternation_non_captures.txt (Ruby #22310, fixed on mainline 4.1).
     if (strcmp(cruby_tag, "SyntaxError:unexpected_do_block") == 0) {
         return true;
     }

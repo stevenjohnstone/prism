@@ -366,7 +366,7 @@ def diff_bucket?(executable: "", crash_output: "")
 end
 
 def build_diff_loupe_url(source)
-  "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(source.b))}&ruby_ver=4.0"
+  "#{PRISM_LOUPE_BASE_URL}?code=#{CGI.escape(Base64.strict_encode64(source.b))}&ruby_ver=4.1"
 end
 
 # Decodes the 4-byte fuzzer option header consumed by harness() in
@@ -819,7 +819,7 @@ def diff_c_program(source, crash_details, crash_output, loupe_url)
   end
   main_lines << ""
   main_lines << "pm_options_t *options = pm_options_new();"
-  main_lines << 'pm_options_version_set(options, "4.0", 3);'
+  main_lines << 'pm_options_version_set(options, "4.1", 3);'
   main_lines << ""
   main_lines << "pm_arena_t *arena = pm_arena_new();"
   main_lines << "pm_parser_t *parser = pm_parser_new(arena, #{source_ptr}, input_size, options);"
@@ -914,7 +914,7 @@ def c_program(input_file, crash_details, crash_output: "", reason: "unknown", ex
   option_lines = []
 
   if is_diff
-    option_lines << 'pm_options_version_set(options, "4.0", 3);'
+    option_lines << 'pm_options_version_set(options, "4.1", 3);'
   else
     need_limits = h[:need_limits]
 
@@ -1675,7 +1675,7 @@ def input_and_options_metadata(minimized_input, reason:, crash_output:, raw_size
 
   options_meta = if is_diff
                    {
-                     "ruby_version" => "4.0",
+                     "ruby_version" => "4.1",
                      "start_line" => 1,
                      "start_line_expr" => nil,
                      "encoding" => nil,
