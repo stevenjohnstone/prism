@@ -36,7 +36,7 @@ ENV PATH="/usr/lib/llvm-${LLVM_VERSION}/bin:${PATH}"
 # Pin an explicit ruby/ruby mainline commit SHA (do not use a moving ref like `master`)
 # so bumping this value invalidates both Make stamps and this Docker build layer.
 # Run `make fuzz-docker-update` to advance to mainline HEAD, or override with RUBY_GIT_REF=...
-ARG RUBY_GIT_REF=4414d3ea25fe74f06bf13370b06973544bbc1dd4
+ARG RUBY_GIT_REF=e5e6cd45db456b2a4d368f2a34598641319df630
 RUN apt-get update && apt-get install -y --no-install-recommends ruby \
     && git init /opt/ruby \
     && git -C /opt/ruby fetch --depth=1 https://github.com/ruby/ruby.git "${RUBY_GIT_REF}" \
