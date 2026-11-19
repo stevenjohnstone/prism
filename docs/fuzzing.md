@@ -9,11 +9,14 @@ test/fuzz
 ├── docker
 │   └── Dockerfile                for building a container with the fuzzer toolchain
 ├── harness
+│   ├── accel.c                   SIMD vs SWAR differential libFuzzer target for scan_identifier_ascii
+│   ├── accel_backend.c           per-backend wrapper compiled into isolated native and SWAR DSOs
 │   ├── coverage.c                driver for coverage collection
 │   ├── fuzz.c                    generic entrypoint for fuzzing
 │   ├── include
 │   │   └── prism_xallocator.h    custom allocator header for fast leak detection
-│   └── parse.c                   fuzz harness for parsing, serialization, and formatting
+│   ├── parse.c                   fuzz harness for parsing, serialization, and formatting
+│   └── test_accel.sh             builds backend DSOs and runs the PASS/FAIL accel fuzzer
 ├── oss-fuzz
 │   ├── Dockerfile                OSS-Fuzz builder image setup
 │   ├── README.md                 OSS-Fuzz targets, usage, and differences from local fuzzing
@@ -375,6 +378,30 @@ Run `make fuzz-triage` before `make fuzz-clean` if your campaign has untriaged c
 
 Standalone OSS-Fuzz configuration lives in [`test/fuzz/oss-fuzz/`](../test/fuzz/oss-fuzz/README.md) (`project.yaml`, `Dockerfile`, `build.sh`, and `.options` for `prism_parse_fuzzer` and `prism_full_fuzzer`). It builds both parse-only and `-DSLOW` targets without local AFL++ IJON/`lrama-fuzz`/`tmux` infrastructure while reusing `test/fuzz/harness/parse.c`, `test/fuzz/harness/fuzz.c`, `test/fuzz/dict`, and `test/fuzz/runtime/corpus.rb --no-minimize`.
 
+### Differential SIMD vs SWAR Identifier Fuzzing (`make fuzz-accel`)
+
+Prism's native CI/hardware runs on AArch64 (`NEON`) or x86-64 (`SSE2`), leaving the portable `SWAR` fallback untested in normal fuzz campaigns. `make fuzz-accel` builds and runs a minimal PASS/FAIL libFuzzer target (under ASAN + UBSAN) that cross-checks native `scan_identifier_ascii` against the SWAR implementation in the same process:
+
+```bash
+# Default 10-second run inside prism/fuzz
+make fuzz-accel
+
+# Longer run or single saved-artifact replay
+make fuzz-accel ACCEL_TIME=60
+make fuzz-accel ACCEL_FUZZ_ARGS=/prism/tmp/fuzz/accel-failures/crash-...
+```
+
+Environment variables forwarded from `make fuzz-accel` to [`test/fuzz/harness/test_accel.sh`](../test/fuzz/harness/test_accel.sh):
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `ACCEL_TIME` | `10` | libFuzzer `-max_total_time` in seconds when `ACCEL_FUZZ_ARGS` is unset. |
+| `ACCEL_FUZZ_ARGS` | `-max_len=4096 -max_total_time=...` | Custom libFuzzer flags or a crash-file path to replay directly (if non-flag paths are provided, the generated seed corpus is omitted). |
+| `ACCEL_BIN` | temporary dir in `/tmp` | Output path for the linked `fuzz.accel` binary (its companion `.so`s live alongside it via `$ORIGIN` rpath). |
+| `ACCEL_ARTIFACT_DIR` | temporary dir (copies failures to `tmp/fuzz/accel-failures/`) | Custom directory for libFuzzer crash/divergence artifacts. |
+
+Because `fuzz-accel` is a standalone PASS/FAIL check for backend equivalence rather than AFL++ infrastructure verification, it is separate from `make fuzz-test`.
+
 ### Testing the Fuzzing Infrastructure
 
 To run the automated regression suites for the custom AFL++ instrumentation patch (`test/fuzz/patches/test_afl_patch.sh`), crash triage, archiving, and post-fix verification pipeline (`test/fuzz/triage/test_triage.sh`), grammar seed generator (`test/fuzz/runtime/test_grammar.sh`), and OSS-Fuzz build/corpus smoke test (`test/fuzz/oss-fuzz/test_oss_fuzz.sh`):
@@ -511,3 +538,14 @@ When `ijon` reaches a novel state combination and saves the input to `tmp/fuzz/a
 - **Reachable bignum divide-and-conquer (`-DPM_INTEGER_DIVIDE_THRESHOLD=8`)**: By default, `src/integer.c` only switches from schoolbook decimal parsing to divide-and-conquer parsing (and Karatsuba multiplication in `src/bignum.c`) above 224 chunks (2,017 digits), which cannot be reached within `FUZZ_MAX_INPUT_SIZE` (1,024 bytes). Lowering the threshold to 8 chunks (72 digits) exercises both schoolbook (20–72 digits) and divide-and-conquer / Karatsuba (73–1,020 digits) within the 1 KB input limit.
 - **Reachable recursion depth limit (`-DPRISM_DEPTH_MAXIMUM=128`)**: Lowering `PRISM_DEPTH_MAXIMUM` from `10000` to `128` makes `PM_ERR_NESTING_TOO_DEEP` error-recovery paths in `parse_expression` and `parse_pattern` reachable within 1 KB inputs and prevents deeply nested expressions from causing quadratic indentation buffer growth in `pm_prettyprint`.
 - **Write-only ASAN (`-mllvm -asan-instrument-reads=0`)**: `build/fuzz` and `build/fuzz.sand` disable ASAN read instrumentation so they only trap on illegal writes, UBSAN errors, and assertion failures, leaving out-of-bounds and uninitialized reads to `build/fuzz.msan`.
+
+### Accelerated Backend Differential Target (`test/fuzz/harness/accel.c`)
+
+[`include/prism/compiler/accel.h`](../include/prism/compiler/accel.h) selects at most one vectorization strategy (`PRISM_HAS_NEON`, `PRISM_HAS_SSE2`, `PRISM_HAS_SWAR`, or pure scalar fallback) and provides a compile-time `-DPRISM_ACCEL_SWAR` override ahead of architecture auto-detection.
+
+To differential-test `scan_identifier_ascii` across native (`NEON`/`SSE2`) and `SWAR` in-process with zero modifications to `src/`:
+
+1. **Isolated variant shared libraries ([`test_accel.sh`](../test/fuzz/harness/test_accel.sh), [`accel_backend.c`](../test/fuzz/harness/accel_backend.c)):**
+   `test_accel.sh` compiles `native` (default) and `swar` (`-DPRISM_ACCEL_SWAR`) into two separate shared libraries (`libprism_native.so` and `libprism_swar.so`) using `-fPIC -shared -fsanitize=fuzzer-no-link,address,undefined`. Each DSO compiles `src/*.c` (excluding `src/prism.c`), plus `accel_backend.c` which `#include`s `src/prism.c` directly so `static scan_identifier_ascii` stays callable. A GNU linker version script (`{ global: accel_<backend>_*; local: *; };`) together with `-Wl,-Bsymbolic` keeps every internal `pm_*` symbol private to its DSO while registering all 8-bit coverage counters with libFuzzer.
+2. **Direct raw-input check ([`accel.c`](../test/fuzz/harness/accel.c)):**
+   Each fuzz input `data[0..size)` is copied directly into an exact-sized `malloc` buffer with no trailing NUL (so ASAN catches 1-byte or vector over-reads) and passed straight to both backends. Because `NEON`/`SSE2` advance by `16`-byte chunks and `SWAR` advances by `8`-byte words, both fast paths are validated against `lex_identifier`'s scalar tail invariant: each backend must consume only `[a-zA-Z0-9_]` bytes (`n <= expected`), leave `< chunk_width` identifier bytes remaining, and land at the same `expected` end position once completed by the scalar tail loop. On any violation, `accel.c` prints which backend failed (`Outlier`), the escaped input text, the stopping byte, and the wrongly accepted or missed slice before calling `abort()`.

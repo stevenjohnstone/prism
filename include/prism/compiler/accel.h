@@ -15,7 +15,11 @@
  * each strategy relies only on instructions that the architecture baseline
  * guarantees: NEON is mandatory on AArch64 and SSE2 is mandatory on x86-64.
  */
-#if (defined(__aarch64__) && defined(__ARM_NEON)) || (defined(_MSC_VER) && defined(_M_ARM64))
+#if defined(PRISM_ACCEL_SWAR)
+#   if defined(PRISM_LITTLE_ENDIAN_COMPTIME)
+#       define PRISM_HAS_SWAR
+#   endif
+#elif (defined(__aarch64__) && defined(__ARM_NEON)) || (defined(_MSC_VER) && defined(_M_ARM64))
 #   define PRISM_HAS_NEON
 #elif (defined(__x86_64__) && defined(__SSE2__)) || (defined(_MSC_VER) && defined(_M_X64))
 #   define PRISM_HAS_SSE2

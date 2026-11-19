@@ -267,6 +267,11 @@ fuzz-bench: fuzz-docker-build fuzz-gen-templates
 	$(Q) $(MAKEDIRS) $(FUZZ_DIR)
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz ruby ./test/fuzz/runtime/grammar_bench.rb --json tmp/fuzz/grammar-bench.json $(GRAMMAR_BENCH_ARGS)
 
+fuzz-accel: fuzz-docker-build fuzz-gen-templates
+	$(ECHO) "running SIMD vs SWAR differential accel fuzzer"
+	$(Q) $(MAKEDIRS) $(FUZZ_DIR)
+	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -e ACCEL_TIME -e ACCEL_FUZZ_ARGS -e ACCEL_BIN -e ACCEL_ARTIFACT_DIR -v $(CURDIR):/prism prism/fuzz ./test/fuzz/harness/test_accel.sh
+
 fuzz-test: fuzz-docker-build fuzz-gen-templates
 	$(ECHO) "testing AFL++ instrumentation patch, crash triage, grammar generator, and OSS-Fuzz build"
 	$(Q) docker run --rm $(FUZZ_TMPFS_FLAGS) -v $(CURDIR):/prism prism/fuzz /bin/bash -c "make $(FUZZ_AFL_STAMP) && ./test/fuzz/patches/test_afl_patch.sh && ./test/fuzz/triage/test_triage.sh && ./test/fuzz/runtime/test_grammar.sh && ./test/fuzz/oss-fuzz/test_oss_fuzz.sh"
@@ -310,5 +315,5 @@ fuzz-clean:
 	$(Q) if [ -d "$(FUZZ_DIR)" ]; then find $(FUZZ_DIR) -mindepth 1 -maxdepth 1 ! -name triage -exec rm -rf -- {} +; fi
 	$(ECHO) "done"
 
-.PHONY: fuzz-clean fuzz-docker-build fuzz-docker-force fuzz-docker-update fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-match fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-test
+.PHONY: fuzz-clean fuzz-docker-build fuzz-docker-force fuzz-docker-update fuzz-gen-templates fuzz-build fuzz-debug fuzz-triage fuzz-retriage fuzz-verify fuzz-match fuzz-bisect fuzz-run fuzz-daemon fuzz-attach fuzz-stop fuzz-coverage fuzz-plot fuzz-bench fuzz-accel fuzz-test
 
